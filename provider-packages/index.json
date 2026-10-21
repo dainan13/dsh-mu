@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "templates": [
+    {
+      "name": "deepseek",
+      "label": "DeepSeek 官方",
+      "description": "官方 anthropic 端点，deepseek-flash / deepseek-v4-pro，带 5 档推理等级",
+      "api": "anthropic-messages",
+      "models": 2
+    },
+    {
+      "name": "opencode-go",
+      "label": "OpenCode Go",
+      "description": "OpenCode Go 订阅，OpenAI Chat Completions，30 个模型",
+      "api": "openai-completions",
+      "models": 30
+    }
+  ]
+}

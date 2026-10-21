@@ -137,7 +137,18 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
   </section>
 
   <section id="tab-providers">
-    <h3 style="font-size:14px;margin:18px 0 8px">用配置文件接 provider（推荐）</h3>
+    <h3 style="font-size:14px;margin:0 0 8px">从线上模板库导入（最省事）</h3>
+    <div class="row" style="align-items:center;gap:8px">
+      <button class="primary" type="button" onclick="loadTemplates()">读取模板列表</button>
+      <span class="muted" id="tplSource" style="font-size:12px"></span>
+    </div>
+    <div class="muted" style="margin:6px 0 10px;font-size:12px">
+      模板来自项目仓库的 <code>provider-packages/</code> 目录，下载后会**先按配置规范校验**再保存；
+      不会自动创建套餐，也不会覆盖同名 provider（除非你在提示里确认）。
+    </div>
+    <div id="tplTable"></div>
+
+    <h3 style="font-size:14px;margin:22px 0 8px">用配置文件接 provider（推荐）</h3>
     <div class="banner" style="border-color:#2b3240;color:#aeb6c2;line-height:1.9">
       配置规范与"给 AI 的提示词"：<button class="act" type="button" onclick="showSpec()">查看 / 复制</button>
       <button class="act" type="button" onclick="downloadSpec()">下载为文件</button>
@@ -263,6 +274,7 @@ document.querySelectorAll('nav button').forEach(b => b.addEventListener('click',
   if (b.dataset.tab === 'providers') loadProviders(); loadPackages();
   if (b.dataset.tab === 'plugins') loadPlugins();
   if (b.dataset.tab === 'instances') { loadProviders(); fillLogInstances(); }
+  if (b.dataset.tab === 'providers') { loadTemplates(); }
   if (b.dataset.tab !== 'instances') {
     if (LOG_TIMER) { clearInterval(LOG_TIMER); LOG_TIMER = null; }
     const box = $('#logLive');
@@ -662,6 +674,42 @@ async function loadProviders() {
         <button class="act" onclick="showPatch('${i.name}')">查看 patch</button></td></tr>`; }).join('')}</tbody></table>
     <div id="provResult"></div>`;
 }
+// ------------------------------------------------------- 线上 provider 模板库
+async function loadTemplates() {
+  const box = $('#tplTable');
+  box.innerHTML = '<div class="muted">读取中…</div>';
+  try {
+    const d = await api('provider-templates');
+    $('#tplSource').textContent = d.source ? '来源：' + d.source : '';
+    const rows = d.templates || [];
+    box.innerHTML = rows.length
+      ? `<table><thead><tr><th>模板</th><th>说明</th><th>协议</th><th>模型</th><th>状态</th><th></th></tr></thead>
+         <tbody>${rows.map(t => `<tr>
+           <td><b>${esc(t.label || t.name)}</b><div class="muted">${esc(t.name)}</div></td>
+           <td class="muted">${esc(t.description || '')}</td>
+           <td class="muted">${esc(t.api || '-')}</td>
+           <td>${t.models || '-'}</td>
+           <td>${t.imported ? '<span class="pill ok">已导入</span>' : '<span class="muted">未导入</span>'}</td>
+           <td><button class="act" onclick="importTemplate('${esc(t.name)}',${t.imported ? 'true' : 'false'})">${t.imported ? '重新导入' : '导入'}</button></td>
+         </tr>`).join('')}</tbody></table>`
+      : '<div class="muted">模板库里没有模板。</div>';
+  } catch (e) {
+    box.innerHTML = '';
+    flash('读取模板失败：' + e.message, 'err');
+    $('#tplTable').innerHTML = `<div class="muted">读取失败：${esc(e.message)}</div>`;
+  }
+}
+
+window.importTemplate = async (name, exists) => {
+  if (exists && !confirm(`${name} 已经导入过，覆盖它吗？`)) return;
+  try {
+    const r = await api('provider-templates/import', { method: 'POST',
+      body: JSON.stringify({ name, force: !!exists }) });
+    flash(`已导入 ${r.label || r.id}（${r.models} 个模型，sha256 ${String(r.sha256).slice(0, 12)}…）。下一步：为它建一个套餐。`);
+    loadTemplates(); loadPackages();
+  } catch (e) { flash('导入失败：' + e.message, 'err'); }
+};
+
 // --------------------------------------------------- provider 配置文件（package）
 let PKGS = [];
 async function loadPackages() {

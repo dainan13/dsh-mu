@@ -47,7 +47,9 @@
 #                                  reply is not success, keys are never echoed
 #  31. tests/plans.py              model plans: the patch, the credential refs and the
 #                                  browser-session `records:` block surviving a sync
-#  32. tests/login-limit.py        the failed-login limit really engages (runs last:
+#  32. tests/provider-templates.py provider templates: listing, import, validation, and
+#                                  the guards (no overwrite, no path traversal)
+#  33. tests/login-limit.py        the failed-login limit really engages (runs last:
 #                                  it consumes the per-client-IP failure budget)
 #
 # Exit code 0 only when every layer passed.
@@ -101,7 +103,7 @@ step() { printf '\n=== %s ===\n' "$*"; }
 . "$HERE/lib.sh" 2>/dev/null || true
 have() { command -v "$1" >/dev/null 2>&1; }
 
-step "1/31 doctor"
+step "1/33 doctor"
 if have dsh-muctl; then
 	if out=$(dsh-muctl doctor 2>&1); then
 		ok "dsh-muctl doctor: $(printf '%s\n' "$out" | grep -E '^doctor:' | tail -1)"
@@ -180,7 +182,7 @@ run_node() {
 	chroot "$GW_ROOTFS" /usr/bin/node "$_script" $_staged_args
 }
 
-step "2/31 gateway selftest"
+step "2/33 gateway selftest"
 if [ -f "$LIB/tests/selftest.mjs" ] && [ -n "$USER" ]; then
 	if run_node "$LIB/tests/selftest.mjs" --user "$USER" --pass "$PASSWORD" >/tmp/regression-selftest.log 2>&1; then
 		ok "selftest: $(grep -c '^PASS' /tmp/regression-selftest.log) checks passed"
@@ -192,7 +194,7 @@ else
 	skip "selftest needs --user/--password and $LIB/tests/selftest.mjs"
 fi
 
-step "3/31 UI consistency (admin page, panel, backend routes)"
+step "3/33 UI consistency (admin page, panel, backend routes)"
 if [ -f "$CHECKOUT/tests/ui-lint.mjs" ] || [ -f "$SRC/tests/ui-lint.mjs" ]; then
 	_ui="$CHECKOUT/tests/ui-lint.mjs"; [ -f "$_ui" ] || _ui="$SRC/tests/ui-lint.mjs"
 	if run_node "$_ui" "${CHECKOUT:-$SRC}" >/tmp/regression-ui.log 2>&1; then
@@ -205,7 +207,7 @@ else
 	skip "ui-lint.mjs not found in the checkout"
 fi
 
-step "4/31 CLI contract (clean errors, no tracebacks)"
+step "4/33 CLI contract (clean errors, no tracebacks)"
 _cli="$LIB/tests/cli-contract.sh"; [ -f "$_cli" ] || _cli="$HERE/cli-contract.sh"
 if [ -f "$_cli" ]; then
 	if sh "$_cli" ${INSTANCE:+"$INSTANCE"} >/tmp/regression-cli.log 2>&1; then
@@ -218,7 +220,7 @@ else
 	skip "cli-contract.sh not installed"
 fi
 
-step "5/31 admin API contract (JSON errors, no tracebacks)"
+step "5/33 admin API contract (JSON errors, no tracebacks)"
 _api="$LIB/tests/api-contract.py"; [ -f "$_api" ] || _api="$HERE/api-contract.py"
 if [ -f "$_api" ]; then
 	if python3 "$_api" ${INSTANCE:+--instance "$INSTANCE"} >/tmp/regression-api.log 2>&1; then
@@ -231,7 +233,7 @@ else
 	skip "api-contract.py not installed"
 fi
 
-step "6/31 acceptance suite"
+step "6/33 acceptance suite"
 if [ -f "$LIB/tests/acceptance.sh" ] && [ -n "$USER" ]; then
 	if sh "$LIB/tests/acceptance.sh" "${INSTANCE:-$USER}" "$USER" "$PASSWORD" >/tmp/regression-acceptance.log 2>&1; then
 		ok "acceptance: $(grep -E 'ACCEPTANCE: ' /tmp/regression-acceptance.log | tail -1)"
@@ -246,7 +248,7 @@ fi
 # The rehearsal shells out to node too; point it at the staged suite.
 export DSH_MU_NODE="chroot $GW_ROOTFS /usr/bin/node"
 export DSH_MU_TEST_DIR="/tmp/dsh-mu-suite/tests"
-step "7/31 fresh-machine checklist"
+step "7/33 fresh-machine checklist"
 if [ -f "$LIB/tests/fresh-machine.py" ]; then
 	if [ -n "$USER" ]; then
 		if python3 "$LIB/tests/fresh-machine.py" --skip-install --user "$USER" --password "$PASSWORD" \
@@ -267,7 +269,7 @@ else
 	skip "fresh-machine.py not installed"
 fi
 
-step "8/31 isolation boundary"
+step "8/33 isolation boundary"
 if [ -f "$LIB/tests/isolation.sh" ] || [ -f "$HERE/isolation.sh" ]; then
 	_iso="$LIB/tests/isolation.sh"; [ -f "$_iso" ] || _iso="$HERE/isolation.sh"
 	if sh "$_iso" ${INSTANCE:+"$INSTANCE"} >/tmp/regression-isolation.log 2>&1; then
@@ -280,7 +282,7 @@ else
 	skip "isolation.sh not installed"
 fi
 
-step "9/31 failure modes"
+step "9/33 failure modes"
 if [ -f "$LIB/tests/failure-modes.py" ] || [ -f "$HERE/failure-modes.py" ]; then
 	_fm="$LIB/tests/failure-modes.py"; [ -f "$_fm" ] || _fm="$HERE/failure-modes.py"
 	if [ -n "$USER" ]; then
@@ -298,7 +300,7 @@ else
 	skip "failure-modes.py not installed"
 fi
 
-step "10/31 documentation consistency"
+step "10/33 documentation consistency"
 if [ -f "$CHECKOUT/tests/doc-lint.mjs" ] || [ -f "$SRC/tests/doc-lint.mjs" ]; then
 	_doc="$CHECKOUT/tests/doc-lint.mjs"; [ -f "$_doc" ] || _doc="$SRC/tests/doc-lint.mjs"
 	if run_node "$_doc" "${CHECKOUT:-$SRC}" >/tmp/regression-doc.log 2>&1; then
@@ -311,7 +313,7 @@ else
 	skip "doc-lint.mjs not found in the checkout"
 fi
 
-step "11/31 sustained load (soak)"
+step "11/33 sustained load (soak)"
 if [ -f "$LIB/tests/soak.py" ] || [ -f "$HERE/soak.py" ]; then
 	_soak="$LIB/tests/soak.py"; [ -f "$_soak" ] || _soak="$HERE/soak.py"
 	if [ -n "$USER" ]; then
@@ -329,7 +331,7 @@ else
 	skip "soak.py not installed"
 fi
 
-step "12/31 release artifact audit"
+step "12/33 release artifact audit"
 if [ -f "$CHECKOUT/tests/artifact-audit.py" ] || [ -f "$SRC/tests/artifact-audit.py" ]; then
 	_audit="$CHECKOUT/tests/artifact-audit.py"; [ -f "$_audit" ] || _audit="$SRC/tests/artifact-audit.py"
 	# audit the package built from *this* tree, not a leftover from an earlier run
@@ -345,7 +347,7 @@ else
 	skip "artifact-audit.py not found in the checkout"
 fi
 
-step "13/31 deploy drift (is the machine running this code?)"
+step "13/33 deploy drift (is the machine running this code?)"
 if [ -f "$LIB/tests/drift-audit.py" ] || [ -f "$HERE/drift-audit.py" ]; then
 	_drift="$LIB/tests/drift-audit.py"; [ -f "$_drift" ] || _drift="$HERE/drift-audit.py"
 	_pkg=$(ls -t "${CHECKOUT:-$SRC}"/dist/*.apk 2>/dev/null | head -1)
@@ -360,7 +362,7 @@ else
 	skip "drift-audit.py not installed"
 fi
 
-step "14/31 doctor repair (break it, then fix it)"
+step "14/33 doctor repair (break it, then fix it)"
 if [ -f "$LIB/tests/doctor-fix.sh" ] || [ -f "$HERE/doctor-fix.sh" ]; then
 	_fix="$LIB/tests/doctor-fix.sh"; [ -f "$_fix" ] || _fix="$HERE/doctor-fix.sh"
 	if sh "$_fix" >/tmp/regression-doctorfix.log 2>&1; then
@@ -373,7 +375,7 @@ else
 	skip "doctor-fix.sh not installed"
 fi
 
-step "15/31 log rotation"
+step "15/33 log rotation"
 if [ -f "$LIB/tests/log-rotation.sh" ] || [ -f "$HERE/log-rotation.sh" ]; then
 	_rot="$LIB/tests/log-rotation.sh"; [ -f "$_rot" ] || _rot="$HERE/log-rotation.sh"
 	if sh "$_rot" >/tmp/regression-logrotate.log 2>&1; then
@@ -386,7 +388,7 @@ else
 	skip "log-rotation.sh not installed"
 fi
 
-step "16/31 account lifecycle"
+step "16/33 account lifecycle"
 if [ -f "$LIB/tests/user-flows.py" ] || [ -f "$HERE/user-flows.py" ]; then
 	_uf="$LIB/tests/user-flows.py"; [ -f "$_uf" ] || _uf="$HERE/user-flows.py"
 	if python3 "$_uf" >/tmp/regression-userflows.log 2>&1; then
@@ -399,7 +401,7 @@ else
 	skip "user-flows.py not installed"
 fi
 
-step "17/31 per-instance uid"
+step "17/33 per-instance uid"
 if [ -f "$LIB/tests/run-uid.sh" ] || [ -f "$HERE/run-uid.sh" ]; then
 	_uid="$LIB/tests/run-uid.sh"; [ -f "$_uid" ] || _uid="$HERE/run-uid.sh"
 	if sh "$_uid" >/tmp/regression-runuid.log 2>&1; then
@@ -412,7 +414,7 @@ else
 	skip "run-uid.sh not installed"
 fi
 
-step "18/31 clean-Alpine rehearsal"
+step "18/33 clean-Alpine rehearsal"
 if [ "$FAST" = 1 ]; then
 	skip "rehearsal skipped (--fast)"
 elif [ -z "$CHECKOUT" ]; then
@@ -442,7 +444,7 @@ else
 	skip "rehearsal script not found next to this runner"
 fi
 
-step "19/31 state lock under contention"
+step "19/33 state lock under contention"
 if [ -f "$LIB/tests/state-lock.py" ] || [ -f "$HERE/state-lock.py" ]; then
 	_lock="$LIB/tests/state-lock.py"; [ -f "$_lock" ] || _lock="$HERE/state-lock.py"
 	# It holds the platform lock for ~3s, so it must not run beside other writers.
@@ -456,7 +458,7 @@ else
 	skip "state-lock.py not installed"
 fi
 
-step "20/31 admin surface as a real administrator"
+step "20/33 admin surface as a real administrator"
 if [ -f "$LIB/tests/admin-surface.py" ] || [ -f "$HERE/admin-surface.py" ]; then
 	_adm="$LIB/tests/admin-surface.py"; [ -f "$_adm" ] || _adm="$HERE/admin-surface.py"
 	# Creates a temporary host account, adds it to ADMIN_SYSTEM_USERS, logs in and
@@ -471,7 +473,7 @@ else
 	skip "admin-surface.py not installed"
 fi
 
-step "21/31 user panel (what a normal account sees)"
+step "21/33 user panel (what a normal account sees)"
 if [ -f "$LIB/tests/user-panel.py" ] || [ -f "$HERE/user-panel.py" ]; then
 	_panel="$LIB/tests/user-panel.py"; [ -f "$_panel" ] || _panel="$HERE/user-panel.py"
 	# Creates its own account+instance, stops it, starts it through /me, deletes both.
@@ -485,7 +487,7 @@ else
 	skip "user-panel.py not installed"
 fi
 
-step "22/31 port move (guards + no reload)"
+step "22/33 port move (guards + no reload)"
 if [ -f "$LIB/tests/port-move.py" ] || [ -f "$HERE/port-move.py" ]; then
 	_pm="$LIB/tests/port-move.py"; [ -f "$_pm" ] || _pm="$HERE/port-move.py"
 	if python3 "$_pm" >/tmp/regression-portmove.log 2>&1; then
@@ -498,7 +500,7 @@ else
 	skip "port-move.py not installed"
 fi
 
-step "23/31 restore ownership"
+step "23/33 restore ownership"
 if [ -f "$LIB/tests/restore-owner.py" ] || [ -f "$HERE/restore-owner.py" ]; then
 	_ro="$LIB/tests/restore-owner.py"; [ -f "$_ro" ] || _ro="$HERE/restore-owner.py"
 	# Creates a dedicated-uid instance, stages a stale owner, backs up, wipes and
@@ -513,7 +515,7 @@ else
 	skip "restore-owner.py not installed"
 fi
 
-step "24/31 restore plan (what a restore would overwrite)"
+step "24/33 restore plan (what a restore would overwrite)"
 if [ -f "$LIB/tests/restore-plan.py" ] || [ -f "$HERE/restore-plan.py" ]; then
 	_rp="$LIB/tests/restore-plan.py"; [ -f "$_rp" ] || _rp="$HERE/restore-plan.py"
 	# Builds an archive, makes the live platform newer, then checks the dry-run
@@ -528,7 +530,7 @@ else
 	skip "restore-plan.py not installed"
 fi
 
-step "25/31 log endpoint edges"
+step "25/33 log endpoint edges"
 if [ -f "$LIB/tests/log-bounds.py" ] || [ -f "$HERE/log-bounds.py" ]; then
 	_lb="$LIB/tests/log-bounds.py"; [ -f "$_lb" ] || _lb="$HERE/log-bounds.py"
 	# The tail clamp plus the two error paths: a typo must be a 400, an unknown
@@ -543,7 +545,7 @@ else
 	skip "log-bounds.py not installed"
 fi
 
-step "26/31 platform config edges"
+step "26/33 platform config edges"
 if [ -f "$LIB/tests/config-bounds.py" ] || [ -f "$HERE/config-bounds.py" ]; then
 	_cb="$LIB/tests/config-bounds.py"; [ -f "$_cb" ] || _cb="$HERE/config-bounds.py"
 	# Unknown key / bad value / emptying the admin list / narrowing PORT_RANGE past
@@ -558,7 +560,7 @@ else
 	skip "config-bounds.py not installed"
 fi
 
-step "27/31 account names and API keys"
+step "27/33 account names and API keys"
 if [ -f "$LIB/tests/name-key-bounds.py" ] || [ -f "$HERE/name-key-bounds.py" ]; then
 	_nk="$LIB/tests/name-key-bounds.py"; [ -f "$_nk" ] || _nk="$HERE/name-key-bounds.py"
 	# 11 invalid names (no records, no directories), an admin's name, and the API
@@ -573,7 +575,7 @@ else
 	skip "name-key-bounds.py not installed"
 fi
 
-step "28/31 limit values (what 0, negative and unit forms really do)"
+step "28/33 limit values (what 0, negative and unit forms really do)"
 if [ -f "$LIB/tests/limit-values.py" ] || [ -f "$HERE/limit-values.py" ]; then
 	_lv="$LIB/tests/limit-values.py"; [ -f "$_lv" ] || _lv="$HERE/limit-values.py"
 	# 0 = unlimited in the friendly forms (verified against the live cgroup), raw 0
@@ -588,7 +590,7 @@ else
 	skip "limit-values.py not installed"
 fi
 
-step "29/31 password minimum on every entrance"
+step "29/33 password minimum on every entrance"
 if [ -f "$LIB/tests/password-bounds.py" ] || [ -f "$HERE/password-bounds.py" ]; then
 	_pb="$LIB/tests/password-bounds.py"; [ -f "$_pb" ] || _pb="$HERE/password-bounds.py"
 	# CLI, `user add` and the administrator's API must share one minimum; a refused
@@ -603,7 +605,7 @@ else
 	skip "password-bounds.py not installed"
 fi
 
-step "30/31 provider connection test"
+step "30/33 provider connection test"
 if [ -f "$LIB/tests/provider-probe.py" ] || [ -f "$HERE/provider-probe.py" ]; then
 	_pp="$LIB/tests/provider-probe.py"; [ -f "$_pp" ] || _pp="$HERE/provider-probe.py"
 	# A local stub endpoint: a real reply, a 200 with junk, a 500, a refused port,
@@ -619,7 +621,7 @@ else
 	skip "provider-probe.py not installed"
 fi
 
-step "31/32 model plans (patch + credential refs + the browser-session record)"
+step "31/33 model plans (patch + credential refs + the browser-session record)"
 _pl="$LIB/tests/plans.py"; [ -f "$_pl" ] || _pl="$HERE/plans.py"
 if [ -f "$_pl" ]; then
 	if python3 "$_pl" >/tmp/regression-plans.log 2>&1; then
@@ -632,7 +634,20 @@ else
 	skip "tests/plans.py not installed"
 fi
 
-step "32/32 login rate limit (runs last: it burns the per-IP failure budget)"
+step "32/33 provider templates (list / import / validate / guards, offline)"
+_tpl="$LIB/tests/provider-templates.py"; [ -f "$_tpl" ] || _tpl="$HERE/provider-templates.py"
+if [ -f "$_tpl" ]; then
+	if python3 "$_tpl" >/tmp/regression-templates.log 2>&1; then
+		ok "provider templates: $(grep -E 'PROVIDER TEMPLATES:' /tmp/regression-templates.log | tail -1)"
+	else
+		bad "provider templates (see /tmp/regression-templates.log)"
+		grep -E "^FAIL" /tmp/regression-templates.log | head -5 | sed 's/^/      /'
+	fi
+else
+	skip "provider-templates.py not installed"
+fi
+
+step "33/33 login rate limit (runs last: it burns the per-IP failure budget)"
 if [ -f "$LIB/tests/login-limit.py" ] || [ -f "$HERE/login-limit.py" ]; then
 	_lim="$LIB/tests/login-limit.py"; [ -f "$_lim" ] || _lim="$HERE/login-limit.py"
 	if python3 "$_lim" >/tmp/regression-limit.log 2>&1; then

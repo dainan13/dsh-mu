@@ -1,5 +1,32 @@
 # CHANGELOG
 
+## 0.15.0（打 tag 自动发 Release，支持一行安装）
+
+- 新增 `.github/workflows/release.yml`：推送 `v*` tag（或手动指定版本）即自动打包并发布 Release；
+- **latest 的关键**：每个 Release 同时上传**固定名字** `dsh-mu.apk`（+ 版本化名字 + `SHA256SUMS`），
+  并显式 `make_latest: true` —— 于是
+  `https://github.com/dainan13/dsh-mu/releases/latest/download/dsh-mu.apk` 成为**永久不变**的安装地址；
+- 手动触发时可选 **prerelease**：标记为预览版后，GitHub 的 `latest` 会**跳过**它（这正是发预览版的正确姿势）；
+- CI 门：tag 必须等于 `VERSION` → `doc-lint`/`ui-lint` → 在 **Alpine 3.24** 里构建
+  （`apk mkpkg` 只在 apk-tools 3 里有）→ 在**干净** Alpine 容器里**真的 `apk add` 装一遍**并校验
+  `dsh-muctl --version`、三个二进制、admin 页面与 tests 都在位 → 才发布；
+- Release 说明自动取 `CHANGELOG.md` 里对应版本的段落，并附一行安装命令；
+- README 安装章节改为"一行安装（推荐）"，并给出固定版本、离线机器两种替代写法；
+- `docs/05` 新增第 0 节：latest 的三个必要条件、资产清单、CI 门、以及"包未签名"的已知限制与签名路径。
+
+## 0.14.0（从线上模板库导入 provider）
+
+- 新增 `dsh-muctl template list|import|source`：从项目仓库的 `provider-packages/` 拉取模板并导入；
+- 后台「模型接入」页新增 **从线上模板库导入** 卡片：列表（已导入/未导入）、一键导入、覆盖需确认；
+- 模板先经 `validate_provider_package()` 校验再落盘；只允许 `https://` / `file://`；
+  不覆盖已有 provider（除非 `--force`）、不自动建套餐、模板名防路径穿越；
+- 仓库新增 `provider-packages/index.json`（模板清单；没有 index 时回落到 GitHub contents API）；
+- 模板库地址可配：`provider_template_base`（`dsh-muctl config` / `template source --url`），
+  支持 `file://` 本地目录，离线机器也能用；
+- 新增回归层 `tests/provider-templates.py`（**完全离线**，用临时 `file://` 目录）；
+  回归层数 32 → 33；
+- 审计记录 `provider.template.import`（含 `sha256`）。
+
 ## 0.13.2（日志视图：空日志不再只是「(空)」）
 
 - 实例日志接口与页面现在**解释**为什么是空的，而不是只回一个 `(空)`：

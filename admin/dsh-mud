@@ -447,6 +447,8 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("GET", re.compile(r"^/api/plans$"), "plan_list"),
     ("POST", re.compile(r"^/api/plans$"), "plan_add"),
     ("POST", re.compile(r"^/api/plans/([\w.-]+)/(enable|disable|default)$"), "plan_action"),
+    ("GET", re.compile(r"^/api/provider-templates$"), "template_list"),
+    ("POST", re.compile(r"^/api/provider-templates/import$"), "template_import"),
     ("GET", re.compile(r"^/api/mounts$"), "mount_list"),
     ("POST", re.compile(r"^/api/mounts$"), "mount_save"),
     ("DELETE", re.compile(r"^/api/mounts$"), "mount_delete"),
@@ -480,6 +482,7 @@ MUTATING = {"auth_verify", "instance_ensure", "provider_save", "provider_delete"
             "package_import", "package_delete", "plan_add", "plan_action", "plan_delete",
             "plan_probe", "plan_usage", "plan_models",
             "mount_list", "mount_save", "mount_delete",
+            "template_list", "template_import",
             "me_plan_action", "me_restart", "me_plugin_action", "plugin_catalog",
             "me_password", "user_create", "user_password", "user_toggle", "user_delete",
             "instance_create", "instance_action", "instance_limits",
@@ -961,6 +964,33 @@ class Handler(BaseHTTPRequestHandler):
                 mu.sync_all(st)
                 return 200, {"ok": True, "id": pid, "note": "restart your instance to apply"}
             return 400, {"error": "unknown action", "action": action}
+        if name in ("template_list", "template_import"):
+            cfg = mu.load_config()
+            if name == "template_list":
+                try:
+                    rows = mu.provider_template_index(cfg)
+                except Exception as exc:  # noqa: BLE001 - offline / 404 / bad index
+                    return 502, {"error": "template index unavailable", "detail": str(exc)[:200],
+                                 "source": mu.provider_template_base(cfg)}
+                have = set(mu.list_provider_packages())
+                for row in rows:
+                    row["imported"] = row["name"] in have
+                return 200, {"templates": rows, "source": mu.provider_template_base(cfg)}
+            name_ = str(body.get("name") or "").strip()
+            if not name_:
+                return 400, {"error": "a template name is required"}
+            try:
+                res = mu.import_provider_template(name_, cfg, force=bool(body.get("force")))
+            except Exception as exc:  # noqa: BLE001 - bad JSON, failed validation, exists
+                return 400, {"error": str(exc)[:300]}
+            mu.audit_write("provider.template.import", target=res["package"]["id"],
+                           detail={"sha256": res["sha256"], "replaced": res["replaced"]})
+            mu.sync_all(mu.load_state())
+            pkg = res["package"]
+            return 200, {"ok": True, "id": pkg["id"], "label": pkg.get("label"),
+                         "models": len(pkg.get("models") or []),
+                         "sha256": res["sha256"], "replaced": res["replaced"],
+                         "note": "create a plan for it, then restart the instances"}
         if name in ("mount_list", "mount_save", "mount_delete"):
             st = mu.load_state()
             if name == "mount_list":

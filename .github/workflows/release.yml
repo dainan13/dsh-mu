@@ -1,0 +1,172 @@
+name: release
+
+# Tag a release with:  git tag v0.15.0 && git push origin v0.15.0
+# The tag is the version: vX.Y.Z must equal ./VERSION, otherwise the job stops.
+#
+# Every release carries THREE assets:
+#   dsh-mu.apk            <- stable name; this is what /releases/latest/download/ needs
+#   dsh-mu-X.Y.Z-r0.apk   <- same bytes, versioned name (pin/archive)
+#   SHA256SUMS            <- checksums for both
+#
+# About "latest": GitHub defines it as the most recent release that is neither a
+# draft nor a prerelease. So this workflow never sets those flags for tag pushes,
+# asks for make_latest, and keeps the asset name stable - that is exactly what makes
+#   https://github.com/<owner>/<repo>/releases/latest/download/dsh-mu.apk
+# a permanent, never-changing URL.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the leading v (e.g. 0.15.0)"
+        required: true
+      prerelease:
+        description: "Mark as prerelease (then /releases/latest will NOT point here)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      ALPINE: alpine:3.24   # same generation as the target machines (apk-tools 3)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide the version (tag and VERSION must agree)
+        id: v
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ inputs.version }}"
+          else
+            RAW="${GITHUB_REF_NAME}"
+          fi
+          V="${RAW#v}"
+          case "$V" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version '$V' is not X.Y.Z"; exit 1 ;;
+          esac
+          FILE_V="$(cat VERSION)"
+          if [ "$V" != "$FILE_V" ]; then
+            echo "::error::tag says $V but VERSION says $FILE_V - bump VERSION first"; exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "::notice::building $V"
+
+      - name: Documentation and UI consistency (node is preinstalled on the runner)
+        run: |
+          set -eu
+          node tests/doc-lint.mjs .
+          node tests/ui-lint.mjs .
+
+      # The package is built inside Alpine 3.24: `apk mkpkg` only exists in
+      # apk-tools 3.x, and the Ubuntu runner ships apk-tools 2.x.
+      - name: Build the .apk
+        run: |
+          set -eu
+          docker run --rm -v "$PWD:/src" -w /src -e V="${{ steps.v.outputs.version }}" \
+            "$ALPINE" sh -c '
+              set -eu
+              apk add --no-cache bash python3 tar gzip >/dev/null
+              apk --help 2>&1 | grep -q mkpkg || {
+                echo "::error::apk-tools 3 is required (no mkpkg in this image)"; exit 1; }
+              sh packaging/make-apk.sh --version "$V"
+            '
+
+      # Stronger than inspecting the archive: actually install it, in a clean image,
+      # exactly the way a user would. This catches missing deps and post-install bugs.
+      - name: Install it in a clean Alpine (the real user path)
+        run: |
+          set -eu
+          V="${{ steps.v.outputs.version }}"
+          docker run --rm -v "$PWD/dist:/dist:ro" "$ALPINE" sh -c '
+            set -eu
+            apk add --no-cache --allow-untrusted "/dist/dsh-mu-'"$V"'-r0.apk"
+            test -x /usr/local/sbin/dsh-muctl
+            test -x /usr/local/sbin/dsh-mud
+            test -x /usr/local/sbin/dsh-mu-jail
+            test -f /usr/local/lib/dsh-mu/admin/index.html
+            test -f /usr/local/lib/dsh-mu/tests/regression.sh
+            dsh-muctl --version
+            apk info dsh-mu | head -2
+          '
+
+      - name: Prepare assets (stable name is what makes /releases/latest work)
+        run: |
+          set -eu
+          V="${{ steps.v.outputs.version }}"
+          mkdir -p release
+          cp "dist/dsh-mu-${V}-r0.apk" "release/dsh-mu-${V}-r0.apk"
+          cp "dist/dsh-mu-${V}-r0.apk" "release/dsh-mu.apk"
+          ( cd release && sha256sum "dsh-mu-${V}-r0.apk" dsh-mu.apk > SHA256SUMS )
+          cat release/SHA256SUMS
+
+      - name: Release notes from CHANGELOG
+        run: |
+          set -eu
+          V="${{ steps.v.outputs.version }}"
+          python3 - "$V" <<'PY' > /tmp/body.md
+          import re, sys
+          want = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^##\s+{re.escape(want)}\b.*?$", text, re.M)
+          body = ""
+          if m:
+              rest = text[m.end():]
+              nxt = re.search(r"^##\s", rest, re.M)
+              body = (rest[: nxt.start()] if nxt else rest).strip()
+          if not body:
+              body = f"_(no CHANGELOG section for {want})_"
+          print(body)
+          PY
+          cat >> /tmp/body.md <<'MD'
+
+          ---
+
+          ### Install (Alpine 3.22+)
+
+          ```sh
+          apk add --allow-untrusted \
+            https://github.com/${{ github.repository }}/releases/latest/download/dsh-mu.apk
+          ```
+
+          Then create the platform (see README → 安装):
+
+          ```sh
+          dsh-muctl install
+          ```
+
+          > The URL above always resolves to the newest release and always points at
+          > the same asset name (`dsh-mu.apk`), so it can be scripted as-is.
+          > Verify the download against `SHA256SUMS` if you mirror the package.
+          MD
+          cat /tmp/body.md
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.v.outputs.version }}
+          name: dsh-mu ${{ steps.v.outputs.version }}
+          body_path: /tmp/body.md
+          files: |
+            release/dsh-mu.apk
+            release/dsh-mu-${{ steps.v.outputs.version }}-r0.apk
+            release/SHA256SUMS
+          draft: false
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
+          # decides whether /releases/latest/download/ points at this release
+          make_latest: ${{ !(github.event_name == 'workflow_dispatch' && inputs.prerelease) }}
+          fail_on_unmatched_files: true

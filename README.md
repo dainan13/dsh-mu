@@ -26,6 +26,30 @@
 
 ## 安装
 
+### 一行安装（从 GitHub Release，推荐）
+
+目标机是 Alpine（3.22+，apk-tools 3），并且能访问外网时：
+
+```sh
+apk add --allow-untrusted \
+  https://github.com/dainan13/dsh-mu/releases/latest/download/dsh-mu.apk
+```
+
+- `--allow-untrusted` 是**必需**的：包是**未签名**的（签名分发见文末"已知限制"）。
+- 这个 URL **永远指向最新版本**，并且**文件名固定为 `dsh-mu.apk`** —— 所以可以原样写进脚本 / cloud-init / 装机清单。
+- 打完包会自动创建平台所需的东西；**平台本身**（账号、实例、网关）还需要跑一次：
+
+```sh
+dsh-muctl install --gateway-host <这台机器的主机名或 IP>
+```
+
+要固定某个版本就把 `latest/download/dsh-mu.apk` 换成
+`download/v0.15.0/dsh-mu-0.15.0-r0.apk`（每个 Release 里同时挂着这两个名字 + `SHA256SUMS`）。
+
+> 内网/离线机器：从 Release 下载 `dsh-mu.apk` 后 `scp` 上去，`apk add --allow-untrusted ./dsh-mu.apk` 即可。
+
+### 从源码安装（开发机打包）
+
 ```sh
 # 在开发机上打包
 tar czf dsh-mu-src.tgz -C dsh-mu .
@@ -520,9 +544,9 @@ sh tests/fresh-rehearsal.sh --keep --skip-dsh            # 保留 rootfs 便于�
 sh tests/fresh-rehearsal.sh --clean --skip-dsh --tarball dist/dsh-mu-<ts>.tgz   # 用交付包复现（交付前推荐）
 ```
 
-`tests/regression.sh` 依次跑 32 层并在末尾给一行汇总：`doctor` → 网关 `selftest` → **界面自洽性** →
+`tests/regression.sh` 依次跑 33 层并在末尾给一行汇总：`doctor` → 网关 `selftest` → **界面自洽性** →
 **CLI 契约** → **管理 API 契约** → `acceptance` → `fresh-machine.py` → **隔离边界自检** → **故障与恢复** →
-**文档一致性** → **持续负载** → **交付物审计** → **部署漂移审计** → **修复能力验证** → **日志轮转验证** → **账号生命周期** → **每实例独立 uid** → 干净 Alpine 排练 → **state.json 并发锁** → **管理员面**（以真正的管理员走一遍 `/admin/`）→ **用户面板**（普通账号看到的 `/me` 与「启动我的实例」）→ **端口迁移**（守卫 + 网关无需 reload）→ **恢复后的属主** → **恢复计划（覆盖前体检）** → **日志接口边界** → **平台配置边界** → **账号名与 API key 的校验** → **限额取值** → **密码最小长度（各入口一致）** → **provider 连接测试** → **登录限速**（**排在最后**：它会消耗按 IP 的失败预算）
+**文档一致性** → **持续负载** → **交付物审计** → **部署漂移审计** → **修复能力验证** → **日志轮转验证** → **账号生命周期** → **每实例独立 uid** → 干净 Alpine 排练 → **state.json 并发锁** → **管理员面**（以真正的管理员走一遍 `/admin/`）→ **用户面板**（普通账号看到的 `/me` 与「启动我的实例」）→ **端口迁移**（守卫 + 网关无需 reload）→ **恢复后的属主** → **恢复计划（覆盖前体检）** → **日志接口边界** → **平台配置边界** → **账号名与 API key 的校验** → **限额取值** → **密码最小长度（各入口一致）** → **provider 连接测试** → **线上 provider 模板**（列表/导入/校验/防护，完全离线）→ **登录限速**（**排在最后**：它会消耗按 IP 的失败预算）
 （`--fast` 可跳过最后一层）。它自动构建 0.1.0/0.1.1 两个包，好让排练能真正走一遍 `apk` 升级路径。
 
 **每实例独立 uid**（`sh tests/run-uid.sh`）：把 `instance_run_uid` 切到 `auto`，建一个临时账号+实例，

@@ -14,7 +14,7 @@
 #
 # Maintainer: dsh-mu maintainers <maintainers@dsh-mu.invalid>
 pkgname=dsh-mu
-pkgver=0.13.3
+pkgver=0.15.0
 pkgrel=0
 pkgdesc="DeepSeek Harness multi-instance platform (gateway, jail runner, admin API)"
 url="https://github.com/deepseek-ai/dsh"

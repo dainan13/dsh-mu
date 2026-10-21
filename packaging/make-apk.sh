@@ -105,6 +105,7 @@ build_unsigned() {
 	install_file 0755 "$SRC/jail/dsh-mu-cgroup-init" /usr/local/sbin/dsh-mu-cgroup-init
 	install_file 0755 "$SRC/admin/dsh-mud"           /usr/local/sbin/dsh-mud
 	install_file 0644 "$SRC/cli/dshmuctl.py"         /usr/local/lib/dsh-mu/python/dshmuctl.py
+	install_file 0644 "$SRC/VERSION"                 /usr/local/lib/dsh-mu/python/VERSION
 	for f in "$SRC"/gateway/lua/*.lua; do
 		install_file 0644 "$f" "/usr/local/lib/dsh-mu/lua/$(basename "$f")"
 	done

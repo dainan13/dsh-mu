@@ -56,7 +56,7 @@ sh tests/regression.sh --user <用户> --password <口令> --instance <实例>
 # 或在已安装的机器上： sh /usr/local/lib/dsh-mu/tests/regression.sh …
 ```
 
-它依次跑 32 层并在末尾给一行汇总：
+它依次跑 33 层并在末尾给一行汇总：
 
 | # | 层 | 内容 |
 |---|---|---|

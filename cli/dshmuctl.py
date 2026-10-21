@@ -34,7 +34,21 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-VERSION = "1.0.0"
+def _platform_version() -> str:
+    """The package version, as installed next to this file (`/usr/local/lib/dsh-mu/VERSION`)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "VERSION"), os.path.join(here, "..", "VERSION")):
+        try:
+            with open(cand) as fh:
+                text = fh.read().strip()
+            if text:
+                return text
+        except OSError:
+            continue
+    return "0.0.0-dev"
+
+
+VERSION = _platform_version()
 
 ETC = "/etc/dsh-mu"
 STATE_PATH = f"{ETC}/state.json"
@@ -98,6 +112,9 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
      "启用 HTTPS 后把 80 的请求 301 到 https（与 tls_keep_http 互斥时以本项为准）"),
     ("RELAY_ENABLED", "relay_enabled", "bool", True,
      "套餐的 key 走网关代理（实例里只有占位符 `mu-relay`）；关掉则回到直连、真 key 写进实例"),
+    ("PROVIDER_TEMPLATE_BASE", "provider_template_base", "str",
+     "https://raw.githubusercontent.com/dainan13/dsh-mu/main/provider-packages",
+     "线上 provider 模板库地址（https://… 或 file://…；留空用项目仓库默认）"),
     ("RELAY_LISTEN", "relay_listen", "int", 8099,
      "代理监听的 loopback 端口（只给本机 jail 用，不对外）"),
     # 24h by default: an unattended browser tab should not stay signed in for a week.
@@ -4860,11 +4877,23 @@ def cmd_provider(args):
              f"({len(normalized['models'])} model(s), default {normalized['model']})")
         return 0
     if action == "rm":
-        if args.name not in custom:
-            die(f"{args.name} is not an operator-defined provider "
-                f"(built-ins cannot be removed: {', '.join(sorted(custom)) or 'none defined'})")
-        custom.pop(args.name)
-        save_custom_providers(custom)
+        # Two kinds of "custom" exist: the legacy providers.json entries and the
+        # imported package files (the model used by plans and by template imports).
+        # Only the second branch was missing, so an imported provider could never be
+        # removed - not by the operator and not by the test that imports one.
+        removed = False
+        if args.name in custom:
+            custom.pop(args.name)
+            save_custom_providers(custom)
+            removed = True
+        package_path = f"{PROVIDERS_DIR}/{args.name}.json"
+        if os.path.exists(package_path):
+            os.unlink(package_path)
+            removed = True
+        if not removed:
+            die(f"{args.name} is neither an imported package nor an operator-defined "
+                f"provider (imported: {', '.join(sorted(list_provider_packages())) or 'none'}; "
+                f"custom: {', '.join(sorted(custom)) or 'none'})")
         info(f"provider {args.name} removed")
         return 0
     die(f"unknown provider action: {action}")
@@ -5968,6 +5997,115 @@ def fill_from_preset(pkg: dict) -> dict:
     return pkg
 
 
+# ---------------------------------------------------------------- online templates
+# Provider templates live in the project repo (provider-packages/). An operator picks
+# one from the admin UI instead of hand-writing JSON. Everything downloaded is
+# validated by validate_provider_package() before it lands in PROVIDERS_DIR, and an
+# import never overwrites an existing package unless explicitly forced.
+DEFAULT_TEMPLATE_BASE = ("https://raw.githubusercontent.com/dainan13/dsh-mu/main/"
+                         "provider-packages")
+
+
+def provider_template_base(cfg: dict | None = None) -> str:
+    cfg = cfg if cfg is not None else load_config()
+    return str(cfg.get("provider_template_base") or DEFAULT_TEMPLATE_BASE).rstrip("/")
+
+
+def _template_fetch(url: str, timeout: int = 20) -> bytes:
+    """GET a template file. Supports https:// and file:// (file:// keeps this
+    testable on a machine without internet)."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "file":
+        with open(parsed.path, "rb") as fh:
+            return fh.read()
+    if parsed.scheme != "https":
+        raise ValueError(f"only https:// and file:// template sources are allowed, got {url}")
+    req = urllib.request.Request(url, headers={"User-Agent": "dsh-mu-template/1"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if resp.status != 200:
+            raise ValueError(f"HTTP {resp.status} for {url}")
+        return resp.read()
+
+
+def _github_api_from_raw(base: str) -> str | None:
+    """Turn a raw.githubusercontent.com directory URL into its GitHub contents API URL."""
+    m = re.match(r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$", base)
+    if not m:
+        return None
+    owner, repo, ref, path = m.groups()
+    return f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+
+
+def provider_template_index(cfg: dict | None = None) -> list[dict]:
+    """List available templates. Prefers index.json (no API limits); falls back to
+    the GitHub contents API when the directory has no index."""
+    base = provider_template_base(cfg)
+    try:
+        raw = _template_fetch(f"{base}/index.json")
+        doc = json.loads(raw.decode("utf-8"))
+        rows = doc.get("templates") if isinstance(doc, dict) else doc
+        out = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or row.get("id") or "").strip()
+            if not name:
+                continue
+            out.append({"name": name, "label": row.get("label") or name,
+                        "description": row.get("description") or "",
+                        "api": row.get("api") or "", "models": row.get("models") or 0})
+        if out:
+            return out
+    except Exception as exc:  # noqa: BLE001 - fall through to the API listing
+        index_error = exc
+    else:
+        index_error = None
+
+    api = _github_api_from_raw(base)
+    if not api:
+        raise RuntimeError(f"template index unavailable at {base}/index.json: {index_error}")
+    doc = json.loads(_template_fetch(api).decode("utf-8"))
+    if not isinstance(doc, list):
+        raise RuntimeError(f"GitHub did not return a directory listing for {base}")
+    out = []
+    for row in doc:
+        name = str(row.get("name") or "")
+        if not name.endswith(".json") or name == "index.json":
+            continue
+        out.append({"name": name[:-5], "label": name[:-5], "description": "",
+                    "api": "", "models": 0})
+    return out
+
+
+def fetch_provider_template(name: str, cfg: dict | None = None) -> tuple[dict, str]:
+    """Download and validate one template. Returns (package, sha256)."""
+    name = str(name or "").strip()
+    if not name or "/" in name or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise ValueError("template name may only contain letters, digits, dot, dash, underscore")
+    base = provider_template_base(cfg)
+    raw = _template_fetch(f"{base}/{name}.json")
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"template {name}.json is not valid JSON: {exc}") from exc
+    pkg, problems = validate_provider_package(doc)
+    if problems:
+        raise ValueError(f"template {name}.json failed validation: " + "; ".join(problems[:3]))
+    return pkg, digest
+
+
+def import_provider_template(name: str, cfg: dict | None = None,
+                             force: bool = False) -> dict:
+    pkg, digest = fetch_provider_template(name, cfg)
+    existing = load_provider_package(pkg["id"])
+    if existing and not force:
+        raise ValueError(f"provider {pkg['id']} already exists "
+                         f"(use --force to replace it)")
+    save_provider_package(pkg)
+    return {"package": pkg, "sha256": digest, "replaced": bool(existing)}
+
+
 def load_provider_package(pid: str) -> dict | None:
     """Load a package and normalise it (each model carries its own api/base_url)."""
     path = f"{PROVIDERS_DIR}/{pid}.json"
@@ -6218,6 +6356,58 @@ def cmd_plan(args):
                  + (f", default {res['default_plan']}" if res.get("default_plan") else ""))
         return 0
     die(f"unknown plan action: {action}")
+
+
+def cmd_template(args):
+    """Browse and import provider templates published in the project repo."""
+    ensure_root()
+    cfg = load_config()
+    action = args.action
+    if action == "source":
+        info("template source: " + provider_template_base(cfg))
+        if args.url:
+            cfg["provider_template_base"] = args.url.rstrip("/")
+            save_config(cfg)
+            info("updated: " + cfg["provider_template_base"])
+        return 0
+    if action == "list":
+        info("source: " + provider_template_base(cfg))
+        try:
+            rows = provider_template_index(cfg)
+        except Exception as exc:  # noqa: BLE001 - offline / 404 / bad JSON
+            die(f"cannot read the template index: {exc}")
+        have = set(list_provider_packages())
+        if not rows:
+            info("no templates found")
+            return 0
+        for row in rows:
+            state = "imported" if row["name"] in have or row["name"] == "index" else ""
+            extra = f" [{row['api']}]" if row["api"] else ""
+            info(f"  {row['name']:<18} {row['label']}{extra} {state}")
+            if row.get("description"):
+                info(f"    {row['description']}")
+        info("import with: dsh-muctl template import <name>")
+        return 0
+    if action == "import":
+        if not args.name:
+            die("usage: dsh-muctl template import <name> [--force]")
+        try:
+            res = import_provider_template(args.name, cfg, force=args.force)
+        except Exception as exc:  # noqa: BLE001
+            die(f"import failed: {exc}")
+        pkg = res["package"]
+        audit_write("provider.template.import", target=pkg["id"],
+                    detail={"sha256": res["sha256"], "replaced": res["replaced"]})
+        info(f"imported provider {pkg['id']} ({pkg.get('label')}), "
+             f"{len(pkg.get('models') or [])} model(s)")
+        info(f"sha256 {res['sha256']}")
+        if res["replaced"]:
+            info("an existing package with this id was replaced")
+        info("create a plan that uses it: dsh-muctl plan add --provider "
+             f"{pkg['id']} --name <name> --key <key>")
+        info("restart the instances that will use the new plan")
+        return 0
+    die(f"unknown template action: {action}")
 
 
 def cmd_mount(args):
@@ -7543,6 +7733,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--default", action="store_true", help="make this team plan the default")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_plan)
+    sp = sub.add_parser("template", help="import provider templates from the project repo")
+    sp.add_argument("action", choices=["list", "import", "source"])
+    sp.add_argument("name", nargs="?", help="template name (without .json)")
+    sp.add_argument("--force", action="store_true", help="replace an existing package")
+    sp.add_argument("--url", help="change the template source (base URL, https:// or file://)")
+    sp.set_defaults(func=cmd_template)
+
     sp = sub.add_parser("mount", help="bind host directories into an instance jail")
     sp.add_argument("action", choices=["list", "add", "rm", "delete", "set"])
     sp.add_argument("host", nargs="?", help="host directory")
