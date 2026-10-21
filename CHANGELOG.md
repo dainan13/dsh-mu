@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 0.15.1（修：apk 不能从 URL 安装）
+
+- **实测纠正**：`apk add --allow-untrusted <URL>` 在 Alpine 3.24 / apk-tools 3.0.6 上**不支持** ✗
+  —— apk 只接受**本地文件**或**仓库包名**；
+- README / `docs/05` / Release 说明全部改成 **`wget` 下载 + `apk add ./本地文件`** 两步，
+  并写明"apk add <URL> 不行"以及可选校验（`SHA256SUMS`）；
+- CI 里那段冒烟测试本来就是装**本地文件** ✓，不受影响；
+- `doc-lint` 新增一项闸门（现 22 项）：**任何文档里出现 `apk add … http(s)://` 就 FAIL**，
+  已做反向验证（故意写错 → 立刻 FAIL）。
+
 ## 0.15.0（打 tag 自动发 Release，支持一行安装）
 
 - 新增 `.github/workflows/release.yml`：推送 `v*` tag（或手动指定版本）即自动打包并发布 Release；
