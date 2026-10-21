@@ -1,0 +1,15 @@
+#!/bin/sh
+cat <<'TXT'
+
+  dsh-mu is installed. Next steps on this machine:
+
+    1) dsh-muctl doctor          # 31 prerequisite checks (kernel/cgroup/apk/nginx/mirrors)
+    2) dsh-muctl install         # packages, DSH runtime, jail template, gateway fragments
+       ... which prints a one-time admin password
+    3) open http://<this-host>/   and log in, then visit /admin/
+
+  Configuration lives in /etc/dsh-mu/dsh-mu.conf (secrets: secret.key, admin.token).
+  Instance data lives in /var/lib/dsh-mu; `apk del` never removes either directory.
+
+TXT
+exit 0

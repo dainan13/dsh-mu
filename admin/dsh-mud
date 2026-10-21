@@ -1,0 +1,1534 @@
+#!/usr/bin/env python3
+"""dsh-mud - loopback admin backend for the dsh-mu platform.
+
+Serves a small JSON API that the gateway exposes at /admin/ after checking the
+caller's platform session and role. It is deliberately *not* a second control
+plane: every mutation goes through the same library the CLI uses
+(`/usr/local/lib/dsh-mu/python/dshmuctl.py`), under the same state lock, so the
+CLI and the admin UI can never disagree.
+
+Trust model: binds loopback only, refuses non-loopback peers, and — when
+/etc/dsh-mu/admin.token exists — requires the gateway to present it. AuthN/AuthZ
+for browsers is the gateway's job (Lua session + role=admin).
+
+Everything here is Python standard library only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import contextlib
+import shutil
+import os
+import re
+import subprocess
+import tempfile
+import sys
+import threading
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+sys.path.insert(0, "/usr/local/lib/dsh-mu/python")
+
+import dshmuctl as mu  # noqa: E402
+
+VERSION = "1.0.0"
+STARTED = time.time()
+AUDIT_PATH = f"{mu.LOGS}/audit.log"
+WEB_DIR = f"{mu.LIB}/admin"
+# The library's generic state-change records would duplicate the request-level
+# records written below, so turn them off in this process.
+os.environ.setdefault("DSHMU_BACKEND", "1")
+
+INDEX_PATH = f"{WEB_DIR}/index.html"
+TOKEN_PATH = f"{mu.ETC}/admin.token"
+MAX_BODY_BYTES = 1024 * 1024
+
+
+# ------------------------------------------------------------------ audit trail
+
+
+def audit(actor: str, action: str, target: str = "", detail: dict | None = None, ip: str = "") -> dict:
+    """One audit implementation for the whole platform (see dshmuctl.audit_write).
+
+    The library also records state/config/provider *diffs*, but it skips them
+    here because this backend logs the request that caused them.
+    """
+    return mu.audit_write(action, target=target, detail=detail,
+                          actor=actor or "unknown", ip=ip)
+
+
+SYSTEM_ADMIN_DEFAULT = "root"
+
+
+def system_admin_names(cfg: dict) -> list[str]:
+    """System accounts allowed to administer the platform (verified via /etc/shadow)."""
+    raw = str(cfg.get("admin_system_users") or SYSTEM_ADMIN_DEFAULT)
+    return [name.strip() for name in raw.replace(",", " ").split() if name.strip()]
+
+
+def shadow_entry(user: str) -> tuple[str | None, str]:
+    """The password field of /etc/shadow for `user` (backend runs as root)."""
+    try:
+        with open("/etc/shadow", errors="replace") as fh:
+            for line in fh:
+                parts = line.rstrip("\n").split(":")
+                if parts and parts[0] == user:
+                    return (parts[1] if len(parts) > 1 else ""), ""
+    except OSError as exc:
+        return None, str(exc)
+    return None, "no such system account"
+
+
+def verify_system_password(user: str, password: str) -> tuple[bool, str]:
+    """Check a password against the host's shadow entry.
+
+    The credential never reaches argv: hashes are computed by reading the
+    password from stdin (`busybox cryptpw -P 0` or `openssl passwd -stdin`).
+    """
+    stored, err = shadow_entry(user)
+    if stored is None:
+        return False, err
+    if not stored:
+        return False, "the account has no password set (run `passwd`)"
+    if stored[0] in "!*":
+        return False, "the account is locked (run `passwd`)"
+    if not stored.startswith("$"):
+        return False, "unsupported password hash format in /etc/shadow"
+    algo = stored.split("$")[1] if len(stored.split("$")) > 1 else ""
+    salt_spec = stored.rsplit("$", 1)[0]          # "$6$salt" / "$6$rounds=N$salt"
+    plain_salt = salt_spec.rsplit("$", 1)[-1]
+    # Pure Python first: `crypt` was removed in Python 3.13, busybox cryptpw does
+    # not reproduce `$6$` on Alpine, and openssl is not guaranteed to be installed
+    # (a missing openssl used to make every administrator login fail).
+    if mu.verify_shadow_password(stored, password):
+        return True, ""
+    candidates = [
+        ["busybox", "cryptpw", "-P", "0", "-m", f"sha{algo}" if algo in ("256", "512") else "sha512",
+         "-S", salt_spec],
+        ["openssl", "passwd", f"-{algo or '6'}", "-salt", plain_salt, "-stdin"],
+    ]
+    for cmd in candidates:
+        try:
+            res = subprocess.run(cmd, input=password, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if res.returncode == 0 and res.stdout.strip() == stored:
+            return True, ""
+    return False, "password does not match"
+
+
+def verify_admin_password(password: str, cfg: dict, st: dict) -> tuple[bool, str]:
+    """True when `password` belongs to *some* administrator.
+
+    Used as the escalation gate: a normal user may go beyond the curated plugin
+    list (or remove something an administrator installed) only by proving they
+    hold an administrator's password.
+    """
+    if not password:
+        return False, "administrator password required"
+    for sysuser in system_admin_names(cfg):
+        ok, _why = verify_system_password(sysuser, password)
+        if ok:
+            return True, sysuser
+    algo = str(cfg.get("password_algo") or "pbkdf2sha256")
+    for name, user in (st.get("users") or {}).items():
+        if str(user.get("role")) != "admin" or not user.get("pw"):
+            continue
+        if str(user.get("pw")).startswith(("scrypt$", "pbkdf2sha256$")):
+            try:
+                if mu.verify_password_hash(password, str(user["pw"])):
+                    return True, name
+            except Exception:  # noqa: BLE001 - a bad hash must not 500 the route
+                continue
+    return False, "administrator password is not valid"
+
+
+def parse_since(value: str) -> int:
+    """Accept epoch seconds (`1792086668`) or an ISO date/time (`2026-10-15`)."""
+    value = (value or "").strip()
+    if not value:
+        return 0
+    if value.isdigit():
+        return int(value)
+    try:
+        from datetime import datetime, timezone
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp())
+    except ValueError:
+        return 0
+
+
+def read_audit(limit: int = 100) -> list[dict]:
+    if not os.path.exists(AUDIT_PATH):
+        return []
+    try:
+        with open(AUDIT_PATH, errors="replace") as fh:
+            lines = fh.readlines()[-max(1, min(limit, 2000)):]
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return list(reversed(out))
+
+
+# ------------------------------------------------------------------- API views
+
+
+def users_view(st: dict) -> list[dict]:
+    """Users without credential material (never expose `pw`)."""
+    return [
+        {
+            "name": name,
+            "role": user.get("role", "user"),
+            "enabled": bool(user.get("enabled", True)),
+            "epoch": int(user.get("epoch", 0)),
+            "instance": user.get("instance") or "",
+            "must_change": bool(user.get("must_change")),
+            "created_at": user.get("created_at", 0),
+            "updated_at": user.get("updated_at", 0),
+        }
+        for name, user in sorted(st["users"].items())
+    ]
+
+
+def mu_exc_message(exc: BaseException) -> str:
+    """The message a `dshmuctl.die()` carried, falling back to str(exc)."""
+    return str(getattr(exc, "message", "") or exc)
+
+
+def instance_view(st: dict, name: str) -> dict:
+    inst = st["instances"][name]
+    port = int(inst.get("port", 0))
+    provider = inst.get("provider") or {}
+    # The provider table on the page shows a credential column: it used to read
+    # `key_set`/`key_source`, which this view never returned - so the column always
+    # said "not set", even right after a key had been stored.
+    try:
+        _key, key_source = mu.provider_credentials(st, name)
+    except Exception:  # noqa: BLE001 - a broken store must not break the list
+        _key, key_source = None, "none"
+    try:
+        resources = mu.instance_resources(name)
+    except Exception:  # noqa: BLE001 - metrics must never break the instance list
+        resources = {}
+    return {
+        "name": name,
+        "resources": resources,
+        "user": inst.get("user", ""),
+        "port": port,
+        "state": inst.get("state", "?"),
+        "live": mu.port_in_use(port),
+        "cookie": bool(inst.get("upstream", {}).get("cookie")),
+        "uid": int(inst.get("uid", 0)),
+        "limits": {k: inst.get(k) for k in ("cpu_max", "mem_max", "mem_high", "pids_max")},
+        "limits_human": mu.human_limits(inst),
+        "provider": provider.get("preset", "deepseek"),
+        "provider_model": provider.get("model", ""),
+        "key_set": bool(_key),
+        "key_source": key_source,
+        "service_installed": os.path.exists(f"/etc/init.d/dsh-mu-{name}"),
+        "boot_start": os.path.exists(f"/etc/runlevels/default/dsh-mu-{name}"),
+        "disk_mb": mu._du_mb(f"{mu.INSTANCES_DIR}/{name}"),
+        "log_bytes": (os.path.getsize(f"{mu.LOGS}/{name}.log")
+                      if os.path.exists(f"{mu.LOGS}/{name}.log") else 0),
+        "restarts": int(inst.get("restarts", 0)),
+        "port_range": [int(x) for x in (st["config"].get("port_range") or [])],
+    }
+
+
+def instances_view(st: dict) -> list[dict]:
+    return [instance_view(st, name) for name in sorted(st["instances"])]
+
+
+def overview(st: dict, cfg: dict) -> dict:
+    instances = instances_view(st)
+    checks = mu.doctor_checks(st)
+    summary: dict[str, int] = {}
+    for check in checks:
+        summary[check["status"]] = summary.get(check["status"], 0) + 1
+    files = mu.platform_log_files()
+    return {
+        "version": VERSION,
+        "uptime_s": int(time.time() - STARTED),
+        "platform": {
+            "gateway_host": cfg.get("gateway_host"),
+            "gateway_listen": cfg.get("gateway_listen"),
+            "config_file": mu.CONF_PATH,
+            "state_schema": st.get("schema"),
+            "alpine": mu.host_alpine_version(),
+            "dsh_version": mu.installed_dsh_version(),
+            "port_range": cfg.get("port_range"),
+        },
+        "counts": {
+            "users": len(st["users"]),
+            "instances": len(instances),
+            "running": sum(1 for i in instances if i["live"]),
+            "admins": sum(1 for u in st["users"].values() if u.get("role") == "admin"),
+        },
+        "disk": {
+            "free_mb": mu._disk_free_mb(mu.VAR if os.path.isdir(mu.VAR) else "/"),
+            "template_mb": mu._du_mb(mu.TEMPLATE),
+            "logs_mb": sum(os.path.getsize(p) for p in files if os.path.exists(p)) // (1024 * 1024),
+        },
+        "doctor": {"summary": summary,
+                   "failing": [c["check"] for c in checks if c["status"] == mu.DOCTOR_FAIL],
+                   "warning": [c["check"] for c in checks if c["status"] == mu.DOCTOR_WARN]},
+        "instances": instances,
+    }
+
+
+def tail_log(path: str, lines: int) -> dict:
+    """Tail a log, and explain emptiness instead of just returning [].
+
+    logrotate runs with copytruncate (the service holds the descriptor), so the live
+    file legitimately becomes 0 bytes at rotation time. Silently showing "(空)" made
+    that look like the viewer was broken, so: fall back to the rotated copy and say
+    which file the lines came from.
+    """
+    want = max(1, min(lines, 2000))
+    if not os.path.exists(path):
+        return {"file": path, "lines": [], "error": "no such log", "source": "missing"}
+
+    def read_tail(target: str) -> list[str]:
+        with open(target, errors="replace") as fh:
+            return [line.rstrip("\n") for line in fh.readlines()[-want:]]
+
+    try:
+        live = read_tail(path)
+        size = os.path.getsize(path)
+        mtime = int(os.path.getmtime(path))
+    except OSError as exc:
+        return {"file": path, "lines": [], "error": str(exc), "source": "error"}
+
+    if live:
+        return {"file": path, "lines": live, "source": "live", "size": size, "mtime": mtime}
+
+    for suffix in ("1", "2", "gz"):
+        rotated = f"{path}.{suffix}"
+        if not os.path.exists(rotated):
+            continue
+        if suffix == "gz":
+            try:
+                import gzip
+                with gzip.open(rotated, "rt", errors="replace") as fh:
+                    rows = [line.rstrip("\n") for line in fh.readlines()[-want:]]
+            except OSError:
+                continue
+            return {"file": rotated, "lines": rows, "source": "rotated",
+                    "size": os.path.getsize(rotated), "mtime": int(os.path.getmtime(rotated)),
+                    "note": "live log is empty (rotated); showing the rotated copy"}
+        try:
+            rows = read_tail(rotated)
+        except OSError:
+            continue
+        if rows:
+            return {"file": rotated, "lines": rows, "source": "rotated",
+                    "size": os.path.getsize(rotated), "mtime": int(os.path.getmtime(rotated)),
+                    "note": "live log is empty (rotated); showing the rotated copy"}
+
+    return {"file": path, "lines": [], "source": "empty", "size": size, "mtime": mtime,
+            "note": "no output yet since the log was rotated/truncated"}
+
+
+# ------------------------------------------------------------------- mutation
+
+
+def with_state(fn):
+    """Run `fn(state)` under the platform state lock and persist the result."""
+    def wrapper(*args, **kwargs):
+        with mu.state_lock():
+            st = mu.load_state()
+            result = fn(st, *args, **kwargs)
+            mu.save_state(st)
+        return result
+    return wrapper
+
+
+def ns(**kwargs):
+    """Synthetic argparse namespace for the CLI functions we reuse."""
+    return argparse.Namespace(**kwargs)
+
+
+def do_user_create(st: dict, body: dict) -> tuple[int, dict]:
+    name = str(body.get("name", "")).strip().lower()
+    if not name:
+        return 400, {"error": "name is required"}
+    password = body.get("password") or mu.random_password()
+    mu.cmd_user_add(ns(name=name, role=body.get("role", "user"), password=password,
+                       instance=body.get("instance", "auto")))
+    created = mu.load_state()["users"].get(name, {})
+    return 201, {"user": {"name": name, "role": created.get("role"),
+                          "instance": created.get("instance"),
+                          "enabled": created.get("enabled")},
+                 "generated_password": password if not body.get("password") else None}
+
+
+def do_user_password(name: str, body: dict) -> tuple[int, dict]:
+    password = body.get("password") or mu.random_password()
+    mu.cmd_user_passwd(ns(name=name, password=password))
+    return 200, {"user": name, "sessions_invalidated": True,
+                 "generated_password": password if not body.get("password") else None}
+
+
+def do_instance_create(st: dict, body: dict) -> tuple[int, dict]:
+    name = str(body.get("name", "")).strip()
+    if not name:
+        return 400, {"error": "name is required"}
+    mu.cmd_instance_create(ns(name=name, user=body.get("user") or name,
+                              cpu=body.get("cpu_max"), mem=body.get("mem_max"),
+                              pids=body.get("pids_max"), port=body.get("port"),
+                              cpu_cores=body.get("cpu_cores"), mem_mb=body.get("mem_mb"),
+                              pids_num=body.get("pids_num"),
+                              start=bool(body.get("start"))))
+    return 201, {"instance": instance_view(mu.load_state(), name)}
+
+
+def do_instance_action(action: str, name: str, body: dict) -> tuple[int, dict]:
+    if action == "logs":
+        return 200, tail_log(f"{mu.LOGS}/{name}.log", int(body.get("lines", 200)))
+    if action == "start":
+        mu.cmd_instance_start(ns(names=[name], no_wait=True))
+    elif action == "stop":
+        mu.cmd_instance_stop(ns(names=[name]))
+    elif action == "restart":
+        mu.cmd_instance_restart(ns(names=[name], no_wait=True))
+    elif action == "refresh-cookie":
+        mu.cmd_instance_refresh_cookie(ns(names=[name]))
+    elif action == "limits":
+        mu.cmd_instance_limits(ns(name=name, cpu=body.get("cpu_max"),
+                                  mem=body.get("mem_max"), pids=body.get("pids_max")))
+    return 200, {"instance": instance_view(mu.load_state(), name)}
+
+
+# -------------------------------------------------------------------- routing
+
+ROUTES: list[tuple[str, re.Pattern, str]] = [
+    ("GET", re.compile(r"^/api/health$"), "health"),
+    ("GET", re.compile(r"^/api/me$"), "me"),
+    ("POST", re.compile(r"^/api/me/password$"), "me_password"),
+    ("GET", re.compile(r"^/api/overview$"), "overview"),
+    ("GET", re.compile(r"^/api/users$"), "users"),
+    ("GET", re.compile(r"^/api/instances$"), "instances"),
+    ("GET", re.compile(r"^/api/instances/([\w-]+)/logs$"), "instance_logs"),
+    ("GET", re.compile(r"^/api/instances/([\w-]+)/patch$"), "instance_patch"),
+    ("GET", re.compile(r"^/api/instances/([\w-]+)$"), "instance"),
+    ("GET", re.compile(r"^/api/doctor$"), "doctor"),
+    ("GET", re.compile(r"^/api/config$"), "config_get"),
+    ("GET", re.compile(r"^/api/providers$"), "providers"),
+    ("POST", re.compile(r"^/api/providers$"), "provider_save"),
+    ("POST", re.compile(r"^/api/provider-test$"), "provider_test"),
+    ("POST", re.compile(r"^/api/auth/verify$"), "auth_verify"),
+    ("GET", re.compile(r"^/api/auth/status$"), "auth_status"),
+    ("POST", re.compile(r"^/api/instances/([\w-]+)/ensure$"), "instance_ensure"),
+    ("DELETE", re.compile(r"^/api/providers/([\w.-]+)$"), "provider_delete"),
+    ("GET", re.compile(r"^/api/provider-spec$"), "provider_spec"),
+    ("GET", re.compile(r"^/api/packages$"), "package_list"),
+    ("GET", re.compile(r"^/api/packages/([\w.-]+)$"), "package_export"),
+    ("POST", re.compile(r"^/api/packages$"), "package_import"),
+    ("POST", re.compile(r"^/api/packages/([\w.-]+)/refresh$"), "package_refresh"),
+    ("POST", re.compile(r"^/api/packages/([\w.-]+)/usage$"), "package_usage"),
+    ("DELETE", re.compile(r"^/api/packages/([\w.-]+)$"), "package_delete"),
+    ("GET", re.compile(r"^/api/plugins$"), "plugin_list"),
+    ("POST", re.compile(r"^/api/plugins$"), "plugin_catalog"),
+    ("GET", re.compile(r"^/api/me/plugins$"), "me_plugins"),
+    ("POST", re.compile(r"^/api/me/plugins$"), "me_plugin_action"),
+    ("POST", re.compile(r"^/api/me/instance/restart$"), "me_restart"),
+    ("GET", re.compile(r"^/api/me/plans$"), "me_plans"),
+    ("POST", re.compile(r"^/api/me/plans$"), "me_plan_action"),
+    ("GET", re.compile(r"^/api/plans$"), "plan_list"),
+    ("POST", re.compile(r"^/api/plans$"), "plan_add"),
+    ("POST", re.compile(r"^/api/plans/([\w.-]+)/(enable|disable|default)$"), "plan_action"),
+    ("GET", re.compile(r"^/api/mounts$"), "mount_list"),
+    ("POST", re.compile(r"^/api/mounts$"), "mount_save"),
+    ("DELETE", re.compile(r"^/api/mounts$"), "mount_delete"),
+    ("POST", re.compile(r"^/api/plans/([\w.-]+)/probe$"), "plan_probe"),
+    ("POST", re.compile(r"^/api/plans/([\w.-]+)/usage$"), "plan_usage"),
+    ("POST", re.compile(r"^/api/plans/([\w.-]+)/models$"), "plan_models"),
+    ("DELETE", re.compile(r"^/api/plans/([\w.-]+)$"), "plan_delete"),
+    ("POST", re.compile(r"^/api/instances/([\w-]+)/provider/test$"), "instance_provider_test"),
+    ("POST", re.compile(r"^/api/instances/([\w-]+)/key$"), "instance_key_set"),
+    ("DELETE", re.compile(r"^/api/instances/([\w-]+)/key$"), "instance_key_del"),
+    ("GET", re.compile(r"^/api/audit$"), "audit"),
+    ("GET", re.compile(r"^/api/backup$"), "backup"),
+    ("POST", re.compile(r"^/api/users$"), "user_create"),
+    ("POST", re.compile(r"^/api/users/([\w-]+)/password$"), "user_password"),
+    ("POST", re.compile(r"^/api/users/([\w-]+)/(enable|disable)$"), "user_toggle"),
+    ("POST", re.compile(r"^/api/users/([\w-]+)/kick$"), "user_kick"),
+    ("POST", re.compile(r"^/api/instances$"), "instance_create"),
+    ("POST", re.compile(r"^/api/instances/([\w-]+)/(start|stop|restart|refresh-cookie)$"), "instance_action"),
+    ("POST", re.compile(r"^/api/instances/([\w-]+)/provider$"), "instance_provider"),
+    ("POST", re.compile(r"^/api/config$"), "config_set"),
+    ("PATCH", re.compile(r"^/api/instances/([\w-]+)$"), "instance_limits"),
+    ("DELETE", re.compile(r"^/api/users/([\w-]+)$"), "user_delete"),
+    ("DELETE", re.compile(r"^/api/instances/([\w-]+)$"), "instance_delete"),
+]
+
+# restarting or refreshing an instance waits for the harness banner, which can
+# take tens of seconds: accept the request, run it in a thread, audit the result.
+SLOW_ACTIONS = {"start", "restart", "refresh-cookie"}
+
+MUTATING = {"auth_verify", "instance_ensure", "provider_save", "provider_delete", "instance_key_set", "instance_key_del",
+            "package_import", "package_delete", "plan_add", "plan_action", "plan_delete",
+            "plan_probe", "plan_usage", "plan_models",
+            "mount_list", "mount_save", "mount_delete",
+            "me_plan_action", "me_restart", "me_plugin_action", "plugin_catalog",
+            "me_password", "user_create", "user_password", "user_toggle", "user_delete",
+            "instance_create", "instance_action", "instance_limits",
+            "instance_delete", "instance_provider", "config_set"}
+
+
+def run_async(fn, actor: str, action: str, target: str, ip: str) -> None:
+    """Run a slow platform operation without blocking the HTTP request."""
+    def worker():
+        status = 200
+        try:
+            fn()
+        except SystemExit as exc:
+            status = 400
+            sys.stderr.write(f"dsh-mud: async {action} {target} refused: {exc}\n")
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            status = 500
+        audit(actor, action, target, {"status": status, "async": True}, ip)
+    threading.Thread(target=worker, daemon=True, name=f"{action}:{target}").start()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = f"dsh-mud/{VERSION}"
+    protocol_version = "HTTP/1.1"
+
+    # ------------------------------------------------------------- plumbing
+    def log_message(self, fmt, *args):  # keep stderr structured for the service log
+        sys.stderr.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {self.client_address[0]} {fmt % args}\n")
+
+    def _send(self, status: int, payload):
+        body = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, status: int, body: bytes):
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_no_content(self):
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _body(self) -> dict:
+        """Parse the JSON body, remembering *why* it could not be used.
+
+        A malformed body used to look identical to an empty one, so the handler
+        answered "name is required" instead of saying the JSON was broken - which
+        is what the admin page shows the operator.
+        """
+        self._body_error = ""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._body_error = "invalid Content-Length"
+            return {}
+        if length <= 0:
+            return {}
+        if length > MAX_BODY_BYTES:
+            self._body_error = f"body larger than {MAX_BODY_BYTES} bytes"
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            parsed = json.loads(raw.decode() or "{}")
+        except (ValueError, UnicodeDecodeError) as exc:
+            self._body_error = f"invalid JSON body ({exc})"
+            return {}
+        if not isinstance(parsed, dict):
+            self._body_error = "JSON body must be an object"
+            return {}
+        return parsed
+
+    def _allowed(self) -> tuple[bool, str]:
+        if self.client_address[0] not in ("127.0.0.1", "::1"):
+            return False, "loopback only"
+        expected = (mu.read_text(TOKEN_PATH) or "").strip()
+        if expected and self.headers.get("X-DSH-MU-Admin", "") != expected:
+            return False, "missing or wrong X-DSH-MU-Admin token"
+        return True, ""
+
+    def do_GET(self):
+        self._dispatch("GET")
+
+    def do_POST(self):
+        self._dispatch("POST")
+
+    def do_PATCH(self):
+        self._dispatch("PATCH")
+
+    def do_DELETE(self):
+        self._dispatch("DELETE")
+
+    def _dispatch(self, method: str):
+        started = time.time()
+        ok, why = self._allowed()
+        if not ok:
+            return self._send(403, {"error": why})
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        query = parse_qs(parsed.query)
+        body = self._body() if method in ("POST", "PATCH", "PUT", "DELETE") else {}
+        actor = self.headers.get("X-DSH-MU-User") or query.get("actor", [""])[0]
+        if method == "GET" and not path.startswith("/api/"):
+            if path in ("/", "/index.html"):
+                body_bytes = mu.read_text(INDEX_PATH)
+                if body_bytes is None:
+                    return self._send(503, {"error": "admin page missing",
+                                            "detail": f"{INDEX_PATH} not installed"})
+                return self._send_html(200, body_bytes.encode())
+            if path == "/favicon.ico":
+                return self._send_no_content()
+            return self._send(404, {"error": "not found", "path": path})
+        for route_method, pattern, name in ROUTES:
+            if route_method != method:
+                continue
+            match = pattern.match(path)
+            if not match:
+                continue
+            try:
+                status, payload = self._run(name, match, body, query, actor,
+                                            self.client_address[0])
+            except SystemExit as exc:  # dshmuctl.die()
+                status, payload = 400, {"error": "operation refused",
+                                             "detail": mu_exc_message(exc) or "dshmuctl exited"}
+            except Exception as exc:  # noqa: BLE001 - report any failure to the caller
+                traceback.print_exc()
+                status, payload = 500, {"error": type(exc).__name__, "detail": str(exc)}
+            if getattr(self, "_body_error", "") and status >= 400:
+                payload = {"error": self._body_error, "detail": payload.get("error", "")
+                           if isinstance(payload, dict) else ""}
+            if payload is None:  # handler already wrote the raw response
+                self.log_message("%s %s -> raw (%dms) actor=%s", method, path,
+                                 int((time.time() - started) * 1000), actor or "-")
+                return
+            if name in MUTATING and not payload.pop("_audited", False):
+                audit(actor, name, match.group(1) if match.groups() else "",
+                      {"status": status, "method": method, "path": path,
+                       "body": {k: v for k, v in body.items()
+                                if "password" not in k and "api_key" not in k}},
+                      self.client_address[0])
+            self.log_message("%s %s -> %s (%dms) actor=%s", method, path, status,
+                             int((time.time() - started) * 1000), actor or "-")
+            return self._send(status, payload)
+        return self._send(404, {"error": "unknown endpoint", "path": path})
+
+    # -------------------------------------------------------------- handlers
+    def _run(self, name: str, match: re.Match, body: dict, query: dict,
+             actor: str = "", ip: str = "") -> tuple[int, dict]:
+        groups = match.groups()
+        if name == "provider_spec":
+            return 200, {"spec": mu.PROVIDER_SPEC_TEXT}
+        if name == "package_list":
+            rows = []
+            for pid, pkg in sorted(mu.list_provider_packages().items()):
+                rows.append({"id": pid, "label": pkg.get("label") or pid,
+                             "base_url": pkg.get("base_url"),
+                             "models": len(pkg.get("models") or []),
+                             "apis": sorted({m.get("api") for m in pkg.get("models") or []}),
+                             "default_model": pkg.get("default_model"),
+                             "discover": bool(pkg.get("discover")),
+                             "usage": bool(pkg.get("usage"))})
+            return 200, {"packages": rows}
+        if name == "package_export":
+            pkg = mu.load_provider_package(groups[0])
+            if not pkg:
+                return 404, {"error": "no such package", "id": groups[0]}
+            return 200, {"package": pkg}
+        if name == "package_import":
+            raw = body.get("text") or ""
+            if not raw and isinstance(body.get("package"), dict):
+                doc = body["package"]
+            else:
+                try:
+                    doc = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    return 400, {"error": "invalid JSON", "detail": str(exc)}
+            pkg, problems = mu.validate_provider_package(doc)
+            if problems:
+                return 400, {"error": "the provider file has problems", "problems": problems}
+            if body.get("dry_run"):
+                return 200, {"ok": True, "dry_run": True, "id": pkg["id"],
+                             "models": len(pkg["models"]), "default_model": pkg["default_model"]}
+            target = mu.save_provider_package(pkg)
+            custom = mu.load_custom_providers()
+            custom[pkg["id"]] = mu.provider_package_to_defn(pkg)
+            mu.save_custom_providers(custom)
+            return 200, {"ok": True, "id": pkg["id"], "saved_to": target,
+                         "models": len(pkg["models"]),
+                         "default_model": pkg["default_model"]}
+        if name in ("package_refresh", "package_usage"):
+            pid = groups[0]
+            pkg = mu.load_provider_package(pid)
+            if not pkg:
+                return 404, {"error": "no such package", "id": pid}
+            st = mu.load_state()
+            key = str(body.get("key") or "").strip()
+            if not key:
+                first = next(iter(st["instances"]), None)
+                key = (mu.provider_credentials(st, first)[0] if first else None) or \
+                      str(st["config"].get("model_api_key") or "")
+            if not key:
+                return 400, {"error": "no credential", "detail": "pass a key or set a platform key"}
+            if name == "package_usage":
+                res = mu.provider_usage(pkg, key)
+                if not res.get("ok"):
+                    return 502, {"error": "usage probe failed", "detail": res.get("error"),
+                                 "status": res.get("status")}
+                return 200, {"windows": res["windows"]}
+            res = mu.provider_discover(pkg, key)
+            if not res.get("ok"):
+                return 502, {"error": "model discovery failed", "detail": res.get("error"),
+                             "status": res.get("status")}
+            known = {m["id"] for m in pkg["models"]}
+            merged = list(pkg["models"])
+            detected = {}
+            for row in res["models"]:
+                if row["id"] not in known:
+                    new_row = {"id": row["id"], "api": pkg["api"], "base_url": pkg["base_url"]}
+                    for k in ("name", "contextWindow", "maxTokens"):
+                        if k in row:
+                            new_row[k] = row[k]
+                    api = mu.provider_detect_api(pkg, key, row["id"])
+                    if api:
+                        new_row["api"] = api
+                        detected[row["id"]] = api
+                    merged.append(new_row)
+            pkg["models"] = merged
+            mu.save_provider_package(pkg)
+            return 200, {"found": len(res["models"]), "added": len(merged) - len(known),
+                         "detected": detected, "models": len(merged)}
+        if name == "package_delete":
+            path = f"{mu.PROVIDERS_DIR}/{groups[0]}.json"
+            if not os.path.exists(path):
+                return 404, {"error": "no such package", "id": groups[0]}
+            os.unlink(path)
+            return 200, {"ok": True, "id": groups[0]}
+        if name == "plugin_list":
+            st_ = mu.load_state()
+            return 200, {"plugins": mu.plugins_catalog(st_),
+                         "instances": {n: mu.instance_plugins(n)
+                                       for n in sorted((st_.get("instances") or {}))}}
+        if name == "plugin_catalog":
+            action = str(body.get("action") or "add").strip()
+            pkg = str(body.get("pkg") or "").strip()
+            version = str(body.get("version") or "").strip()
+            note = str(body.get("note") or "").strip()
+            if not pkg or not mu.PLUGIN_PKG_RE.match(pkg):
+                return 400, {"error": "invalid package name", "got": pkg[:80]}
+            if version and not mu.PLUGIN_VER_RE.match(version):
+                return 400, {"error": "invalid version", "got": version[:40]}
+            with mu.state_lock():
+                st_ = mu.load_state()
+                rows = [e for e in (st_.get("plugins_catalog") or [])
+                        if str(e.get("pkg")) != pkg]
+                if action == "add":
+                    rows.append({"pkg": pkg, "version": version, "note": note[:200],
+                                 "added_at": int(__import__("time").time()),
+                                 "added_by": str(actor or "")})
+                    st_["plugins_catalog"] = rows
+                    mu.save_state(st_)
+                    audit(actor, "plugin.catalog.add", pkg, {"version": version}, "")
+                    return 200, {"ok": True, "pkg": pkg, "plugins": mu.plugins_catalog(st_)}
+                if action == "remove":
+                    if len(rows) == len(st_.get("plugins_catalog") or []):
+                        return 404, {"error": "not in the catalog", "pkg": pkg}
+                    st_["plugins_catalog"] = rows
+                    mu.save_state(st_)
+                    audit(actor, "plugin.catalog.remove", pkg, {}, "")
+                    return 200, {"ok": True, "pkg": pkg, "plugins": mu.plugins_catalog(st_)}
+            return 400, {"error": "unknown action", "action": action}
+        if name == "me_plugins":
+            actor_user = str(actor or "").strip()
+            st_ = mu.load_state()
+            if actor_user not in (st_.get("users") or {}):
+                return 403, {"error": "not a platform account", "user": actor_user}
+            inst = str((st_["users"].get(actor_user) or {}).get("instance") or "")
+            catalog = mu.plugins_catalog(st_)
+            return 200, {"catalog": catalog,
+                         "instance": inst,
+                         "installed": mu.instance_plugins(inst) if inst else [],
+                         "profile": mu.instance_profile(inst) if inst else ""}
+        if name == "me_plugin_action":
+            actor_user = str(actor or "").strip()
+            st_ = mu.load_state()
+            user = (st_.get("users") or {}).get(actor_user)
+            if not user:
+                return 403, {"error": "not a platform account", "user": actor_user}
+            inst = str(user.get("instance") or "")
+            if not inst or inst not in (st_.get("instances") or {}):
+                return 400, {"error": "no instance", "detail": "this account has no instance yet"}
+            action = str(body.get("action") or "").strip()
+            pkg = str(body.get("pkg") or "").strip()
+            version = str(body.get("version") or "").strip()
+            if action not in ("install", "uninstall"):
+                return 400, {"error": "unknown action", "action": action}
+            if not pkg or not mu.PLUGIN_PKG_RE.match(pkg):
+                return 400, {"error": "invalid package name", "got": pkg[:80]}
+            if version and not mu.PLUGIN_VER_RE.match(version):
+                return 400, {"error": "invalid version", "got": version[:40]}
+            catalog = {str(e.get("pkg")): e for e in mu.plugins_catalog(st_)}
+            curated = pkg in catalog
+            installed = {r["pkg"]: r for r in mu.instance_plugins(inst)}
+            # the one rule: anything that goes beyond the curated list needs an
+            # administrator's password (installing something else, or removing
+            # something the administrator put there)
+            needs_admin = (not curated) if action == "install" else curated
+            if needs_admin:
+                cfg_ = mu.load_config()
+                ok, who = verify_admin_password(str(body.get("admin_password") or ""), cfg_, st_)
+                if not ok:
+                    return 403, {"error": "administrator password required",
+                                 "needs_admin_password": True,
+                                 "reason": who,
+                                 "detail": ("不在管理员清单里的包，需要管理员密码"
+                                            if action == "install" else
+                                            "这是管理员提供的插件，卸载需要管理员密码")}
+                audit(actor_user, f"plugin.{action}.approved", pkg,
+                      {"instance": inst, "approved_by": who}, "")
+            if action == "uninstall" and pkg not in installed:
+                return 404, {"error": "not installed", "pkg": pkg}
+            if action == "install" and pkg in installed:
+                return 409, {"error": "already installed", "pkg": pkg,
+                             "version": installed[pkg]["version"]}
+            try:
+                ok, out = mu.plugin_exec(inst, "add" if action == "install" else "remove",
+                                         pkg, version or None)
+            except Exception as exc:  # noqa: BLE001
+                return 500, {"error": "plugin command failed", "detail": mu_exc_message(exc)}
+            if not ok:
+                return 400, {"error": "plugin command failed", "detail": out[-600:]}
+            mu.record_plugin(mu.load_state(), inst, pkg,
+                             version or mu._installed_version(inst, pkg),
+                             "curated" if curated else "self", actor_user,
+                             present=(action == "install"))
+            audit(actor_user, f"plugin.{action}", pkg, {"instance": inst, "version": version}, "")
+            return 200, {"ok": True, "action": action, "pkg": pkg,
+                         "installed": mu.instance_plugins(inst),
+                         "detail": "restart the instance to apply"}
+        if name == "me_restart":
+            actor_user = str(actor or "").strip()
+            if not actor_user:
+                return 401, {"error": "no acting user"}
+            st = mu.load_state()
+            user = (st.get("users") or {}).get(actor_user)
+            if not user:
+                return 403, {"error": "not a platform account", "user": actor_user}
+            inst = str(user.get("instance") or "")
+            if not inst or inst not in (st.get("instances") or {}):
+                return 400, {"error": "no instance", "detail": "this account has no instance yet"}
+            audit(actor_user, "me.restart", inst, {}, "")
+            try:
+                mu.stop_instance(st, inst)
+                mu.start_instance(st, inst)
+            except Exception as exc:  # noqa: BLE001 - report, do not 500
+                return 500, {"error": "restart failed", "detail": mu_exc_message(exc)}
+            fresh = mu.load_state()
+            return 202, {"accepted": True, "instance": inst,
+                         "state": (fresh["instances"].get(inst) or {}).get("state", "unknown")}
+        if name in ("me_plans", "me_plan_action"):
+            actor_user = str(actor or "").strip()
+            if not actor_user:
+                return 401, {"error": "no acting user"}
+            st = mu.load_state()
+            if actor_user not in (st.get("users") or {}):
+                return 403, {"error": "not a platform account", "user": actor_user}
+            if name == "me_plans":
+                rows = []
+                visible = [pl for pl in mu.plans_for_user(actor_user)]
+                default_id = ""
+                wanted = str((mu.load_config() or {}).get("default_plan") or "")
+                if wanted and any(pl["id"] == wanted for pl in visible):
+                    default_id = wanted
+                elif visible:
+                    default_id = sorted(visible,
+                                        key=lambda p: str(p.get("name") or p["id"]))[0]["id"]
+                for plan in sorted(mu.plans_for_user(actor_user),
+                                   key=lambda p: str(p.get("name") or p.get("id"))):
+                    pid = plan["id"]
+                    own = str(plan.get("owner") or "*") == actor_user
+                    rows.append({"id": pid, "name": plan.get("name"),
+                                 "provider": plan.get("provider"), "own": own,
+                                 "team": not own, "is_default": pid == default_id,
+                                 "enabled": bool(plan.get("enabled", True)),
+                                 "models": plan.get("models") or [],
+                                 "available_models": plan.get("available_models"),
+                                 "last_probe": plan.get("last_probe") or {},
+                                 "effective_models": mu.plan_effective_models(plan),
+                                 "has_key": bool(plan.get("has_key")),
+                                 "default_model": plan.get("default_model") or ""})
+                providers = []
+                for pid, pkg in sorted(mu.list_provider_packages().items()):
+                    pkg = mu.fill_from_preset(pkg)
+                    providers.append({"id": pid, "label": pkg.get("label") or pid,
+                                      "models": [{"id": m["id"], "name": m.get("name") or "",
+                                                  "reasoningEfforts": m.get("reasoningEfforts")}
+                                                 for m in pkg.get("models") or []]})
+                # Built-in presets are NOT offered here: an operator imports the
+                # packages they want, and the drawer only lists those (a preset the
+                # user never saw appear out of nowhere was confusing).
+                return 200, {"plans": rows, "providers": providers,
+                             "default": default_id,
+                             "team_plans_are_readonly": True}
+            action = str(body.get("action") or "")
+            if action == "add":
+                name_ = str(body.get("name") or "").strip()
+                provider = str(body.get("provider") or "").strip()
+                key = str(body.get("key") or "").strip()
+                pkg = mu.load_provider_package(provider) or mu.preset_as_package(provider)
+                if not pkg:
+                    return 400, {"error": "unknown provider", "provider": provider}
+                if not name_:
+                    return 400, {"error": "a name is required"}
+                if not key:
+                    return 400, {"error": "a credential is required"}
+                models = [str(m) for m in (body.get("models") or []) if str(m).strip()]
+                known = {m["id"] for m in pkg.get("models") or []}
+                bad = [m for m in models if m not in known]
+                if bad:
+                    return 400, {"error": "models not in the provider", "models": bad}
+                plan = {"schema": mu.PLAN_SCHEMA, "id": mu.plan_id_for(actor_user + "/" + name_),
+                        "name": name_, "provider": pkg["id"], "owner": actor_user,
+                        "visible_to": [actor_user], "enabled": True,
+                        "models": models, "default_model": str(body.get("default_model") or "")}
+                saved = mu.save_plan(plan, key=key)
+                mu.sync_all(st)
+                return 200, {"ok": True, "plan": {"id": saved["id"], "name": saved["name"],
+                                                  "provider": saved["provider"]},
+                             "note": "restart your instance to pick up the new plan"}
+            pid = str(body.get("id") or "").strip()
+            plan = mu.load_plan(pid) if pid else None
+            if not plan:
+                return 404, {"error": "no such plan", "id": pid}
+            if str(plan.get("owner") or "*") != actor_user:
+                return 403, {"error": "team plans are read-only",
+                             "detail": "ask the platform administrator to change or remove it"}
+            if action == "models":
+                res = mu.set_plan_models(plan, body.get("models") or [],
+                                         select_all_available=bool(body.get("all_available")))
+                if not res.get("ok"):
+                    return 400, {"error": res.get("error"),
+                                 "unusable": res.get("unusable") or [],
+                                 "unknown": res.get("unknown") or []}
+                mu.sync_all(st)
+                return 200, {"ok": True, "id": pid, "models": res["models"],
+                             "count": res["count"],
+                             "note": "restart your instance to apply"}
+            if action == "probe":
+                res = mu.plan_probe_models(plan)
+                if not res.get("ok"):
+                    return 502, {"error": res.get("error"), "status": res.get("status")}
+                fresh = mu.load_plan(pid) or plan
+                return 200, {"ok": True, "available": res["available"],
+                             "unknown": res["unknown"], "added": res["added"],
+                             "lost": res["lost"], "first": res["first"],
+                             "before": res["before"], "last_probe": res["last_probe"],
+                             "effective": mu.plan_effective_models(fresh)}
+            if action == "rename":
+                new_name = str(body.get("name") or "").strip()
+                if not new_name:
+                    return 400, {"error": "a name is required"}
+                plan["name"] = new_name
+                mu.save_plan(plan)
+                mu.sync_all(st)
+                return 200, {"ok": True, "id": pid, "name": new_name,
+                             "note": "restart your instance to apply"}
+            if action == "delete":
+                for path in (f"{mu.PLANS_DIR}/{pid}.json", mu.plan_key_path(pid)):
+                    with contextlib.suppress(OSError):
+                        os.unlink(path)
+                mu.sync_all(st)
+                return 200, {"ok": True, "id": pid, "note": "restart your instance to apply"}
+            return 400, {"error": "unknown action", "action": action}
+        if name in ("mount_list", "mount_save", "mount_delete"):
+            st = mu.load_state()
+            if name == "mount_list":
+                rows = []
+                for inst_name, inst in sorted(st["instances"].items()):
+                    for row in mu.parse_mount_specs(inst):
+                        rows.append({"instance": inst_name, "host": row["host"],
+                                     "jail": row["jail"], "mode": row["mode"],
+                                     "exists": os.path.isdir(row["host"])})
+                return 200, {"mounts": rows,
+                             "instances": sorted(st["instances"])}
+            inst_name = str(body.get("instance") or "")
+            inst = st["instances"].get(inst_name)
+            if not inst:
+                return 404, {"error": "no such instance", "instance": inst_name}
+            host = str(body.get("host") or "").strip()
+            jail = str(body.get("jail") or "").strip() or host
+            mode = "rw" if str(body.get("mode") or "") == "rw" else "ro"
+            targets = sorted(st["instances"]) if body.get("all") else [inst_name]
+            if name == "mount_delete":
+                # Prefer the jail path: one host directory may be mounted at several
+                # jail paths, and removing by host would delete all of them at once.
+                jail_key = "/" + str(body.get("jail") or "").strip("/")
+                for target in targets:
+                    rows = [r for r in mu.parse_mount_specs(st["instances"][target])
+                            if (r["jail"] != jail_key if len(jail_key) > 1
+                                else r["host"] != os.path.abspath(host))]
+                    mu.set_instance_mounts(
+                        target, [(r["host"], r["jail"], r["mode"]) for r in rows])
+                mu.sync_all(mu.load_state())
+                return 200, {"ok": True, "restart_required": True, "targets": targets}
+            problems = mu.validate_mount(host, jail, mode, st["instances"])
+            if problems:
+                return 400, {"error": "invalid mount", "problems": problems}
+            for target in targets:
+                rows = [r for r in mu.parse_mount_specs(st["instances"][target])
+                        if r["jail"] != "/" + jail.strip("/")]
+                rows.append({"host": host, "jail": jail, "mode": mode})
+                mu.set_instance_mounts(
+                    target, [(r["host"], r["jail"], r["mode"]) for r in rows])
+            # Reload: set_instance_mounts persisted its own copy, and sync_all would
+            # otherwise write this handler's stale `st` back over it.
+            mu.sync_all(mu.load_state())
+            return 200, {"ok": True, "restart_required": True, "targets": targets,
+                         "note": "restart the affected instances to apply"}
+        if name in ("plan_probe", "plan_usage", "plan_models"):
+            pid = groups[0]
+            plan = mu.load_plan(pid)
+            if not plan:
+                return 404, {"error": "no such plan", "id": pid}
+            if name == "plan_probe":
+                res = mu.plan_probe_models(plan)
+                if not res.get("ok"):
+                    return 502, {"error": res.get("error"), "status": res.get("status")}
+                fresh = mu.load_plan(pid) or plan
+                return 200, {"ok": True, "available": res["available"],
+                             "unknown": res["unknown"], "catalog": res["catalog"],
+                             "added": res["added"], "lost": res["lost"],
+                             "first": res["first"], "before": res["before"],
+                             "effective": mu.plan_effective_models(fresh),
+                             "probed_at": fresh.get("probed_at") or 0,
+                             "last_probe": res["last_probe"],
+                             "restart_required": True}
+            if name == "plan_usage":
+                res = mu.plan_probe_usage(plan)
+                if not res.get("ok"):
+                    return 502, {"error": res.get("error"), "status": res.get("status")}
+                return 200, {"windows": res.get("windows") or []}
+            res = mu.set_plan_models(plan, body.get("models") or [],
+                                     select_all_available=bool(body.get("all_available")),
+                                     clear=bool(body.get("clear")))
+            if not res.get("ok"):
+                return 400, {"error": res.get("error"),
+                             "unusable": res.get("unusable") or [],
+                             "unknown": res.get("unknown") or []}
+            return 200, {"ok": True, "models": res["models"], "count": res["count"],
+                         "restart_required": True}
+        if name == "plan_list":
+            st = mu.load_state()
+            plans = mu.list_plans()
+            rows = []
+            for pid, plan in sorted(plans.items(), key=lambda kv: str(kv[1].get("name") or kv[0])):
+                rows.append({"id": pid, "name": plan.get("name"), "provider": plan.get("provider"),
+                             "owner": plan.get("owner") or "*",
+                             "visible_to": plan.get("visible_to") or ["*"],
+                             "enabled": bool(plan.get("enabled", True)),
+                             "models": plan.get("models") or [],
+                             "available_models": plan.get("available_models"),
+                             "probed_at": plan.get("probed_at") or 0,
+                             "last_probe": plan.get("last_probe") or {},
+                             "effective_models": mu.plan_effective_models(plan),
+                             "has_key": bool(plan.get("has_key")),
+                             "default_model": plan.get("default_model") or ""})
+            return 200, {"plans": rows, "default": st["config"].get("default_plan") or ""}
+        if name == "plan_add":
+            st = mu.load_state()
+            pkg = mu.load_provider_package(str(body.get("provider") or "")) or \
+                mu.preset_as_package(str(body.get("provider") or ""))
+            if not pkg:
+                return 400, {"error": "unknown provider", "provider": body.get("provider")}
+            name_ = str(body.get("name") or "").strip()
+            if not name_:
+                return 400, {"error": "name is required"}
+            key = str(body.get("key") or "").strip()
+            if not key:
+                return 400, {"error": "a credential is required"}
+            models = [m for m in (body.get("models") or []) if m]
+            known = {m["id"] for m in pkg["models"]}
+            bad = [m for m in models if m not in known]
+            if bad:
+                return 400, {"error": "models not in the provider", "models": bad}
+            owner = str(body.get("owner") or "*")
+            visible = [str(v) for v in (body.get("visible_to") or []) if str(v).strip()]
+            if owner != "*" and not visible:
+                visible = [owner]
+            plan = {"schema": mu.PLAN_SCHEMA, "id": mu.plan_id_for(name_), "name": name_,
+                    "provider": pkg["id"], "owner": owner, "visible_to": visible or ["*"],
+                    "enabled": True, "models": models,
+                    "default_model": str(body.get("default_model") or "")}
+            saved = mu.save_plan(plan, key=key)
+            if body.get("default") and owner == "*":
+                st["config"]["default_plan"] = saved["id"]
+                mu.save_config(st["config"])
+            mu.sync_all(st)
+            return 200, {"ok": True, "plan": {k: v for k, v in saved.items() if k != "has_key"}}
+        if name == "plan_action":
+            st = mu.load_state()
+            pid, action = groups
+            plan = mu.load_plan(pid)
+            if not plan:
+                return 404, {"error": "no such plan", "id": pid}
+            if action == "default":
+                if str(plan.get("owner") or "*") != "*":
+                    return 400, {"error": "only team plans can be the platform default"}
+                st["config"]["default_plan"] = pid
+                mu.save_config(st["config"])
+            else:
+                plan["enabled"] = action == "enable"
+                mu.save_plan(plan)
+            mu.sync_all(st)
+            return 200, {"ok": True, "id": pid, "action": action}
+        if name == "plan_delete":
+            st = mu.load_state()
+            pid = groups[0]
+            if not mu.load_plan(pid):
+                return 404, {"error": "no such plan", "id": pid}
+            for path in (f"{mu.PLANS_DIR}/{pid}.json", mu.plan_key_path(pid)):
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+            if str(st["config"].get("default_plan") or "") == pid:
+                st["config"].pop("default_plan", None)
+                mu.save_config(st["config"])
+            mu.sync_all(st)
+            return 200, {"ok": True, "id": pid}
+
+        if name == "health":
+            return 200, {"ok": True, "version": VERSION, "uptime_s": int(time.time() - STARTED),
+                         "token_required": os.path.exists(TOKEN_PATH)}
+        if name == "doctor":
+            st = mu.load_state()
+            checks = mu.doctor_checks(st)
+            summary: dict[str, int] = {}
+            for check in checks:
+                summary[check["status"]] = summary.get(check["status"], 0) + 1
+            return 200, {"checks": checks, "summary": summary}
+        st = mu.load_state()
+        cfg = st["config"]
+        if name == "me":
+            actor = self.headers.get("X-DSH-MU-User") or ""
+            user = st["users"].get(actor) or {}
+            return 200, {"user": actor, "role": user.get("role", "user"),
+                         "must_change": bool(user.get("must_change")),
+                         "instance": user.get("instance") or ""}
+        if name == "overview":
+            return 200, overview(st, cfg)
+        if name == "users":
+            return 200, {"users": users_view(st)}
+        if name == "instances":
+            return 200, {"instances": instances_view(st)}
+        if name == "instance":
+            if groups[0] not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": groups[0]}
+            return 200, {"instance": instance_view(st, groups[0])}
+        if name == "instance_logs":
+            if groups[0] not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": groups[0]}
+            raw_lines = query.get("lines", ["200"])[0]
+            try:
+                # A typo used to surface as a 500 ValueError; name the field instead.
+                want_lines = int(raw_lines)
+            except (TypeError, ValueError):
+                return 400, {"error": "lines must be an integer", "got": str(raw_lines)[:32],
+                             "detail": "the log tail is clamped to 1..2000 lines"}
+            payload = tail_log(f"{mu.LOGS}/{groups[0]}.log", want_lines)
+            # The launcher prints its one-time launch URL to the service log, which
+            # carries the session token. The file stays root-only, but the API should
+            # not hand that token to anyone reading logs.
+            payload["lines"] = [re.sub(r"(token=)[A-Za-z0-9_\-]+", r"\1***", line)
+                                for line in payload.get("lines") or []]
+            return 200, payload
+        if name == "config_get":
+            secret_keys = ["model_api_key"]
+            masked = {k: ("***" if k in secret_keys and v else v) for k, v in cfg.items()}
+            return 200, {"config": masked, "secret_keys": secret_keys,
+                         "secrets_set": {k: bool(cfg.get(k)) for k in secret_keys},
+                         "config_file": mu.CONF_PATH}
+        if name == "providers":
+            catalog = mu.all_providers()
+            custom = mu.load_custom_providers()
+            return 200, {"providers": {
+                k: {**v, "custom": k in custom,
+                    "models": v.get("models") or []}
+                for k, v in sorted(catalog.items())},
+                "file": mu.PROVIDERS_PATH}
+        if name == "provider_save":
+            provider_name = str(body.get("name", "")).strip()
+            if not provider_name:
+                return 400, {"error": "name is required"}
+            try:
+                definition = mu.normalize_provider(provider_name, body)
+            except SystemExit as exc:
+                return 400, {"error": "invalid provider", "detail": mu_exc_message(exc)}
+            custom = mu.load_custom_providers()
+            custom[provider_name] = definition
+            mu.save_custom_providers(custom)
+            return 200, {"provider": definition, "file": mu.PROVIDERS_PATH}
+        if name == "auth_status":
+            admins = system_admin_names(cfg)
+            status = {}
+            for name_ in admins:
+                stored, err = shadow_entry(name_)
+                status[name_] = {"exists": stored is not None,
+                                 "password_set": bool(stored) and stored[0] not in "!*",
+                                 "detail": err}
+            return 200, {"system_admins": admins, "accounts": status,
+                         "verify_endpoint": "/api/auth/verify"}
+        if name == "auth_verify":
+            sysuser = str(body.get("user", "")).strip()
+            password = str(body.get("password", ""))
+            if sysuser not in system_admin_names(cfg):
+                return 403, {"ok": False, "error": "not a configured admin system account"}
+            if not password:
+                return 400, {"ok": False, "error": "password required"}
+            ok, why = verify_system_password(sysuser, password)
+            return (200 if ok else 401), {"ok": ok, "user": sysuser,
+                                          "error": "" if ok else why}
+        if name == "instance_ensure":
+            target = groups[0]
+            if target not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": target}
+            port = int(st["instances"][target].get("port", 0))
+            if mu.port_in_use(port):
+                return 200, {"instance": target, "started": False, "live": True, "port": port,
+                             "_audited": True}
+            run_async(lambda: do_instance_action("start", target, {}),
+                      actor or "gateway", "instance_ensure", target, ip)
+            return 202, {"instance": target, "started": True, "live": False, "port": port,
+                         "detail": "start requested", "_audited": True}
+        if name == "provider_test":
+            catalog = mu.all_providers()
+            target = str(body.get("name", ""))
+            if target not in catalog:
+                return 404, {"error": "no such provider", "name": target}
+            prov = json.loads(json.dumps(catalog[target]))
+            prov["preset"] = target
+            key = body.get("api_key") or str(cfg.get("model_api_key") or "") or None
+            result = mu.provider_probe(prov, key, model=body.get("model") or prov.get("model"))
+            result["provider"] = target
+            result["key_source"] = "argument" if body.get("api_key") else ("platform" if key else "none")
+            return 200, result
+        if name == "provider_delete":
+            custom = mu.load_custom_providers()
+            if groups[0] not in custom:
+                return 404, {"error": "not an operator-defined provider", "name": groups[0]}
+            custom.pop(groups[0])
+            mu.save_custom_providers(custom)
+            return 200, {"deleted": groups[0]}
+        if name == "instance_patch":
+            if groups[0] not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": groups[0]}
+            return 200, mu.resolved_provider(st, groups[0])
+        if name == "instance_provider_test":
+            if groups[0] not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": groups[0]}
+            resolved = mu.resolved_provider(st, groups[0])
+            prov = resolved["provider"]
+            key = body.get("api_key") or mu.provider_credentials(st, groups[0])[0]
+            result = mu.provider_probe(prov, key, model=body.get("model") or prov.get("model"))
+            result["instance"] = groups[0]
+            result["key_source"] = "argument" if body.get("api_key") else resolved["key_source"]
+            return 200, result
+        if name == "instance_key_set":
+            if groups[0] not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": groups[0]}
+            api_key = str(body.get("api_key") or "").strip()
+            if len(api_key) < 8:
+                return 400, {"error": "api_key looks too short"}
+            mu.write_instance_api_key(st, groups[0], api_key)
+            # Same bookkeeping as the CLI path: the secret stays in the 0600 file,
+            # but the *fact* goes into the record so the audit diff can see it.
+            with mu.state_lock():
+                fresh = mu.load_state()
+                marker = dict((fresh["instances"].get(groups[0]) or {}).get("credentials") or {})
+                marker["api_key"] = True
+                fresh["instances"][groups[0]]["credentials"] = marker
+                fresh["instances"][groups[0]]["updated_at"] = int(mu.time.time())
+                mu.save_state(fresh)
+            return 200, {"instance": groups[0], "key_set": True, "key_length": len(api_key),
+                         "restart_required": True}
+        if name == "instance_key_del":
+            if groups[0] not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": groups[0]}
+            mu.write_instance_api_key(st, groups[0], None)
+            with mu.state_lock():
+                fresh = mu.load_state()
+                marker = dict((fresh["instances"].get(groups[0]) or {}).get("credentials") or {})
+                marker.pop("api_key", None)
+                fresh["instances"][groups[0]]["credentials"] = marker
+                fresh["instances"][groups[0]]["updated_at"] = int(mu.time.time())
+                mu.save_state(fresh)
+            return 200, {"instance": groups[0], "key_set": False, "restart_required": True}
+        if name == "backup":
+            # Records only (never the multi-hundred-MB rootfs copies); the caller
+            # decides whether instance home directories are included.
+            with_instances = str(query.get("with_instances", ["0"])[0]).lower() in ("1", "true", "yes")
+            out = tempfile.NamedTemporaryFile(prefix="dsh-mu-backup-", suffix=".tgz",
+                                              delete=False)
+            out.close()
+            try:
+                manifest = mu.create_backup(out.name, with_instances=with_instances)
+            except SystemExit as exc:
+                with contextlib.suppress(OSError):
+                    os.unlink(out.name)
+                return 400, {"error": "backup failed", "detail": mu_exc_message(exc)}
+            # Stream it: instance workspaces are user data and can be large, so
+            # reading the whole archive into memory would scale the backend's RSS
+            # with the backup size.
+            size = os.path.getsize(out.name)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/gzip")
+            self.send_header("Content-Disposition",
+                             f'attachment; filename="dsh-mu-backup-{manifest["created_iso"].replace(":", "")}.tgz"')
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            with open(out.name, "rb") as fh:
+                shutil.copyfileobj(fh, self.wfile, 256 * 1024)
+            with contextlib.suppress(OSError):
+                os.unlink(out.name)
+            return None
+        if name == "audit":
+            scanned = read_audit(2000)
+            records = scanned
+            actor = (query.get("actor", [""])[0] or "").strip().lower()
+            action = (query.get("action", [""])[0] or "").strip().lower()
+            target = (query.get("target", [""])[0] or "").strip().lower()
+            threshold = parse_since(query.get("since", [""])[0])
+            if threshold:
+                records = [r for r in records if int(r.get("ts", 0)) >= threshold]
+            for needle, field in ((actor, "actor"), (action, "action"), (target, "target")):
+                if needle:
+                    records = [r for r in records if needle in str(r.get(field, "")).lower()]
+            if query.get("format", [""])[0] == "jsonl":
+                payload = "".join(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n"
+                                  for r in records).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+                self.send_header("Content-Disposition", 'attachment; filename="dsh-mu-audit.jsonl"')
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return None
+            limit = int(query.get("limit", ["200"])[0])
+            return 200, {"records": records[:max(1, min(limit, 2000))],
+                         "matched": len(records), "scanned": len(scanned),
+                         "actions": sorted({str(r.get("action", "")) for r in scanned})}
+        # mutations: they call into dshmuctl, which re-reads and re-saves state
+        if name == "me_password":
+            actor = self.headers.get("X-DSH-MU-User") or ""
+            if actor not in st["users"]:
+                return 401, {"error": "unknown actor", "detail": "the gateway must send X-DSH-MU-User"}
+            password = body.get("password") or ""
+            if len(password) < 8:
+                return 400, {"error": "password too short", "detail": "at least 8 characters"}
+            mu.cmd_user_passwd(ns(name=actor, password=password))
+            with mu.state_lock():
+                fresh = mu.load_state()
+                fresh["users"][actor]["must_change"] = False
+                mu.save_state(fresh)
+                mu.render_gateway(fresh)
+            return 200, {"user": actor, "changed": True, "relogin_required": True,
+                         "detail": "every session of this account was invalidated; log in again"}
+        if name == "user_kick":
+            if groups[0] not in st["users"]:
+                return 404, {"error": "no such user", "user": groups[0]}
+            mu.cmd_user_kick(ns(name=groups[0]))
+            return 200, {"user": groups[0], "kicked": True,
+                         "detail": "every session of this account was invalidated; the password is unchanged"}
+        if name == "user_create":
+            return do_user_create(st, body)
+        if name == "user_password":
+            return do_user_password(groups[0], body)
+        if name == "user_toggle":
+            if groups[0] not in st["users"]:
+                return 404, {"error": "no such user", "user": groups[0]}
+            mu.cmd_user_toggle(ns(name=groups[0]), groups[1] == "enable")
+            return 200, {"user": {"name": groups[0], "enabled": groups[1] == "enable"}}
+        if name == "user_delete":
+            if groups[0] not in st["users"]:
+                return 404, {"error": "no such user", "user": groups[0]}
+            target = st["users"][groups[0]].get("instance") or ""
+            # DELETE carries no body here, so the flag comes from the query string
+            flag = (query.get("with_instance") or ["0"])[0].lower()
+            wants_instance = bool(body.get("with_instance")) or flag in ("1", "true", "yes")
+            if target and not wants_instance:
+                # The CLI keeps the instance by default (data preservation), and so
+                # does this endpoint - but silently leaving an orphan instance made
+                # `doctor` warn and hid the data question from the operator.
+                return 409, {"error": "the account still owns an instance",
+                             "instance": target,
+                             "detail": "delete the instance first, or pass with_instance"}
+            mu.cmd_user_del(ns(name=groups[0], with_instance=wants_instance))
+            return 200, {"deleted": groups[0], "with_instance": wants_instance,
+                         "instance": target or None}
+        if name == "instance_create":
+            return do_instance_create(st, body)
+        if name == "instance_action":
+            if groups[0] not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": groups[0]}
+            if groups[1] in SLOW_ACTIONS:
+                run_async(lambda: do_instance_action(groups[1], groups[0], body),
+                          actor, f"instance_{groups[1]}", groups[0], ip)
+                return 202, {"accepted": True, "instance": groups[0], "action": groups[1],
+                             "detail": "running in the background; poll /api/instances",
+                             "_audited": True}
+            return do_instance_action(groups[1], groups[0], body)
+        if name == "instance_limits":
+            target = groups[0]
+            if target not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": target}
+
+            def pick(*keys):
+                for key in keys:
+                    if key in body and body[key] not in (None, ""):
+                        return body[key]
+                return None
+
+            # A port move may also be requested through the same PATCH.
+            if "port" in body and str(body.get("port") or "").strip():
+                try:
+                    result = mu.change_instance_port(st, target, int(body["port"]),
+                                                     restart=bool(body.get("restart")))
+                except SystemExit as exc:
+                    return 400, {"error": "cannot move the port", "detail": mu_exc_message(exc)}
+                return 200, {"instance": instance_view(mu.load_state(), target),
+                             "port_change": result,
+                             "detail": "port changed; restart to apply"}
+
+            cores, mem, pids = pick("cpu_cores", "cpu"), pick("mem_mb", "mem"), pick("pids_num", "pids")
+            if cores is None and mem is None and pids is None:
+                # Silently accepting an unknown field and answering 200 made a
+                # caller believe the limits changed when nothing happened. Name
+                # the accepted fields instead - and point out the common mix-up
+                # with the raw record field names.
+                return 400, {"error": "no limit fields given",
+                             "accepted": ["cpu_cores", "cpu", "mem_mb", "mem", "pids_num", "pids"],
+                             "detail": ("the record stores cpu_max/mem_max/pids_max; this endpoint "
+                                        "takes cpu_cores|cpu, mem_mb|mem, pids_num|pids")}
+            try:
+                updates = {
+                    "cpu_max": mu.parse_cpu_max(cores) if cores is not None else None,
+                    "mem_max": (mu.parse_mem_mb(mem) if "mem_mb" in body and body.get("mem_mb")
+                                else (mu.parse_mem_max(mem) if mem is not None else None)),
+                    "pids_max": mu.parse_pids_max(pids) if pids is not None else None,
+                }
+            except SystemExit as exc:
+                return 400, {"error": "invalid limit", "detail": mu_exc_message(exc)}
+            inst = st["instances"][target]
+            for key, value in updates.items():
+                if value is not None:
+                    inst[key] = value
+            mu.save_state(st)
+            mu.sync_all(mu.load_state())
+            applied = mu.apply_limits_live(dict(inst, name=target))
+            return 200, {"instance": instance_view(mu.load_state(), target),
+                         "applied_live": applied,
+                         "detail": "applied without a restart" if applied
+                                   else "will apply on the next start"}
+        if name == "instance_delete":
+            if groups[0] not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": groups[0]}
+            purge = str(query.get("purge", ["0"])[0]).lower() in ("1", "true", "yes")
+            mu.cmd_instance_del(ns(name=groups[0], purge=purge))
+            return 200, {"deleted": groups[0], "purged": purge}
+        if name == "instance_provider":
+            if groups[0] not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": groups[0]}
+            mu.cmd_instance_provider(ns(name=groups[0], preset=body.get("preset", "show"),
+                                        model=body.get("model"), key=body.get("api_key"),
+                                        key_file=None))
+            return 200, {"instance": instance_view(mu.load_state(), groups[0])}
+        if name == "config_set":
+            key = str(body.get("key", ""))
+            if key not in cfg:
+                return 400, {"error": "unknown config key", "key": key,
+                             "known": sorted(cfg.keys())}
+            value = body.get("value")
+            if key in ("model_api_key",) and str(value) == "***":
+                return 200, {"config": {k: ("***" if k == key else v)
+                                        for k, v in mu.load_state()["config"].items()},
+                             "note": "unchanged"}
+            mu.cmd_config(ns(key=key, value=json.dumps(value) if not isinstance(value, str) else value,
+                             write_default=False))
+            return 200, {"config": mu.load_state()["config"]}
+        return 404, {"error": "unhandled endpoint", "name": name}
+
+
+def parse_listen(value: str) -> tuple[str, int]:
+    host, _, port = value.partition(":")
+    return (host or "127.0.0.1"), int(port or 8787)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(prog="dsh-mud", description=__doc__.splitlines()[0])
+    parser.add_argument("--version", action="version", version=f"dsh-mud {VERSION}")
+    parser.add_argument("--listen", default=None,
+                        help="host:port to bind (default: ADMIN_LISTEN from dsh-mu.conf)")
+    parser.add_argument("--self-check", action="store_true",
+                        help="start, probe /api/health, and exit")
+    args = parser.parse_args(argv)
+
+    listen = args.listen
+    if not listen:
+        cfg = mu.load_config(None)
+        listen = str(cfg.get("admin_listen") or "127.0.0.1:8787")
+    host, port = parse_listen(listen)
+    if host not in ("127.0.0.1", "::1", "localhost"):
+        print(f"dsh-mud: refusing to bind non-loopback address {host!r}", file=sys.stderr)
+        return 2
+
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.daemon_threads = True
+    print(f"dsh-mud {VERSION} listening on http://{host}:{port}/api/ "
+          f"(token={'yes' if os.path.exists(TOKEN_PATH) else 'no'})", flush=True)
+    if args.self_check:
+        import threading
+        import urllib.request
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            headers = {}
+            expected = (mu.read_text(TOKEN_PATH) or "").strip()
+            if expected:
+                headers["X-DSH-MU-Admin"] = expected
+            req = urllib.request.Request(f"http://{host}:{port}/api/health", headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as res:
+                print("self-check:", res.status, res.read().decode().replace("\n", " ")[:120])
+            return 0
+        except Exception as exc:  # noqa: BLE001
+            print(f"self-check failed: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            server.shutdown()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

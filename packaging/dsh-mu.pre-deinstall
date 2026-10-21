@@ -1,0 +1,11 @@
+#!/bin/sh
+echo "dsh-mu: stopping platform services (instance data is preserved)..."
+rc-service dsh-mud stop 2>/dev/null || true
+rc-update del dsh-mud default 2>/dev/null || true
+for f in /etc/init.d/dsh-mu-*; do
+	[ -e "$f" ] || continue
+	svc=$(basename "$f")
+	rc-service "$svc" stop 2>/dev/null || true
+	rc-update del "$svc" default 2>/dev/null || true
+done
+# dsh-mu-cgroup stays registered: a later reinstall must not lose boot delegation.

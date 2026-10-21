@@ -1,0 +1,15 @@
+#!/bin/sh
+cat <<'TXT'
+dsh-mu files are gone. Preserved on purpose:
+
+  /etc/dsh-mu        accounts, session secret, admin token, provider catalog
+  /var/lib/dsh-mu    jail template + every instance's rootfs, home and workspace
+  /var/log/dsh-mu    gateway, instance and audit logs
+  /etc/nginx/{conf.d,http.d}/dsh-mu-*.conf   gateway fragments
+
+Remove everything (including all user data) with:
+  rc-service dsh-mud stop; rc-service dsh-mu-cgroup stop
+  rm -rf /etc/dsh-mu /var/lib/dsh-mu /var/log/dsh-mu \
+         /etc/nginx/conf.d/dsh-mu-*.conf /etc/nginx/http.d/dsh-mu-*.conf \
+         /etc/init.d/dsh-mud /etc/init.d/dsh-mu-*
+TXT

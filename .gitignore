@@ -1,0 +1,16 @@
+# 构建产物（可重建，不入库）
+dist/
+build/
+*.apk
+__pycache__/
+*.pyc
+*.pyo
+
+# 打包快照（在仓库外生成；防止偶然被放进树里）
+*.tgz
+
+# 编辑器 / 系统杂物
+.DS_Store
+*.swp
+*.swo
+*.log

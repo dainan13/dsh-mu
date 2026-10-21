@@ -1,0 +1,288 @@
+#!/bin/sh
+# dsh-mu-jail - run one DeepSeek Harness instance inside its own jail.
+#
+# Isolation model (rjailor-style, deliberately "soft"):
+#   new mount+UTS namespace -> private propagation -> bind mounts from the host
+#   -> cgroup v2 placement -> chroot -> drop capabilities (+ optionally uid)
+#   -> exec `dsh web` on 127.0.0.1:<port>.
+# Network namespace is intentionally NOT created: instances share the host stack.
+#
+# Usage:
+#   dsh-mu-jail <instance>              # start the instance's dsh web (default)
+#   dsh-mu-jail <instance> -- <cmd...>  # run an arbitrary command inside the jail
+#   dsh-mu-jail <instance> --shell      # interactive shell inside the jail
+set -eu
+
+CONF_OVERRIDE=""
+if [ "${1:-}" = "--conf" ]; then
+	CONF_OVERRIDE="${2:-}"
+	[ -n "$CONF_OVERRIDE" ] || { echo "dsh-mu-jail: --conf needs a path" >&2; exit 2; }
+	shift 2
+fi
+NAME="${1:-}"
+[ -n "$NAME" ] || { echo "usage: dsh-mu-jail [--conf FILE] <instance> [-- <cmd...>|--shell]" >&2; exit 2; }
+shift
+
+MODE=serve
+CMD=""
+if [ "${1:-}" = "--shell" ]; then
+	MODE=shell
+elif [ "${1:-}" = "--" ]; then
+	shift
+	MODE=exec
+	CMD="$*"
+elif [ $# -gt 0 ]; then
+	MODE=exec
+	CMD="$*"
+fi
+
+CONF="${CONF_OVERRIDE:-/etc/dsh-mu/instances/${NAME}.conf}"
+if [ ! -r "$CONF" ]; then
+	echo "dsh-mu-jail: instance configuration not found: $CONF" >&2
+	exit 1
+fi
+# shellcheck disable=SC1090
+. "$CONF"
+
+: "${ROOTFS:?ROOTFS missing in $CONF}"
+: "${INSTANCE_HOME:?INSTANCE_HOME missing in $CONF}"
+: "${INSTANCE_WORK:?INSTANCE_WORK missing in $CONF}"
+: "${PORT:?PORT missing in $CONF}"
+: "${INST_UID:=0}"
+: "${INST_GID:=$INST_UID}"
+: "${CPU_MAX:=}"
+: "${MEM_MAX:=}"
+: "${MEM_HIGH:=}"
+: "${PIDS_MAX:=}"
+: "${CGROUP_PATH:=/sys/fs/cgroup/dsh-mu/$NAME}"
+: "${DSH_HOST:=127.0.0.1}"
+: "${DSH_HOME_IN_JAIL:=/home/dsh/.dsh}"
+: "${DSH_WORK_IN_JAIL:=/home/dsh/workspace}"
+: "${DSH_RUNTIME_DIR:=/usr/local/lib/node_modules/@deepseek-ai/dsh}"
+: "${DSH_EXTRA_ARGS:=}"
+: "${DSH_LAUNCH_ARGS:=}"
+: "${EXTRA_MOUNTS:=}"
+
+[ -d "$ROOTFS" ] || { echo "dsh-mu-jail: rootfs missing: $ROOTFS" >&2; exit 1; }
+
+log() { echo "[dsh-mu-jail:$NAME] $*" >&2; }
+
+# ------------------------------------------------------------------ cgroup v2
+setup_cgroup() {
+	[ -w /sys/fs/cgroup/cgroup.procs ] || { log "cgroup2 not writable; skipping limits"; return 0; }
+	mkdir -p /sys/fs/cgroup/dsh-mu 2>/dev/null || true
+	# Controllers must be delegated to children; a group owning processes cannot
+	# enable subtree_control for itself, so only leaf groups ever hold processes.
+	for ctl in cpu memory pids; do
+		grep -qw "$ctl" /sys/fs/cgroup/cgroup.controllers 2>/dev/null || continue
+		grep -q "$ctl" /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || echo "+$ctl" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
+		grep -q "$ctl" /sys/fs/cgroup/dsh-mu/cgroup.subtree_control 2>/dev/null || echo "+$ctl" > /sys/fs/cgroup/dsh-mu/cgroup.subtree_control 2>/dev/null || true
+	done
+	mkdir -p "$CGROUP_PATH" 2>/dev/null || true
+	[ -n "$MEM_MAX" ] && echo "$MEM_MAX" > "$CGROUP_PATH/memory.max" 2>/dev/null || true
+	[ -n "$MEM_HIGH" ] && echo "$MEM_HIGH" > "$CGROUP_PATH/memory.high" 2>/dev/null || true
+	[ -n "$CPU_MAX" ] && echo "$CPU_MAX" > "$CGROUP_PATH/cpu.max" 2>/dev/null || true
+	[ -n "$PIDS_MAX" ] && echo "$PIDS_MAX" > "$CGROUP_PATH/pids.max" 2>/dev/null || true
+	return 0
+}
+
+# --------------------------------------------------------------- inner script
+INNER="${TMPDIR:-/tmp}/dsh-mu-jail.$$"
+trap 'rm -f "$INNER"' EXIT INT TERM
+
+cat > "$INNER" <<'INNER_EOF'
+set -eu
+NAME="$DSHMU_NAME"
+
+mount --make-rprivate / 2>/dev/null || true
+
+# Place this whole process tree into the instance cgroup before doing anything
+# else: children created later inherit the group automatically.
+if [ -w "$CGROUP_PATH/cgroup.procs" ]; then
+	printf '%s' "$$" > "$CGROUP_PATH/cgroup.procs" || echo "[jail] cgroup placement failed" >&2
+fi
+
+bind_dir() { # <src> <dst> [ro]
+	[ -e "$1" ] || return 0
+	mkdir -p "$2" 2>/dev/null || true
+	mount --rbind "$1" "$2" || return 1
+	if [ "${3:-rw}" = "ro" ]; then mount -o remount,ro,bind "$2" 2>/dev/null || true; fi
+	return 0
+}
+
+bind_file() { # <src> <dst> [ro]
+	[ -e "$1" ] || return 0
+	mkdir -p "$(dirname "$2")" 2>/dev/null || true
+	[ -e "$2" ] || : > "$2" 2>/dev/null || true
+	mount --bind "$1" "$2" || return 1
+	if [ "${2:-}" != "" ] && [ "${3:-rw}" = "ro" ]; then mount -o remount,ro,bind "$2" 2>/dev/null || true; fi
+	return 0
+}
+
+
+# bwrap (DSH's own command sandbox) needs "/" to be a mount point so it can make
+# the tree rslave; a bare chroot directory is not one. This must come before every
+# other mount: binding the rootfs over itself hides anything mounted under it.
+# EXPERIMENT (0.8.9): skipped to test the subprocess-runner hypothesis.
+if [ "${DSHMU_SELF_BIND:-1}" = "1" ] && ! mountpoint -q "$ROOTFS" 2>/dev/null; then
+	mount --bind "$ROOTFS" "$ROOTFS" 2>/dev/null || true
+fi
+
+# /proc: a private procfs instance, so nothing the jail can write reaches the
+# host's /proc. Falls back to a bind mount where a fresh mount is not allowed.
+mount -t proc none "$ROOTFS/proc" 2>/dev/null || bind_dir /proc "$ROOTFS/proc" rw || true
+
+# bwrap parses the kernel's overflow uid/gid, which a fresh procfs does not expose
+# in a readable way; the host's sysctl tree is read-only here.
+bind_dir /proc/sys "$ROOTFS/proc/sys" ro || true
+
+# /sys: read-only view (cgroup and driver state must stay out of reach).
+bind_dir /sys "$ROOTFS/sys" ro || true
+mount --make-rslave "$ROOTFS/sys" 2>/dev/null || true
+
+# /dev: read-only bind of the host's /dev.
+#
+# A private tmpfs with a hand-made node set looks safer, but DSH's subprocess
+# runner needs the full device view (/dev/pts, /dev/fd, …) and fails there with a
+# misleading "spawn bash ENOENT". The read-only bind keeps the property that
+# matters here — an instance cannot unlink or replace host device nodes (ENOENT
+# for the node set broke process creation) — while every node resolves.
+bind_dir /dev "$ROOTFS/dev" ro || true
+mount --make-rslave "$ROOTFS/dev" 2>/dev/null || true
+
+# Private /tmp and /run: instance-local scratch, never the host's.
+mount -t tmpfs -o size=256m,mode=1777,nosuid,nodev tmpfs "$ROOTFS/tmp" 2>/dev/null || true
+mkdir -p "$ROOTFS/run" 2>/dev/null || true
+mount -t tmpfs -o size=16m,mode=755,nosuid,nodev tmpfs "$ROOTFS/run" 2>/dev/null || true
+
+bind_file /etc/resolv.conf "$ROOTFS/etc/resolv.conf" ro || true
+[ -e /etc/hosts ] && bind_file /etc/hosts "$ROOTFS/etc/hosts" ro || true
+[ -e /etc/localtime ] && bind_file /etc/localtime "$ROOTFS/etc/localtime" ro || true
+
+# Shared, read-only DeepSeek Harness runtime (the big dependency tree stays on
+# the host; each jail only carries its own node/npm/pnpm via apk).
+# Older builds mounted the runtime at its host path, which fabricated an empty
+# /var/lib/dsh-mu tree inside the rootfs. Remove that leftover so the isolation
+# check ("the host data directory must not exist here") stays meaningful.
+if [ -d "$ROOTFS/var/lib/dsh-mu" ] && ! mountpoint -q "$ROOTFS/var/lib/dsh-mu" 2>/dev/null; then
+	rm -rf "$ROOTFS/var/lib/dsh-mu" 2>/dev/null || true
+fi
+
+# The runtime lives in the gateway template on the host, but inside the jail it must
+# appear at the canonical npm path (mounting it at its host path would fabricate a
+# /var/lib/dsh-mu tree inside the jail and leave the real path empty).
+: "${DSH_RUNTIME_IN_JAIL:=/usr/local/lib/node_modules/@deepseek-ai/dsh}"
+if [ -d "$DSH_RUNTIME_DIR" ]; then
+	bind_dir "$DSH_RUNTIME_DIR" "$ROOTFS$DSH_RUNTIME_IN_JAIL" ro || true
+fi
+
+# Persistent instance volumes.
+mkdir -p "$INSTANCE_HOME" "$INSTANCE_WORK" 2>/dev/null || true
+bind_dir "$INSTANCE_HOME" "$ROOTFS/home/dsh" rw || true
+bind_dir "$INSTANCE_WORK" "$ROOTFS$DSH_WORK_IN_JAIL" rw || true
+
+# Optional extra mounts from the instance conf: "host:jail[:ro],host:jail[:ro]"
+if [ -n "${EXTRA_MOUNTS:-}" ]; then
+	OLDIFS=$IFS; IFS=','
+	for spec in $EXTRA_MOUNTS; do
+		IFS=$OLDIFS
+		h=${spec%%:*}; rest=${spec#*:}
+		j=${rest%%:*}; m=${rest#*:}; [ "$m" = "$j" ] && m=rw
+		case "$j" in /*) ;; *) j="/$j" ;; esac
+		bind_dir "$h" "$ROOTFS$j" "$m" || true
+		IFS=','
+	done
+	IFS=$OLDIFS
+fi
+
+hostname "$NAME" 2>/dev/null || true
+
+# ---------------------------------------------------------------- enter jail
+JAIL_BIN=/bin/sh
+RUN_CMD=""
+case "$DSHMU_MODE" in
+	serve)
+		# $DSH_LAUNCH_ARGS carries launcher-level flags (e.g. --patch) and must
+		# precede the profile selection; the profile itself is named explicitly
+		# because a bare positional is only accepted as the first argument.
+		# Launch the entry script directly: the host has no global `dsh` binary any
+		# more (the runtime lives in the gateway template and only its package
+		# directory is bind-mounted), while `node` exists inside every instance.
+		RUN_CMD="exec node $DSH_RUNTIME_IN_JAIL/lib/bin.js $DSH_LAUNCH_ARGS --profile web --host $DSH_HOST --port $PORT --no-open $DSH_EXTRA_ARGS"
+		JAIL_BIN=/bin/sh
+		;;
+	shell)
+		RUN_CMD="exec /bin/sh -l"
+		;;
+	exec)
+		# Run the caller's command through a shell so quoting survives.
+		RUN_CMD="exec /bin/sh -c \"\$DSHMU_CMD\""
+		;;
+esac
+
+# The platform (gateway) jail needs CAP_NET_BIND_SERVICE to listen on 80/443;
+# every other capability is still dropped. Instances keep the all-dropped form.
+CAPS=""
+if [ -n "${KEEP_CAPS:-}" ] && [ "${INST_UID:-0}" = "0" ]; then
+	# Comma-separated list, e.g. the platform jail needs to bind 80 and to chown
+	# its temp directories to the nginx user. Everything starts from -all so the
+	# permitted set cannot silently stay at "root keeps every capability".
+	LIST="-all"
+	for _cap in $(echo "$KEEP_CAPS" | tr ',' ' '); do
+		LIST="$LIST,+$_cap"
+	done
+	CAPS="--bounding-set=$LIST --inh-caps=$LIST --ambient-caps=$LIST"
+	unset _cap
+fi
+
+if [ -n "${KEEP_CAPS:-}" ]; then
+	printf 'dsh-mu-jail[%s]: KEEP_CAPS=%s -> CAPS=%s\n' \
+		"${NAME:-?}" "$KEEP_CAPS" "${CAPS:-<empty>}" >&2
+fi
+if [ "${INST_UID:-0}" = "0" ]; then
+	# shellcheck disable=SC2086
+	exec chroot "$ROOTFS" "$JAIL_SETPRIV" \
+		${CAPS:---bounding-set=-all --inh-caps=-all --ambient-caps=-all} --no-new-privs \
+		$JAIL_BIN -c "cd $DSH_WORK_IN_JAIL && $RUN_CMD"
+else
+	exec chroot "$ROOTFS" "$JAIL_SETPRIV" \
+		--reuid="$INST_UID" --regid="$INST_GID" --clear-groups \
+		--bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs \
+		$JAIL_BIN -c "cd $DSH_WORK_IN_JAIL && $RUN_CMD"
+fi
+INNER_EOF
+
+# setpriv lives in different places depending on how the rootfs was built; the
+# runner must resolve it inside the jail before chrooting.
+JAIL_SETPRIV=""
+for candidate in /usr/bin/setpriv /bin/setpriv /usr/sbin/setpriv; do
+	if [ -x "$ROOTFS$candidate" ]; then
+		JAIL_SETPRIV="$candidate"
+		break
+	fi
+done
+if [ -z "$JAIL_SETPRIV" ]; then
+	echo "dsh-mu-jail: setpriv not found inside $ROOTFS (the jail template needs util-linux)" >&2
+	exit 1
+fi
+export JAIL_SETPRIV
+
+# ------------------------------------------------------------------- run it
+setup_cgroup
+export DSHMU_NAME="$NAME" DSHMU_MODE="$MODE" DSHMU_CMD="$CMD" \
+	ROOTFS INSTANCE_HOME INSTANCE_WORK PORT INST_UID INST_GID \
+	CGROUP_PATH DSH_HOST DSH_EXTRA_ARGS DSH_WORK_IN_JAIL EXTRA_MOUNTS \
+	DSH_RUNTIME_DIR DSH_RUNTIME_IN_JAIL DSH_HOME_IN_JAIL DSH_PERMISSION_MODE DSH_LAUNCH_ARGS KEEP_CAPS
+export HOME=/home/dsh
+export DSH_HOME="$DSH_HOME_IN_JAIL"
+# The jail is the isolation boundary; DSH's own Linux sandbox backends (bwrap
+# needs unprivileged user namespaces, Landlock is unavailable in this LXC) are
+# unusable here, so the agent runs with the sandbox disabled rather than
+# failing closed. Set instance_permission_mode to change this.
+export DSH_PERMISSION_MODE="${DSH_PERMISSION_MODE:-danger-full-access}"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export TERM="${TERM:-xterm}"
+export LANG="${LANG:-C.UTF-8}"
+
+log "starting mode=$MODE uid=$INST_UID port=$PORT rootfs=$ROOTFS cgroup=$CGROUP_PATH"
+exec unshare --mount --uts --propagation private --fork /bin/sh "$INNER"

@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""dsh-muctl - command-line entry point for the dsh-mu platform.
+
+The implementation lives in the importable library
+`/usr/local/lib/dsh-mu/python/dshmuctl.py` so the same code backs both this CLI
+and the loopback admin backend (`dsh-mud`). Keep this shim trivial.
+"""
+import sys
+
+sys.path.insert(0, "/usr/local/lib/dsh-mu/python")
+
+from dshmuctl import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

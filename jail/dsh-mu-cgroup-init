@@ -1,0 +1,53 @@
+#!/bin/sh
+# Delegate cgroup v2 controllers to /sys/fs/cgroup/dsh-mu so instance jails can
+# carry real cpu/memory/pids limits.
+#
+# Why this is needed: inside an LXC container the cgroup namespace root behaves
+# like an ordinary cgroup, so the kernel refuses to enable subtree_control while
+# it still owns processes (EBUSY). PID 1 and the console getties normally sit
+# there. Draining them into a holder group makes the root empty, after which the
+# controllers can be delegated to our subtree. Idempotent and safe to re-run.
+set -eu
+
+CG=/sys/fs/cgroup
+HOLD="$CG/init"
+TREE="$CG/dsh-mu"
+CONTROLLERS="cpu memory pids io"
+
+[ -w "$CG/cgroup.subtree_control" ] || {
+	echo "dsh-mu-cgroup: $CG/cgroup.subtree_control not writable; resource limits unavailable" >&2
+	exit 0
+}
+
+available=""
+for c in $CONTROLLERS; do
+	grep -qw "$c" "$CG/cgroup.controllers" 2>/dev/null && available="$available $c"
+done
+
+needs_drain=0
+for c in $available; do
+	grep -qw "$c" "$CG/cgroup.subtree_control" 2>/dev/null || needs_drain=1
+done
+
+if [ "$needs_drain" = 1 ]; then
+	mkdir -p "$HOLD"
+	i=0
+	while [ "$i" -lt 5 ]; do
+		procs=$(cat "$CG/cgroup.procs" 2>/dev/null || true)
+		[ -n "$procs" ] || break
+		for p in $procs; do
+			printf '%s' "$p" > "$HOLD/cgroup.procs" 2>/dev/null || true
+		done
+		i=$((i + 1))
+	done
+	for c in $available; do
+		printf '+%s' "$c" > "$CG/cgroup.subtree_control" 2>/dev/null || true
+	done
+fi
+
+mkdir -p "$TREE"
+for c in $available; do
+	grep -qw "$c" "$TREE/cgroup.subtree_control" 2>/dev/null || printf '+%s' "$c" > "$TREE/cgroup.subtree_control" 2>/dev/null || true
+done
+
+echo "dsh-mu-cgroup: root=[$(cat "$CG/cgroup.subtree_control" 2>/dev/null)] tree=[$(cat "$TREE/cgroup.subtree_control" 2>/dev/null)]"

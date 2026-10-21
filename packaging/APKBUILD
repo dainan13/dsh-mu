@@ -1,0 +1,89 @@
+# APKBUILD - canonical Alpine build recipe for dsh-mu.
+#
+# This is the recipe `packaging/make-apk.sh` drives. It is source-less on purpose:
+# the "source" is this repository itself, which keeps the package reproducible
+# from a checkout without publishing a tarball first. Run it from this directory:
+#
+#   abuild-keygen -a -n -i        # once: signing key in /etc/apk/keys
+#   abuild -r                     # builds ~/packages/<repo>/<arch>/dsh-mu-<ver>-r0.apk
+#
+# Alpine 3.2x ships apk-tools 3.x, which no longer accepts hand-written v2
+# packages, so abuild (or an equivalent v3/ADB writer) is required. The jail
+# template (~140 MB) is deliberately not packaged: `dsh-muctl install` builds it
+# on the target from ALPINE_MIRROR.
+#
+# Maintainer: dsh-mu maintainers <maintainers@dsh-mu.invalid>
+pkgname=dsh-mu
+pkgver=0.13.3
+pkgrel=0
+pkgdesc="DeepSeek Harness multi-instance platform (gateway, jail runner, admin API)"
+url="https://github.com/deepseek-ai/dsh"
+arch="noarch"
+license="MIT"
+# The gateway runs inside a jail built from ALPINE_TEMPLATE_PACKAGES; the host
+# itself needs no nginx/openresty.
+depends="python3 nodejs npm pnpm util-linux logrotate"
+# Single line on purpose: a line continuation inside the quotes would become
+# part of the file names abuild looks for.
+install="$pkgname.pre-install $pkgname.post-install $pkgname.pre-upgrade $pkgname.post-upgrade $pkgname.pre-deinstall $pkgname.post-deinstall"
+# No upstream tarball: everything comes from $startdir (this checkout).
+source=""
+builddir="$srcdir"
+options="!check !strip !fhs"
+
+prepare() {
+	default_prepare
+	# Fail early rather than shipping a package with holes in it.
+	for f in cli/dshmuctl.py cli/dsh-muctl jail/dsh-mu-jail jail/dsh-mu-cgroup-init \
+		admin/dsh-mud admin/index.html gateway/dsh-mu-http.conf gateway/dsh-mu-server.conf \
+		tests/fresh-machine.py; do
+		[ -f "$startdir/../$f" ] || die "missing $f in the source tree"
+	done
+}
+
+package() {
+	local d="$pkgdir" s="$startdir/.."
+
+	# programs
+	install -Dm755 "$s/cli/dsh-muctl"           "$d/usr/local/sbin/dsh-muctl"
+	install -Dm755 "$s/jail/dsh-mu-jail"        "$d/usr/local/sbin/dsh-mu-jail"
+	install -Dm755 "$s/jail/dsh-mu-cgroup-init" "$d/usr/local/sbin/dsh-mu-cgroup-init"
+	install -Dm755 "$s/admin/dsh-mud"           "$d/usr/local/sbin/dsh-mud"
+
+	# library, gateway fragments and admin page
+	install -Dm644 "$s/cli/dshmuctl.py" "$d/usr/local/lib/dsh-mu/python/dshmuctl.py"
+	for f in "$s"/gateway/lua/*.lua; do
+		install -Dm644 "$f" "$d/usr/local/lib/dsh-mu/lua/$(basename "$f")"
+	done
+	for f in "$s"/gateway/dsh-mu-*.conf; do
+		install -Dm644 "$f" "$d/usr/local/lib/dsh-mu/nginx/$(basename "$f")"
+	done
+	install -Dm644 "$s/admin/index.html" "$d/usr/local/lib/dsh-mu/admin/index.html"
+
+	# in-page user panel assets (served by the gateway at /mu-static/)
+	for f in "$s"/gateway/static/*; do
+		install -Dm644 "$f" "$d/usr/local/lib/dsh-mu/static/$(basename "$f")"
+	done
+
+	# self-tests ship with the package: `dsh-muctl selftest` uses them
+	if [ -d "$s/tests" ]; then
+		for f in "$s"/tests/*.mjs "$s"/tests/*.sh "$s"/tests/*.py; do
+			[ -e "$f" ] || continue
+			install -Dm644 "$f" "$d/usr/local/lib/dsh-mu/tests/$(basename "$f")"
+		done
+	fi
+	# The handoff sheet is the first thing an operator should find on the machine,
+	# so it ships with the package (together with the changelog and the docs).
+	for doc in README.md DELIVERY.md CHANGELOG.md; do
+		[ -f "$s/$doc" ] && install -Dm644 "$s/$doc" "$d/usr/share/doc/$pkgname/$doc"
+	done
+	if [ -d "$s/docs" ]; then
+		for f in "$s"/docs/*.md; do
+			[ -e "$f" ] || continue
+			install -Dm644 "$f" "$d/usr/share/doc/$pkgname/docs/$(basename "$f")"
+		done
+	fi
+}
+
+# abuild wants a checksum even with no sources.
+sha512sums=""

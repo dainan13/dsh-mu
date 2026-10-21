@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "dsh-mu upgraded. Re-run 'dsh-muctl install' to refresh services and nginx fragments;"
+echo "state schema migrations run automatically on the next dsh-muctl command."
