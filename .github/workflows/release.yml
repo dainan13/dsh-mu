@@ -11,7 +11,7 @@ name: release
 # About "latest": GitHub defines it as the most recent release that is neither a
 # draft nor a prerelease. So this workflow never sets those flags for tag pushes,
 # asks for make_latest, and keeps the asset name stable - that is exactly what makes
-#   https://github.com/<owner>/<repo>/releases/latest/download/dsh-mu.apk
+#   wget -O dsh-mu.apk https://github.com/<owner>/<repo>/releases/latest/download/dsh-mu.apk
 # a permanent, never-changing URL.
 
 on:
@@ -139,9 +139,14 @@ jobs:
           ### Install (Alpine 3.22+)
 
           ```sh
-          apk add --allow-untrusted \
+          cd /tmp
+          wget -O dsh-mu.apk \
             https://github.com/${{ github.repository }}/releases/latest/download/dsh-mu.apk
+          apk add --allow-untrusted ./dsh-mu.apk
           ```
+
+          > `apk add <URL>` is not supported by apk-tools 3 - download first, then
+          > install the local file (that is what the two lines above do).
 
           Then create the platform (see README → 安装):
 

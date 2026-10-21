@@ -349,6 +349,25 @@ if (docs.length === 0) bad('no markdown files found');
   }
 }
 
+// n ------------------------------------- install instructions match the tooling
+{
+  // apk-tools 3 cannot install from a URL (measured on Alpine 3.24 / apk-tools
+  // 3.0.6), so documenting `apk add <url>` sends users into a dead end.
+  const docsToCheck = ['README.md', 'DELIVERY.md', 'docs/05-打包与安装.md', 'docs/06-运维手册.md'];
+  const offenders = [];
+  for (const doc of docsToCheck) {
+    let text;
+    try {
+      text = read(doc);
+    } catch {
+      continue;
+    }
+    if (/apk\s+add[^\n]*\bhttps?:\/\//.test(text)) offenders.push(doc);
+  }
+  if (offenders.length === 0) ok('no document tells people to apk add a URL (download+install instead)');
+  else bad(`apk add <url> is not supported but documented in: ${offenders.join(', ')}`);
+}
+
 console.log(`\n=== DOC LINT: PASS=${pass} FAIL=${fail} ===`);
 console.log(fail === 0 ? 'DOC CHECKS PASSED' : 'DOC CHECKS FAILED');
 process.exit(fail === 0 ? 0 : 1);
