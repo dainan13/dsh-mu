@@ -153,7 +153,14 @@ build_unsigned() {
 	# parsed as one dependency name -- it must be a single space-separated value.
 	# node is NOT a host dependency any more: the DSH runtime is installed inside
 	# the gateway template (see install_dsh_runtime()).
-	set -- "$@" -I "depends:python3 util-linux logrotate curl ca-certificates openssl"
+	# nftables IS one: the per-instance egress policy is enabled by default
+	# (INSTANCE_EGRESS=no-intranet), and a policy that ships without its enforcement
+	# tool silently does nothing.
+	#
+	# Keep this list in sync with packaging/APKBUILD (the --signed path) -- and note
+	# that `apk mkpkg` only honours the LAST `-I depends:` given.
+	DEPENDS="python3 util-linux logrotate curl ca-certificates openssl nftables"
+	set -- "$@" -I "depends:$DEPENDS"
 	for action in pre-install post-install pre-upgrade post-upgrade pre-deinstall post-deinstall; do
 		[ -f "$SRC/packaging/dsh-mu.$action" ] && set -- "$@" -s "$action:$SRC/packaging/dsh-mu.$action"
 	done

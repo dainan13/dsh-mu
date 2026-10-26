@@ -14,7 +14,7 @@
 #
 # Maintainer: dsh-mu maintainers <maintainers@dsh-mu.invalid>
 pkgname=dsh-mu
-pkgver=0.21.2
+pkgver=0.21.4
 pkgrel=0
 pkgdesc="DeepSeek Harness multi-instance platform (gateway, jail runner, admin API)"
 url="https://github.com/deepseek-ai/dsh"
@@ -22,7 +22,9 @@ arch="noarch"
 license="MIT"
 # The gateway runs inside a jail built from ALPINE_TEMPLATE_PACKAGES; the host
 # itself needs no nginx/openresty.
-depends="python3 nodejs npm pnpm util-linux logrotate"
+# nftables: the per-instance egress policy is on by default (INSTANCE_EGRESS=no-intranet),
+# so its enforcement tool has to come with the package instead of being a manual step.
+depends="python3 util-linux logrotate curl ca-certificates openssl nftables"
 # Single line on purpose: a line continuation inside the quotes would become
 # part of the file names abuild looks for.
 install="$pkgname.pre-install $pkgname.post-install $pkgname.pre-upgrade $pkgname.post-upgrade $pkgname.pre-deinstall $pkgname.post-deinstall"

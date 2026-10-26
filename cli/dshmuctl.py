@@ -1465,7 +1465,7 @@ def apply_egress(st: dict, quiet: bool = True) -> dict:
     if not nft_available():
         if not quiet:
             info("egress: rules written to " + EGRESS_NFT
-                 + " but nft is not installed (apk add nftables)")
+                 + " but nft is not installed (it is an apk dependency; apk add nftables)")
         return {"enforced": rules.count("chain eg_"), "loaded": False}
     # delete + create in ONE nft transaction: nft applies a file atomically, so no
     # packet ever sees a half-written table.
@@ -3245,7 +3245,8 @@ def cmd_install(args):
             save_config(st["config"])
             info("instance_keep_caps: dropped the legacy sys_admin,setuid,setgid default")
         if not nft_available():
-            info("hint: apk add nftables  (needed for instance_egress)")
+            info("hint: nft is missing but it is an apk dependency -- "
+                 "install it with `apk add nftables` (or reinstall dsh-mu)")
         ensure_default_kilo_plan()
         sync_all(load_state())
     started = reconcile_instances(load_state())
@@ -7490,7 +7491,8 @@ def cmd_egress(args):
         for name in sorted(st["instances"]):
             policy, allow = instance_egress(st, name)
             info(f"  {name:12} {policy:12} allow=" + fmt(allow))
-        info("nft installed: " + ("yes" if nft_available() else "NO (apk add nftables)"))
+        info("nft installed: " + ("yes" if nft_available()
+                                  else "NO (nftables is a package dependency; apk add nftables)"))
         info("rules file   : " + EGRESS_NFT)
         return 0
 

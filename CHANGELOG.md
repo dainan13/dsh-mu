@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## 0.21.4（`nftables` 其实改错了地方：无签名包读的是 make-apk.sh）
+
+- 0.21.3 我只改了 `packaging/APKBUILD` 的 `depends` ✗ —— 那份只在 `--signed`（abuild）路径生效 ✓；
+  我们实际发布的**无签名 v3 包**由 `apk mkpkg` 打包 ✓，依赖写死在 `packaging/make-apk.sh`
+  的 `-I "depends:..."` 里 ✗ → 装出来的包**依然没有 nftables** ✗（实测 `apk info -R` 为空 ✓）；
+- 现在两处都加上了 ✓，`make-apk.sh` 里的列表提成一个 `DEPENDS` 变量并注明"只认最后一个
+  `-I depends:`"，同时在注释里写明要和 `APKBUILD` 保持同步 ✓；
+- 顺手把两处列表对齐 ✓（都去掉 `nodejs`/`npm`/`pnpm` —— DSH 运行时装在网关模板里 ✓，宿主不需要 ✓）。
+
+## 0.21.3（`nftables` 写进 apk 依赖）
+
+- 之前 `nftables` 是**手动步骤** ✗：不装 → 默认开启的出网策略**静默不生效** ✗，
+  只有 `install`/`doctor` 的 hint 会提一句 ✓ —— 默认开着却默认不生效，这个默认值不合理 ✓；
+- 现在 `depends="python3 nodejs npm pnpm util-linux logrotate nftables"` ✓，
+  装包即装好 ✓，`apk info -R dsh-mu` 能看到 ✓；
+- 文案同步 ✓：`install` / `doctor` / `egress show` 的提示改成"它是包的依赖，缺了就
+  `apk add nftables` 或重装 dsh-mu"✓；docs/05、docs/06、README 里"需要手动装"的说法都改掉 ✓。
+
 > **关于版本号**：`0.16.1` / `0.18.2` / `0.18.3` / `0.18.5` 是当天连续排障时的**中间构建** ✓，
 > 它们的修复已合并进相邻条目（`0.16.0`、`0.18.1`、`0.18.4`）✓，没有单独记 ✓。
 > 当前版本见 `VERSION` 文件 ✓。
