@@ -57,6 +57,8 @@
           border-bottom: 1px solid #1d222c; }
   .plan:last-child { border-bottom: 0; }
   .plan .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mu-greenfield { display: block; margin: 8px 0; font-size: 12px; color: #aeb6c2; }
+  .mu-greenfield select { display: block; width: 100%; margin-top: 4px; }
   .plan .tag { font-size: 11px; color: #8b93a1; border: 1px solid #2b3240; border-radius: 999px;
                padding: 1px 6px; flex: 0 0 auto; }
   .plan button { padding: 2px 6px; font-size: 11px; }
@@ -184,15 +186,6 @@
       </div>
     </div>
 
-    <div class="card" id="pluginCard">
-      <div class="card-head">
-        <h3>我的插件</h3>
-        <button class="btn sm ghost" id="plugAddOpen" title="安装一个插件">＋ 安装</button>
-      </div>
-      <div id="plugs">加载中…</div>
-      <div class="msg" id="plugMsg"></div>
-    </div>
-
     <div class="card" id="planCard">
       <div class="card-head">
         <h3>我的套餐</h3>
@@ -200,6 +193,18 @@
       </div>
       <div id="plans">加载中…</div>
       <div class="msg" id="plMsg"></div>
+    </div>
+
+    <div class="card" id="myDefaultCard">
+      <div class="card-head">
+        <h3>我的默认模型</h3>
+        <button class="btn sm" id="myDefEdit">设置</button>
+      </div>
+      <div id="myDefState" class="plan-sub">加载中…</div>
+      <div class="mu-hint" style="margin:6px 0 0">
+        新会话从这个模型开始，优先于管理员设置的默认；只能设一条，改完要重启实例才生效。
+      </div>
+      <div class="msg" id="myDefMsg"></div>
     </div>
 
     <div class="foot">dsh-mu 多实例网关</div>
@@ -296,6 +301,14 @@
 
   const listOf = (v) => (Array.isArray(v) ? v : []);
 
+  const wireMyDefault = () => {
+    const edit = $("myDefEdit");
+    if (edit && !edit.dataset.wired) {
+      edit.dataset.wired = "1";
+      edit.addEventListener("click", () => openMyDefault());
+    }
+  };
+
   function planRow(p) {
     const acts = p.own
       ? `<button class="link" data-act="probe" data-id="${esc(p.id)}">检测</button>` +
@@ -321,6 +334,106 @@
       </div>
       <div class="plan-side">${badges}${acts}</div>
     </div>`;
+  }
+
+  // The user's own default: one entry, outranks whatever the operator configured.
+  // The card only *shows* the current state; editing happens in a dialog, like every
+  // other create/modify action in this panel.
+  function renderMyDefault(data) {
+    const box = $("myDefState");
+    const btn = $("myDefEdit");
+    if (!box || !btn) return;
+    const mine = data.my_default || {};
+    const plans = listOf(data.plans);
+    const plan = plans.find((p) => p.id === mine.plan);
+    if (mine.plan) {
+      box.innerHTML = `已设置：<b>${esc(plan ? plan.name : mine.plan)}</b>`
+        + (mine.model ? ` · <code>${esc(mine.model)}</code>` : " · 套餐默认模型")
+        + ' <button class="link danger" id="myDefClear">清除</button>';
+      btn.textContent = "修改";
+      const clear = box.querySelector("#myDefClear");
+      if (clear) clear.addEventListener("click", () => clearMyDefault());
+    } else {
+      const fallback = plans.find((p) => p.is_default) || plans[0];
+      box.innerHTML = `未设置${fallback ? `（新会话按平台默认：${esc(fallback.name)}）` : ""}`;
+      btn.textContent = "设置";
+    }
+    state.myDefault = mine;
+    state.myDefaultPlans = plans.filter((p) => p.enabled !== false);
+  }
+
+  function openMyDefault() {
+    const plans = state.myDefaultPlans || [];
+    const mine = state.myDefault || {};
+    if (!plans.length) {
+      formMsg("myDefMsg", "没有可用的套餐", "err");
+      return;
+    }
+    const planOf = (pid) => plans.find((p) => p.id === pid) || plans[0];
+    const modelsOf = (pid) => {
+      const plan = planOf(pid);
+      const eff = listOf(plan.effective_models).length ? listOf(plan.effective_models) : listOf(plan.models);
+      return eff;
+    };
+    const first = mine.plan || (plans.find((p) => p.is_default) || plans[0]).id;
+    const opts = (list, selected) => list
+      .map((v) => `<option value="${esc(v)}" ${v === selected ? "selected" : ""}>${esc(v)}</option>`)
+      .join("");
+    const modelOptions = (pid, selected) =>
+      ['<option value="">（套餐默认）</option>']
+        .concat(modelsOf(pid).map((m) =>
+          `<option value="${esc(m)}" ${m === selected ? "selected" : ""}>${esc(m)}</option>`)).join("");
+
+    openModal({
+      title: mine.plan ? "修改我的默认模型" : "设置我的默认模型",
+      ok: "保存",
+      cancel: "取消",
+      body: `<p class="mu-hint">新会话从这个模型开始，优先于管理员设置的默认；只能设一条。改完要重启实例才生效。</p>
+        <label class="mu-greenfield">套餐
+          <select id="mdPlan">${plans.map((p) =>
+            `<option value="${esc(p.id)}" ${p.id === first ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>
+        <label class="mu-greenfield">模型
+          <select id="mdModel">${modelOptions(first, mine.model || "")}</select></label>
+        <div class="msg" id="mdMsg"></div>`,
+      onOk: async () => {
+        const planSel = dq("mdPlan");
+        const modelSel = dq("mdModel");
+        try {
+          await api("/me", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "plan-default", id: planSel.value,
+                                   model: modelSel.value }),
+          });
+        } catch (e) {
+          formMsg("myDefMsg", "保存失败：" + ((e.body && e.body.detail) || e.message), "err");
+          return false;
+        }
+        formMsg("myDefMsg", "已保存 ✓ 点上面「我的实例」里的「重启」让它生效（约十几秒到一分钟）", "good");
+        refresh();
+        return false;
+      },
+    });
+    const planSel = dq("mdPlan");
+    if (planSel) {
+      planSel.addEventListener("change", () => {
+        dq("mdModel").innerHTML = modelOptions(planSel.value, "");
+      });
+    }
+  }
+
+  async function clearMyDefault() {
+    try {
+      await api("/me", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "plan-default-clear" }),
+      });
+      formMsg("myDefMsg", "已清除：新会话回到平台默认（重启实例后生效）", "good");
+      refresh();
+    } catch (e) {
+      formMsg("myDefMsg", "清除失败：" + ((e.body && e.body.detail) || e.message), "err");
+    }
   }
 
   function renderPlans(data) {
@@ -469,18 +582,6 @@
     </div>`;
   }
 
-  function renderPlugins(data) {
-    const box = $("plugs");
-    if (!box) return;
-    const rows = data.installed || [];
-    box.innerHTML = rows.length
-      ? rows.map(pluginRow).join("")
-      : '<div class="msg">还没有安装插件。点右上角「＋ 安装」从管理员清单里选一个。</div>';
-    box.querySelectorAll('button[data-plug="remove"]').forEach((btn) => {
-      btn.addEventListener("click", () => openUninstall(btn.dataset.pkg));
-    });
-  }
-
   function render(data) {
     state.data = data;
     // Each card renders independently: when one throws (a field of an unexpected
@@ -492,8 +593,8 @@
         flash(`${label} 渲染失败：${e.message}`, "err");
       }
     };
-    safe("插件", () => renderPlugins(data));
     safe("套餐", () => renderPlans(data));
+    safe("我的默认模型", () => { renderMyDefault(data); wireMyDefault(); });
     $("uname").textContent = data.user;
     $("uname").title = data.user;
     $("urole").innerHTML = (data.admin
@@ -517,10 +618,22 @@
       const pidsText = res.pids == null
         ? "—"
         : `${res.pids}${res.pids_max ? " / " + res.pids_max : ""}`;
+      const startedAt = Number(i.started_at || 0);
+      const fmtAgo = (ts) => {
+        const secs = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+        if (secs < 90) return `${secs} 秒前`;
+        if (secs < 5400) return `${Math.round(secs / 60)} 分钟前`;
+        if (secs < 172800) return `${(secs / 3600).toFixed(1)} 小时前`;
+        return `${Math.round(secs / 86400)} 天前`;
+      };
+      const startedText = startedAt
+        ? `${new Date(startedAt * 1000).toLocaleString()}（${fmtAgo(startedAt)}）`
+        : "—";
       $("inst").innerHTML = [
         ["名称", esc(i.name)],
         ["端口", esc(i.port)],
         ["状态", `<span class="${live ? "ok" : "bad"}">${live ? "运行中" : esc(i.state)}</span>`],
+        ["启动", startedText],
         ["模型", esc(i.provider) + (i.model ? " / " + esc(i.model) : "")],
         ["内存", memText],
         ["CPU", cpuText],
@@ -641,18 +754,8 @@
       body: '<p class="mu-hint">重启会中断正在进行的对话，通常需要十几秒到一分钟。</p>',
       ok: "重启",
       onOk: async () => {
-        setBusy($("restartInst"), "重启中…");
-        try {
-          await api("/me", { method: "POST", headers: { "Content-Type": "application/json" },
-                             body: JSON.stringify({ action: "restart" }) });
-          markPending(false);
-          setBusy($("restartInst"), "");
-          setTimeout(refresh, 6000);
-          setTimeout(refresh, 20000);
-        } catch (e) {
-          setBusy($("restartInst"), "");
-          formMsg("plMsg", "重启失败：" + ((e.body && e.body.detail) || e.message), "err");
-        }
+        markPending(false);
+        restartWithProgress($("restartInst"));
         return false;
       },
     });
@@ -660,25 +763,63 @@
 
   $("pendingRestart").addEventListener("click", confirmRestart);
 
+  // Restart is slow (tens of seconds). Show progress instead of going quiet: poll /me
+  // until the harness answers again, and report the elapsed time.
+  async function restartWithProgress(button) {
+    setBusy(button, "重启中… 0s");
+    formMsg("plMsg", "正在重启，可以继续用这个抽屉；进度会显示在重启按钮上。", "good");
+    const began = Date.now();
+    try {
+      await api("/me", { method: "POST", headers: { "Content-Type": "application/json" },
+                         body: JSON.stringify({ action: "restart" }) });
+    } catch (e) {
+      setBusy(button, "");
+      formMsg("plMsg", "重启失败：" + ((e.body && e.body.detail) || e.message), "err");
+      return;
+    }
+    let tick = 0;
+    const timer = setInterval(() => {
+      tick += 1;
+      const secs = Math.round((Date.now() - began) / 1000);
+      setBusy(button, `重启中… ${secs}s`);
+    }, 1000);
+    const deadline = began + 180000;
+    const poll = async () => {
+      let live = false;
+      try {
+        const data = await api("/me");
+        live = Boolean(data.instance && data.instance.live);
+        if (live) state.data = data;
+      } catch (e) { /* the gateway may briefly refuse while it restarts */ }
+      if (live) {
+        clearInterval(timer);
+        const secs = Math.round((Date.now() - began) / 1000);
+        setBusy(button, "");
+        formMsg("plMsg", `已重启完成（${secs} 秒）`, "good");
+        refresh();
+        return;
+      }
+      if (Date.now() > deadline) {
+        clearInterval(timer);
+        setBusy(button, "");
+        formMsg("plMsg", "等了 3 分钟还没起来，看一下实例日志（dsh-muctl instance logs）", "err");
+        refresh();
+        return;
+      }
+      setTimeout(poll, 2000);
+    };
+    setTimeout(poll, 2000);
+  }
+
   $("restartInst").addEventListener("click", () => {
     openModal({
       title: "重启实例",
-      body: '<p class="mu-hint">重启会中断正在进行的对话，通常需要十几秒到一分钟。</p>',
+      body: '<p class="mu-hint">重启会中断正在进行的对话，通常需要十几秒到一分钟。'
+        + '点「重启」后按钮上会显示进度，实例恢复后会有提示。</p>',
       ok: "重启",
       onOk: async () => {
-        setBusy($("restartInst"), "重启中…");
-        try {
-          await api("/me", { method: "POST", headers: { "Content-Type": "application/json" },
-                             body: JSON.stringify({ action: "restart" }) });
-          setBusy($("restartInst"), "");
-          setTimeout(refresh, 6000);
-          setTimeout(refresh, 20000);
-          return false;
-        } catch (e) {
-          setBusy($("restartInst"), "");
-          formMsg("plMsg", "重启失败：" + ((e.body && e.body.detail) || e.message), "err");
-          return false;
-        }
+        restartWithProgress($("restartInst"));
+        return false;
       },
     });
   });
@@ -753,140 +894,6 @@
       },
     });
   });
-
-  // ---- plugins: curated list installs freely; everything else needs an admin ----
-  async function postPlugin(payload) {
-    return api("/me", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-  }
-
-  function adminPasswordField(hint) {
-    return `<label for="plugPw">管理员密码</label>
-      <input id="plugPw" type="password" autocomplete="off" placeholder="${esc(hint || "")}">
-      <div class="msg" id="plugModalMsg"></div>`;
-  }
-
-  $("plugAddOpen").addEventListener("click", () => {
-    const data = state.data || {};
-    const catalog = data.pluginCatalog || [];
-    const installed = new Set((data.installed || []).map((r) => r.pkg));
-    const options = catalog
-      .filter((e) => !installed.has(e.pkg))
-      .map((e) => `<option value="${esc(e.pkg)}" data-version="${esc(e.version || "")}">` +
-                  `${esc(e.pkg)}${e.version ? "  " + esc(e.version) : ""}` +
-                  `${e.note ? "  —  " + esc(e.note) : ""}</option>`).join("");
-    const body = `<p class="mu-hint">清单里的插件可以直接安装。其他包需要管理员密码。</p>
-      <label for="plugPick">从清单选择</label>
-      <select id="plugPick">${options || '<option value="">（清单为空）</option>'}
-        <option value="__other">其他（需要管理员密码）…</option>
-      </select>
-      <div id="plugOther" style="display:none">
-        <label for="plugPkg">包名</label>
-        <input id="plugPkg" placeholder="@scope/dsh-plugin-x" autocomplete="off">
-        <label for="plugVer">版本（可留空）</label>
-        <input id="plugVer" placeholder="1.2.3" autocomplete="off">
-      </div>
-      <div id="plugPwWrap" style="display:none"></div>
-      <div class="msg" id="plugModalMsg"></div>`;
-    openModal({
-      title: "安装插件",
-      ok: "安装",
-      body,
-      onOk: async () => {
-        const pick = dq("plugPick").value;
-        const other = pick === "__other";
-        const pkg = other ? dq("plugPkg").value.trim() : pick;
-        const version = other ? dq("plugVer").value.trim()
-                              : (dq("plugPick").selectedOptions[0].dataset.version || "");
-        formMsg("plugModalMsg", "");
-        if (!pkg) { formMsg("plugModalMsg", "先选一个包，或者填包名。", "err"); return true; }
-        const payload = { action: "plugin-install", pkg };
-        if (version) payload.version = version;
-        const pw = dq("plugPw");
-        if (pw && pw.value) payload.admin_password = pw.value;
-        try {
-          const res = await postPlugin(payload);
-          formMsg("plugMsg", "已安装 " + pkg + "；重启实例后生效。", "good");
-          markPending(true);
-          refresh();
-          return false;
-        } catch (e) {
-          if (e.status === 403 && e.body && e.body.needs_admin_password) {
-            dq("plugPwWrap").style.display = "block";
-            dq("plugPwWrap").innerHTML = adminPasswordField(e.body.detail || "");
-            formMsg("plugModalMsg", "需要管理员密码才能安装这个包。", "err");
-            return true;
-          }
-          formMsg("plugModalMsg", (e.body && e.body.detail) || e.message, "err");
-          return true;
-        }
-      },
-    });
-    // toggle the "other" fields
-    setTimeout(() => {
-      const sel = dq("plugPick");
-      if (!sel) return;
-      const sync = () => {
-        const other = sel.value === "__other";
-        dq("plugOther").style.display = other ? "block" : "none";
-        dq("plugPwWrap").style.display = other ? "block" : "none";
-        if (other && !dq("plugPw")) {
-          dq("plugPwWrap").innerHTML = adminPasswordField("装清单外的包需要它");
-        }
-      };
-      sel.addEventListener("change", sync);
-      sync();
-    }, 30);
-  });
-
-  function openUninstall(pkg) {
-    const row = (state.data && state.data.installed || []).find((r) => r.pkg === pkg) || {};
-    const curated = row.source === "curated";
-    if (curated) {
-      openModal({
-        title: "卸载管理员提供的插件",
-        danger: true,
-        ok: "卸载",
-        body: `<p class="mu-hint">「${esc(pkg)}」在管理员清单里，卸载需要管理员密码。</p>
-          ${adminPasswordField("管理员密码")}`,
-        onOk: async () => {
-          const pw = dq("plugPw") ? dq("plugPw").value : "";
-          formMsg("plugModalMsg", "");
-          try {
-            await postPlugin({ action: "plugin-uninstall", pkg, admin_password: pw });
-            formMsg("plugMsg", "已卸载 " + pkg + "；重启实例后生效。", "good");
-            refresh();
-            return false;
-          } catch (e) {
-            formMsg("plugModalMsg", (e.body && (e.body.detail || e.body.error)) || e.message, "err");
-            return true;
-          }
-        },
-      });
-      return;
-    }
-    openModal({
-      title: "卸载插件",
-      danger: true,
-      ok: "卸载",
-      body: `<p class="mu-hint">「${esc(pkg)}」是你自己装的，可以直接卸载。</p>
-        <div class="msg" id="plugModalMsg"></div>`,
-      onOk: async () => {
-        try {
-          await postPlugin({ action: "plugin-uninstall", pkg });
-          formMsg("plugMsg", "已卸载 " + pkg + "；重启实例后生效。", "good");
-          markPending(true);
-          refresh();
-          return false;
-        } catch (e) {
-          formMsg("plugModalMsg", (e.body && (e.body.detail || e.body.error)) || e.message, "err");
-          return true;
-        }
-      },
-    });
-  }
 
   $("logout").addEventListener("click", () => { location.href = "/logout"; });
 

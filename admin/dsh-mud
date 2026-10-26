@@ -183,16 +183,30 @@ def read_audit(limit: int = 100) -> list[dict]:
 # ------------------------------------------------------------------- API views
 
 
+def is_system_account(name: str) -> bool:
+    """root / ADMIN_SYSTEM_USERS: they authenticate with the host password."""
+    try:
+        return name in mu.system_admin_names(mu.load_config())
+    except Exception:  # noqa: BLE001 - never let a guard turn into a 500
+        return name == "root"
+
+
 def users_view(st: dict) -> list[dict]:
     """Users without credential material (never expose `pw`)."""
     return [
         {
             "name": name,
+            # System accounts (root / ADMIN_SYSTEM_USERS) authenticate against the host
+            # password and cannot be disabled/renamed/deleted from the platform; the
+            # page needs to know so it can hide those buttons instead of offering them.
+            "system": is_system_account(name),
             "role": user.get("role", "user"),
             "enabled": bool(user.get("enabled", True)),
             "epoch": int(user.get("epoch", 0)),
             "instance": user.get("instance") or "",
             "must_change": bool(user.get("must_change")),
+            # the user's own default model; it outranks the operator's priority chain
+            "default_override": user.get("default_override") or {},
             "created_at": user.get("created_at", 0),
             "updated_at": user.get("updated_at", 0),
         }
@@ -241,6 +255,7 @@ def instance_view(st: dict, name: str) -> dict:
         "log_bytes": (os.path.getsize(f"{mu.LOGS}/{name}.log")
                       if os.path.exists(f"{mu.LOGS}/{name}.log") else 0),
         "restarts": int(inst.get("restarts", 0)),
+        "started_at": int(inst.get("started_at", 0) or 0),
         "port_range": [int(x) for x in (st["config"].get("port_range") or [])],
     }
 
@@ -438,15 +453,19 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("POST", re.compile(r"^/api/packages/([\w.-]+)/usage$"), "package_usage"),
     ("DELETE", re.compile(r"^/api/packages/([\w.-]+)$"), "package_delete"),
     ("GET", re.compile(r"^/api/plugins$"), "plugin_list"),
-    ("POST", re.compile(r"^/api/plugins$"), "plugin_catalog"),
-    ("GET", re.compile(r"^/api/me/plugins$"), "me_plugins"),
-    ("POST", re.compile(r"^/api/me/plugins$"), "me_plugin_action"),
     ("POST", re.compile(r"^/api/me/instance/restart$"), "me_restart"),
     ("GET", re.compile(r"^/api/me/plans$"), "me_plans"),
     ("POST", re.compile(r"^/api/me/plans$"), "me_plan_action"),
     ("GET", re.compile(r"^/api/plans$"), "plan_list"),
     ("POST", re.compile(r"^/api/plans$"), "plan_add"),
-    ("POST", re.compile(r"^/api/plans/([\w.-]+)/(enable|disable|default)$"), "plan_action"),
+    ("POST", re.compile(r"^/api/plans/([\w.-]+)/(enable|disable|default|hide|show|order)$"),
+     "plan_action"),
+    ("GET", re.compile(r"^/api/egress$"), "egress_get"),
+    ("POST", re.compile(r"^/api/egress$"), "egress_set"),
+    ("GET", re.compile(r"^/api/plugin-policy$"), "plugin_policy_get"),
+    ("POST", re.compile(r"^/api/plugin-policy$"), "plugin_policy_set"),
+    ("GET", re.compile(r"^/api/default-chain$"), "default_chain_get"),
+    ("POST", re.compile(r"^/api/default-chain$"), "default_chain_set"),
     ("GET", re.compile(r"^/api/provider-templates$"), "template_list"),
     ("POST", re.compile(r"^/api/provider-templates/import$"), "template_import"),
     ("GET", re.compile(r"^/api/mounts$"), "mount_list"),
@@ -455,6 +474,8 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("POST", re.compile(r"^/api/plans/([\w.-]+)/probe$"), "plan_probe"),
     ("POST", re.compile(r"^/api/plans/([\w.-]+)/usage$"), "plan_usage"),
     ("POST", re.compile(r"^/api/plans/([\w.-]+)/models$"), "plan_models"),
+    ("POST", re.compile(r"^/api/plans/([\w.-]+)/key$"), "plan_key"),
+
     ("DELETE", re.compile(r"^/api/plans/([\w.-]+)$"), "plan_delete"),
     ("POST", re.compile(r"^/api/instances/([\w-]+)/provider/test$"), "instance_provider_test"),
     ("POST", re.compile(r"^/api/instances/([\w-]+)/key$"), "instance_key_set"),
@@ -465,9 +486,10 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("POST", re.compile(r"^/api/users/([\w-]+)/password$"), "user_password"),
     ("POST", re.compile(r"^/api/users/([\w-]+)/(enable|disable)$"), "user_toggle"),
     ("POST", re.compile(r"^/api/users/([\w-]+)/kick$"), "user_kick"),
+    ("POST", re.compile(r"^/api/users/([\w-]+)/default-clear$"), "user_default_clear"),
+    ("POST", re.compile(r"^/api/user-defaults/clear-all$"), "user_defaults_clear_all"),
     ("POST", re.compile(r"^/api/instances$"), "instance_create"),
     ("POST", re.compile(r"^/api/instances/([\w-]+)/(start|stop|restart|refresh-cookie)$"), "instance_action"),
-    ("POST", re.compile(r"^/api/instances/([\w-]+)/provider$"), "instance_provider"),
     ("POST", re.compile(r"^/api/config$"), "config_set"),
     ("PATCH", re.compile(r"^/api/instances/([\w-]+)$"), "instance_limits"),
     ("DELETE", re.compile(r"^/api/users/([\w-]+)$"), "user_delete"),
@@ -483,10 +505,13 @@ MUTATING = {"auth_verify", "instance_ensure", "provider_save", "provider_delete"
             "plan_probe", "plan_usage", "plan_models",
             "mount_list", "mount_save", "mount_delete",
             "template_list", "template_import",
-            "me_plan_action", "me_restart", "me_plugin_action", "plugin_catalog",
+            "default_chain_get", "default_chain_set",
+            "plan_key", "user_default_clear", "user_defaults_clear_all",
+            "egress_get", "egress_set", "plugin_policy_get", "plugin_policy_set",
+            "me_plan_action", "me_restart",
             "me_password", "user_create", "user_password", "user_toggle", "user_delete",
             "instance_create", "instance_action", "instance_limits",
-            "instance_delete", "instance_provider", "config_set"}
+            "instance_delete", "config_set"}
 
 
 def run_async(fn, actor: str, action: str, target: str, ip: str) -> None:
@@ -728,108 +753,6 @@ class Handler(BaseHTTPRequestHandler):
                 return 404, {"error": "no such package", "id": groups[0]}
             os.unlink(path)
             return 200, {"ok": True, "id": groups[0]}
-        if name == "plugin_list":
-            st_ = mu.load_state()
-            return 200, {"plugins": mu.plugins_catalog(st_),
-                         "instances": {n: mu.instance_plugins(n)
-                                       for n in sorted((st_.get("instances") or {}))}}
-        if name == "plugin_catalog":
-            action = str(body.get("action") or "add").strip()
-            pkg = str(body.get("pkg") or "").strip()
-            version = str(body.get("version") or "").strip()
-            note = str(body.get("note") or "").strip()
-            if not pkg or not mu.PLUGIN_PKG_RE.match(pkg):
-                return 400, {"error": "invalid package name", "got": pkg[:80]}
-            if version and not mu.PLUGIN_VER_RE.match(version):
-                return 400, {"error": "invalid version", "got": version[:40]}
-            with mu.state_lock():
-                st_ = mu.load_state()
-                rows = [e for e in (st_.get("plugins_catalog") or [])
-                        if str(e.get("pkg")) != pkg]
-                if action == "add":
-                    rows.append({"pkg": pkg, "version": version, "note": note[:200],
-                                 "added_at": int(__import__("time").time()),
-                                 "added_by": str(actor or "")})
-                    st_["plugins_catalog"] = rows
-                    mu.save_state(st_)
-                    audit(actor, "plugin.catalog.add", pkg, {"version": version}, "")
-                    return 200, {"ok": True, "pkg": pkg, "plugins": mu.plugins_catalog(st_)}
-                if action == "remove":
-                    if len(rows) == len(st_.get("plugins_catalog") or []):
-                        return 404, {"error": "not in the catalog", "pkg": pkg}
-                    st_["plugins_catalog"] = rows
-                    mu.save_state(st_)
-                    audit(actor, "plugin.catalog.remove", pkg, {}, "")
-                    return 200, {"ok": True, "pkg": pkg, "plugins": mu.plugins_catalog(st_)}
-            return 400, {"error": "unknown action", "action": action}
-        if name == "me_plugins":
-            actor_user = str(actor or "").strip()
-            st_ = mu.load_state()
-            if actor_user not in (st_.get("users") or {}):
-                return 403, {"error": "not a platform account", "user": actor_user}
-            inst = str((st_["users"].get(actor_user) or {}).get("instance") or "")
-            catalog = mu.plugins_catalog(st_)
-            return 200, {"catalog": catalog,
-                         "instance": inst,
-                         "installed": mu.instance_plugins(inst) if inst else [],
-                         "profile": mu.instance_profile(inst) if inst else ""}
-        if name == "me_plugin_action":
-            actor_user = str(actor or "").strip()
-            st_ = mu.load_state()
-            user = (st_.get("users") or {}).get(actor_user)
-            if not user:
-                return 403, {"error": "not a platform account", "user": actor_user}
-            inst = str(user.get("instance") or "")
-            if not inst or inst not in (st_.get("instances") or {}):
-                return 400, {"error": "no instance", "detail": "this account has no instance yet"}
-            action = str(body.get("action") or "").strip()
-            pkg = str(body.get("pkg") or "").strip()
-            version = str(body.get("version") or "").strip()
-            if action not in ("install", "uninstall"):
-                return 400, {"error": "unknown action", "action": action}
-            if not pkg or not mu.PLUGIN_PKG_RE.match(pkg):
-                return 400, {"error": "invalid package name", "got": pkg[:80]}
-            if version and not mu.PLUGIN_VER_RE.match(version):
-                return 400, {"error": "invalid version", "got": version[:40]}
-            catalog = {str(e.get("pkg")): e for e in mu.plugins_catalog(st_)}
-            curated = pkg in catalog
-            installed = {r["pkg"]: r for r in mu.instance_plugins(inst)}
-            # the one rule: anything that goes beyond the curated list needs an
-            # administrator's password (installing something else, or removing
-            # something the administrator put there)
-            needs_admin = (not curated) if action == "install" else curated
-            if needs_admin:
-                cfg_ = mu.load_config()
-                ok, who = verify_admin_password(str(body.get("admin_password") or ""), cfg_, st_)
-                if not ok:
-                    return 403, {"error": "administrator password required",
-                                 "needs_admin_password": True,
-                                 "reason": who,
-                                 "detail": ("不在管理员清单里的包，需要管理员密码"
-                                            if action == "install" else
-                                            "这是管理员提供的插件，卸载需要管理员密码")}
-                audit(actor_user, f"plugin.{action}.approved", pkg,
-                      {"instance": inst, "approved_by": who}, "")
-            if action == "uninstall" and pkg not in installed:
-                return 404, {"error": "not installed", "pkg": pkg}
-            if action == "install" and pkg in installed:
-                return 409, {"error": "already installed", "pkg": pkg,
-                             "version": installed[pkg]["version"]}
-            try:
-                ok, out = mu.plugin_exec(inst, "add" if action == "install" else "remove",
-                                         pkg, version or None)
-            except Exception as exc:  # noqa: BLE001
-                return 500, {"error": "plugin command failed", "detail": mu_exc_message(exc)}
-            if not ok:
-                return 400, {"error": "plugin command failed", "detail": out[-600:]}
-            mu.record_plugin(mu.load_state(), inst, pkg,
-                             version or mu._installed_version(inst, pkg),
-                             "curated" if curated else "self", actor_user,
-                             present=(action == "install"))
-            audit(actor_user, f"plugin.{action}", pkg, {"instance": inst, "version": version}, "")
-            return 200, {"ok": True, "action": action, "pkg": pkg,
-                         "installed": mu.instance_plugins(inst),
-                         "detail": "restart the instance to apply"}
         if name == "me_restart":
             actor_user = str(actor or "").strip()
             if not actor_user:
@@ -868,7 +791,7 @@ class Handler(BaseHTTPRequestHandler):
                     default_id = sorted(visible,
                                         key=lambda p: str(p.get("name") or p["id"]))[0]["id"]
                 for plan in sorted(mu.plans_for_user(actor_user),
-                                   key=lambda p: str(p.get("name") or p.get("id"))):
+                                   key=mu.plan_order_key):
                     pid = plan["id"]
                     own = str(plan.get("owner") or "*") == actor_user
                     rows.append({"id": pid, "name": plan.get("name"),
@@ -891,8 +814,10 @@ class Handler(BaseHTTPRequestHandler):
                 # Built-in presets are NOT offered here: an operator imports the
                 # packages they want, and the drawer only lists those (a preset the
                 # user never saw appear out of nowhere was confusing).
+                own_default = mu.user_default_override(st, actor_user)
                 return 200, {"plans": rows, "providers": providers,
-                             "default": default_id,
+                             "default": own_default.get("plan") or default_id,
+                             "my_default": own_default,
                              "team_plans_are_readonly": True}
             action = str(body.get("action") or "")
             if action == "add":
@@ -911,7 +836,11 @@ class Handler(BaseHTTPRequestHandler):
                 bad = [m for m in models if m not in known]
                 if bad:
                     return 400, {"error": "models not in the provider", "models": bad}
-                plan = {"schema": mu.PLAN_SCHEMA, "id": mu.plan_id_for(actor_user + "/" + name_),
+                pid_ = mu.plan_id_for(actor_user + "/" + name_)
+                if mu.load_plan(pid_):
+                    return 409, {"error": "you already have a plan with this name",
+                                 "id": pid_, "detail": "rename it, or delete the old one first"}
+                plan = {"schema": mu.PLAN_SCHEMA, "id": pid_,
                         "name": name_, "provider": pkg["id"], "owner": actor_user,
                         "visible_to": [actor_user], "enabled": True,
                         "models": models, "default_model": str(body.get("default_model") or "")}
@@ -920,6 +849,24 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, {"ok": True, "plan": {"id": saved["id"], "name": saved["name"],
                                                   "provider": saved["provider"]},
                              "note": "restart your instance to pick up the new plan"}
+            if action == "default":
+                pid_ = str(body.get("id") or "").strip()
+                model = str(body.get("model") or "").strip()
+                try:
+                    saved = mu.set_user_default_override(st, actor_user, pid_, model)
+                except ValueError as exc:
+                    return 400, {"error": str(exc)}
+                mu.save_state(st)
+                mu.sync_all(st)
+                return 200, {"ok": True, "my_default": saved,
+                             "note": "restart your instance to apply"}
+            if action == "default-clear":
+                cleared = mu.clear_user_default_override(st, actor_user)
+                if cleared:
+                    mu.save_state(st)
+                    mu.sync_all(st)
+                return 200, {"ok": True, "cleared": cleared,
+                             "note": "back to the platform default; restart to apply"}
             pid = str(body.get("id") or "").strip()
             plan = mu.load_plan(pid) if pid else None
             if not plan:
@@ -929,7 +876,9 @@ class Handler(BaseHTTPRequestHandler):
                              "detail": "ask the platform administrator to change or remove it"}
             if action == "models":
                 res = mu.set_plan_models(plan, body.get("models") or [],
-                                         select_all_available=bool(body.get("all_available")))
+                                         select_all_available=bool(body.get("all_available")),
+                                         default_model=(body.get("default_model")
+                                                        if "default_model" in body else None))
                 if not res.get("ok"):
                     return 400, {"error": res.get("error"),
                                  "unusable": res.get("unusable") or [],
@@ -958,12 +907,132 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, {"ok": True, "id": pid, "name": new_name,
                              "note": "restart your instance to apply"}
             if action == "delete":
+                if pid == mu.DEFAULT_PLAN_ID:
+                    return 400, {"error": "the built-in fallback plan cannot be deleted"}
                 for path in (f"{mu.PLANS_DIR}/{pid}.json", mu.plan_key_path(pid)):
                     with contextlib.suppress(OSError):
                         os.unlink(path)
                 mu.sync_all(st)
                 return 200, {"ok": True, "id": pid, "note": "restart your instance to apply"}
             return 400, {"error": "unknown action", "action": action}
+        if name in ("egress_get", "egress_set"):
+            st_e = mu.load_state()
+            if name == "egress_get":
+                rows = []
+                for inst in sorted(st_e["instances"]):
+                    policy, allow = mu.instance_egress(st_e, inst)
+                    own = [r["text"] for r in mu.parse_egress_allow(
+                        (st_e["instances"][inst] or {}).get("egress_allow") or [])]
+                    rows.append({"instance": inst, "policy": policy,
+                                 "allow": [r["text"] for r in allow], "own": own,
+                                 "override": bool((st_e["instances"][inst] or {}).get("egress")),
+                                 "port": int((st_e["instances"][inst] or {}).get("port") or 0)})
+                return 200, {"all_rules": [r["text"] for r in mu.global_egress_allow(st_e)],
+                             "policies": ["allowlist", "no-intranet", "open"],
+                             "labels": {"allowlist": "全限制", "no-intranet": "禁内网",
+                                        "open": "不限制"},
+                             "global": {"policy": st_e["config"].get("instance_egress") or "no-intranet",
+                                        "allow": st_e["config"].get("instance_egress_allow") or ""},
+                             "instances": rows,
+                             "nft": mu.nft_available(),
+                             "rules_file": mu.EGRESS_NFT}
+            target = str(body.get("instance") or "").strip()
+            scope = str(body.get("scope") or "").strip().lower()
+            if scope == "all" or target in ("__all__", "all", "*"):
+                target = ""
+            policy = str(body.get("policy") or "").strip().lower()
+            allow_raw = body.get("allow")
+            if policy and policy not in mu.EGRESS_POLICIES:
+                return 400, {"error": "unknown policy", "policy": policy}
+            try:
+                allow = (mu.parse_egress_allow(allow_raw)
+                         if allow_raw is not None else None)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            if allow is not None:
+                allow = [r["text"] for r in allow]
+            if target:
+                if target not in st_e["instances"]:
+                    return 404, {"error": "no such instance", "instance": target}
+                inst = st_e["instances"][target]
+                if body.get("reset"):
+                    inst.pop("egress", None)
+                    inst.pop("egress_allow", None)
+                else:
+                    if policy:
+                        inst["egress"] = policy
+                    if allow is not None:
+                        inst["egress_allow"] = list(allow)
+            else:
+                if policy:
+                    st_e["config"]["instance_egress"] = policy
+                if allow is not None:
+                    st_e["config"]["instance_egress_allow"] = ", ".join(allow)
+                    # config lives in /etc/dsh-mu/dsh-mu.conf, not in state.json
+                    mu.save_config(st_e["config"])
+            mu.save_state(st_e)
+            res = mu.apply_egress(mu.load_state(), quiet=False)
+            if res.get("error"):
+                return 500, {"error": "nft rejected the rules", "detail": res["error"][:400]}
+            return 200, {"ok": True, "enforced": res.get("enforced"),
+                         "loaded": res.get("loaded")}
+        if name in ("plugin_policy_get", "plugin_policy_set"):
+            st_p = mu.load_state()
+            if name == "plugin_policy_get":
+                installed = {}
+                rows_by_instance = {}
+                for inst in sorted(st_p["instances"]):
+                    rows = mu.instance_plugins(inst)
+                    rows_by_instance[inst] = rows
+                    for row in rows:
+                        installed.setdefault(row["pkg"], []).append(inst)
+                return 200, {"policy": mu.plugin_policy(st_p),
+                             "installed": installed,
+                             "instances": rows_by_instance,
+                             "nft": mu.nft_available()}
+            pkg = str(body.get("pkg") or "").strip()
+            if not pkg:
+                return 400, {"error": "pkg is required"}
+            try:
+                mu.set_plugin_policy(st_p, pkg,
+                                     protected=body.get("protected"),
+                                     mandatory=body.get("mandatory"),
+                                     note=body.get("note"))
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            mu.save_state(st_p)
+            mu.sync_all(mu.load_state())
+            return 200, {"ok": True, "pkg": pkg,
+                         "policy": mu.plugin_policy(mu.load_state()).get(pkg, {})}
+        if name in ("default_chain_get", "default_chain_set"):
+            cfg = mu.load_config()
+            if name == "default_chain_get":
+                chain = mu.default_chain(cfg)
+                rows = []
+                for index, entry in enumerate(chain, 1):
+                    plan = mu.load_plan(entry["plan"]) or {}
+                    pkg = mu.plan_package(plan) or {}
+                    rows.append({
+                        "priority": index,
+                        "plan": entry["plan"],
+                        "plan_name": plan.get("name") or entry["plan"],
+                        "model": entry["model"],
+                        "models": [m["id"] for m in (pkg.get("models") or [])],
+                    })
+                overrides = mu.users_with_default_override(mu.load_state())
+                return 200, {"chain": rows, "user_overrides": overrides,
+                             "user_overrides_count": len(overrides)}
+            entries = []
+            for row in body.get("chain") or []:
+                if isinstance(row, dict) and row.get("plan"):
+                    entries.append({"plan": str(row["plan"]), "model": str(row.get("model") or "")})
+            try:
+                cleaned = mu.save_default_chain(cfg, entries)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            mu.save_config(cfg)
+            mu.sync_all(mu.load_state())
+            return 200, {"ok": True, "chain": cleaned, "restart_required": True}
         if name in ("template_list", "template_import"):
             cfg = mu.load_config()
             if name == "template_list":
@@ -1036,11 +1105,21 @@ class Handler(BaseHTTPRequestHandler):
             mu.sync_all(mu.load_state())
             return 200, {"ok": True, "restart_required": True, "targets": targets,
                          "note": "restart the affected instances to apply"}
-        if name in ("plan_probe", "plan_usage", "plan_models"):
+        if name in ("plan_probe", "plan_usage", "plan_models", "plan_key"):
             pid = groups[0]
             plan = mu.load_plan(pid)
             if not plan:
                 return 404, {"error": "no such plan", "id": pid}
+            if name == "plan_key":
+                key = str(body.get("key") or "").strip()
+                if not key:
+                    return 400, {"error": "the credential must not be empty"}
+                plan["key"] = key
+                plan["has_key"] = True
+                mu.save_plan(plan)
+                mu.sync_all(mu.load_state())
+                return 200, {"ok": True, "id": pid, "rotated": True,
+                             "tail": key[-4:], "restart_required": True}
             if name == "plan_probe":
                 res = mu.plan_probe_models(plan)
                 if not res.get("ok"):
@@ -1061,19 +1140,24 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, {"windows": res.get("windows") or []}
             res = mu.set_plan_models(plan, body.get("models") or [],
                                      select_all_available=bool(body.get("all_available")),
-                                     clear=bool(body.get("clear")))
+                                     clear=bool(body.get("clear")),
+                                     default_model=(body.get("default_model")
+                                                    if "default_model" in body else None))
             if not res.get("ok"):
                 return 400, {"error": res.get("error"),
                              "unusable": res.get("unusable") or [],
                              "unknown": res.get("unknown") or []}
             return 200, {"ok": True, "models": res["models"], "count": res["count"],
+                         "default_model": res.get("default_model") or "",
                          "restart_required": True}
         if name == "plan_list":
             st = mu.load_state()
             plans = mu.list_plans()
             rows = []
-            for pid, plan in sorted(plans.items(), key=lambda kv: str(kv[1].get("name") or kv[0])):
+            for pid, plan in sorted(plans.items(), key=lambda kv: mu.plan_order_key(kv[1])):
                 rows.append({"id": pid, "name": plan.get("name"), "provider": plan.get("provider"),
+                             "hidden": bool(plan.get("hidden")),
+                             "order": plan.get("order"),
                              "owner": plan.get("owner") or "*",
                              "visible_to": plan.get("visible_to") or ["*"],
                              "enabled": bool(plan.get("enabled", True)),
@@ -1084,7 +1168,14 @@ class Handler(BaseHTTPRequestHandler):
                              "effective_models": mu.plan_effective_models(plan),
                              "has_key": bool(plan.get("has_key")),
                              "default_model": plan.get("default_model") or ""})
-            return 200, {"plans": rows, "default": st["config"].get("default_plan") or ""}
+            sp = mu.search_plan(st)
+            return 200, {"plans": rows, "default": st["config"].get("default_plan") or "",
+                         "search_plan": ({"id": sp["id"], "name": sp.get("name"),
+                                          "order": sp.get("order"),
+                                          "hidden": bool(sp.get("hidden"))}
+                                         if sp else None),
+                         "search_capable": [p["id"] for p in mu.list_plans().values()
+                                            if mu.plan_is_search_capable(p)]}
         if name == "plan_add":
             st = mu.load_state()
             pkg = mu.load_provider_package(str(body.get("provider") or "")) or \
@@ -1106,7 +1197,15 @@ class Handler(BaseHTTPRequestHandler):
             visible = [str(v) for v in (body.get("visible_to") or []) if str(v).strip()]
             if owner != "*" and not visible:
                 visible = [owner]
-            plan = {"schema": mu.PLAN_SCHEMA, "id": mu.plan_id_for(name_), "name": name_,
+            pid_ = mu.plan_id_for(name_)
+            existing = mu.load_plan(pid_)
+            if existing and not body.get("replace"):
+                return 409, {"error": "a plan with this name already exists",
+                             "id": pid_, "name": existing.get("name"),
+                             "provider": existing.get("provider"),
+                             "detail": "plan ids come from the name, so the same name is "
+                                       "the same plan; pick another name or confirm replace"}
+            plan = {"schema": mu.PLAN_SCHEMA, "id": pid_, "name": name_,
                     "provider": pkg["id"], "owner": owner, "visible_to": visible or ["*"],
                     "enabled": True, "models": models,
                     "default_model": str(body.get("default_model") or "")}
@@ -1122,6 +1221,18 @@ class Handler(BaseHTTPRequestHandler):
             plan = mu.load_plan(pid)
             if not plan:
                 return 404, {"error": "no such plan", "id": pid}
+            if action in ("hide", "show", "order"):
+                if action in ("hide", "show"):
+                    plan["hidden"] = action == "hide"
+                else:
+                    raw = str(body.get("order") or "").strip()
+                    if not raw.lstrip("-").isdigit():
+                        return 400, {"error": "order must be a number"}
+                    plan["order"] = int(raw)
+                mu.save_plan(plan)
+                mu.sync_all(st)
+                return 200, {"ok": True, "id": pid, "hidden": bool(plan.get("hidden")),
+                             "order": plan.get("order")}
             if action == "default":
                 if str(plan.get("owner") or "*") != "*":
                     return 400, {"error": "only team plans can be the platform default"}
@@ -1137,6 +1248,10 @@ class Handler(BaseHTTPRequestHandler):
             pid = groups[0]
             if not mu.load_plan(pid):
                 return 404, {"error": "no such plan", "id": pid}
+            if pid == mu.DEFAULT_PLAN_ID:
+                return 400, {"error": "the built-in fallback plan cannot be deleted",
+                             "detail": "disable it instead; it remains the last resort for "
+                                       "users who have no other plan"}
             for path in (f"{mu.PLANS_DIR}/{pid}.json", mu.plan_key_path(pid)):
                 with contextlib.suppress(OSError):
                     os.unlink(path)
@@ -1382,6 +1497,22 @@ class Handler(BaseHTTPRequestHandler):
                 mu.render_gateway(fresh)
             return 200, {"user": actor, "changed": True, "relogin_required": True,
                          "detail": "every session of this account was invalidated; log in again"}
+        if name == "user_default_clear":
+            if groups[0] not in st["users"]:
+                return 404, {"error": "no such user", "user": groups[0]}
+            if mu.clear_user_default_override(st, groups[0]):
+                mu.save_state(st)
+                mu.sync_all(st)
+                return 200, {"user": groups[0], "cleared": True, "restart_required": True}
+            return 200, {"user": groups[0], "cleared": False,
+                         "detail": "this user had no personal default"}
+        if name == "user_defaults_clear_all":
+            cleared = mu.clear_all_user_default_overrides(st)
+            if cleared:
+                mu.save_state(st)
+                mu.sync_all(st)
+            return 200, {"cleared": cleared, "count": len(cleared),
+                         "restart_required": bool(cleared)}
         if name == "user_kick":
             if groups[0] not in st["users"]:
                 return 404, {"error": "no such user", "user": groups[0]}
@@ -1391,15 +1522,27 @@ class Handler(BaseHTTPRequestHandler):
         if name == "user_create":
             return do_user_create(st, body)
         if name == "user_password":
+            if is_system_account(groups[0]):
+                return 403, {"error": "system account",
+                             "detail": f"{groups[0]} authenticates with the host password; "
+                                       f"change it with `passwd {groups[0]}` on the server"}
             return do_user_password(groups[0], body)
         if name == "user_toggle":
             if groups[0] not in st["users"]:
                 return 404, {"error": "no such user", "user": groups[0]}
+            if is_system_account(groups[0]):
+                return 403, {"error": "system account",
+                             "detail": f"disabling {groups[0]} would lock the web UI out; "
+                                       f"remove it from ADMIN_SYSTEM_USERS instead"}
             mu.cmd_user_toggle(ns(name=groups[0]), groups[1] == "enable")
             return 200, {"user": {"name": groups[0], "enabled": groups[1] == "enable"}}
         if name == "user_delete":
             if groups[0] not in st["users"]:
                 return 404, {"error": "no such user", "user": groups[0]}
+            if is_system_account(groups[0]):
+                return 403, {"error": "system account",
+                             "detail": f"{groups[0]} is the host's own admin account; "
+                                       f"remove it from ADMIN_SYSTEM_USERS instead of deleting it"}
             target = st["users"][groups[0]].get("instance") or ""
             # DELETE carries no body here, so the flag comes from the query string
             flag = (query.get("with_instance") or ["0"])[0].lower()
@@ -1484,13 +1627,6 @@ class Handler(BaseHTTPRequestHandler):
             purge = str(query.get("purge", ["0"])[0]).lower() in ("1", "true", "yes")
             mu.cmd_instance_del(ns(name=groups[0], purge=purge))
             return 200, {"deleted": groups[0], "purged": purge}
-        if name == "instance_provider":
-            if groups[0] not in st["instances"]:
-                return 404, {"error": "no such instance", "instance": groups[0]}
-            mu.cmd_instance_provider(ns(name=groups[0], preset=body.get("preset", "show"),
-                                        model=body.get("model"), key=body.get("api_key"),
-                                        key_file=None))
-            return 200, {"instance": instance_view(mu.load_state(), groups[0])}
         if name == "config_set":
             key = str(body.get("key", ""))
             if key not in cfg:

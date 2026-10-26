@@ -186,7 +186,7 @@ dsh-muctl selftest --user alice --password 'xxx'
 | cgroup v2 子组 | `cpu.max` / `memory.max` / `memory.high` / `pids.max` 限额，`cgroup.kill` 精确回收整棵进程树 |
 | 私有 `/dev`（tmpfs + 最小设备集 + 独立 devpts/shm） | 实例不能删改宿主设备节点 |
 | 私有 `/proc`（新 procfs 实例）、`/sys` 只读 | 不能写宿主的 proc/sys |
-| 网络共享（**无 netns**） | 按需求"网络不严格隔离"；实例只监听 `127.0.0.1:<port>`，外部无法绕过网关 |
+| 网络共享（**无 netns**）+ **出网策略** | 实例只监听 `127.0.0.1:<port>`，外部无法绕过网关；出网由 nftables **按 cgroup** 限制：默认**禁内网**，只放行自身端口 / relay / DNS / 公网（可配白名单，见下） |
 
 实例**以 jail-root（uid 0）运行**，这与 FreeBSD jail 的惯例一致，也是 jail 内 `apk add` 可用的前提。
 注意一个反直觉的细节：capability 全丢之后，uid 0 **不再拥有 `CAP_DAC_OVERRIDE`**，
@@ -200,6 +200,30 @@ DSH 自身的 agent 沙箱在此环境不可用（bwrap 需要非特权 userns �
 实测 `landlock_create_ruleset` 返回 `EOPNOTSUPP`），而 DSH 的沙箱策略是 fail-closed。
 因此实例默认带 `DSH_PERMISSION_MODE=danger-full-access` 运行——**jail 本身就是沙箱**。
 可用 `dsh-muctl config instance_permission_mode workspace-write` 改回受限模式（那样 agent 的 bash 工具会拒绝执行）。
+
+## 出网策略（0.19.0 起默认禁内网）
+
+实例共享宿主网络，但**出网受策略约束**（`dsh-muctl egress` / 后台实例行「配置」）：
+
+| 策略 | 公网 | 内网 | 特殊规则 |
+|---|---|---|---|
+| **全限制** | 拒 | 拒 | 只允许列出的目标 |
+| **禁内网**（默认） | 放行 | 拒 | 例外放行 |
+| **不限制** | 放行 | 放行 | 不生效 |
+
+- 目标支持 `ip` / `ip/24` / `ip1-ip2`，可带 `:443` 或 `:10000-11000`；特殊规则可以挂在**全部实例**上；
+- 自身端口、`relay`、DNS 永远放行（否则实例自己就不可用）；
+- 宿主需要 `apk add nftables`，内核 ≥ 5.13；改完**立即生效**，不用重启实例；
+- 详见 [docs/06-运维手册.md](docs/06-运维手册.md) ✓
+
+## 插件：平台不管"谁能装什么"，只管两个开关
+
+用户在**自己实例的 DSH 界面**里装插件 ✓。平台提供两个独立策略（后台「插件」页 / `dsh-muctl plugin`）：
+
+- **受保护**：`node_modules/<pkg>` 在 jail 内只读绑定（内核 EROFS），删不掉也停不掉；
+- **强制安装**：新实例自动装上。
+
+做法与边界见 [docs/13-插件.md](docs/13-插件.md) ✓。
 
 ## 模型 provider 接入
 
@@ -256,8 +280,10 @@ DSH 自带 UA（`deepseek-harness/…`）不受影响，脚本自测时要记得
 | [docs/03-M1-实测报告.md](docs/03-M1-实测报告.md) | M1 实测记录 |
 | [docs/04-验收报告.md](docs/04-验收报告.md) | 逐轮验收证据 |
 | [docs/05-打包与安装.md](docs/05-打包与安装.md) | 打包、安装、升级、卸载 |
-| [docs/06-运维手册.md](docs/06-运维手册.md) | 日常操作、故障对照表、安全清单 |
+| [docs/06-运维手册.md](docs/06-运维手册.md) | 日常操作、故障对照表、安全清单、**出网策略 / 插件策略 / 套餐隐藏与顺序** |
 | [docs/07-证据索引.md](docs/07-证据索引.md) | 每条能力主张指向可复现的验证脚本与最近结果 |
+| [docs/11-模型接入.md](docs/11-模型接入.md) | provider 目录、套餐、推理等级、默认链、**搜索套餐 / 隐藏与顺序** |
+| [docs/13-插件.md](docs/13-插件.md) | **插件：受保护 / 强制安装**（平台不再管"谁能装什么"） |
 | [docs/08-验收流程.md](docs/08-验收流程.md) | **验收走查清单**：从空机器到 18 层全绿，含签收表 |
 | [docs/07-证据索引.md](docs/07-证据索引.md) §5 | **需求追溯**：34 条 FR 逐条现状（26 条已实测 / **7 条已接受的偏差** / 1 条待你决定，无静默丢弃） |
 

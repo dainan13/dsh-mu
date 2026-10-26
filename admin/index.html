@@ -33,8 +33,48 @@ button.act:hover{border-color:var(--acc)}
 button.act.danger:hover{border-color:var(--bad);color:#ffb4b0}
 pre{background:#12151b;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;max-height:420px;font-size:12px}
 form{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:16px;display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
+/* `form { display:flex }` outranks the UA rule for [hidden], so a hidden form
+   stayed visible next to its create button ("双份"). Make the attribute win. */
+[hidden]{display:none!important}
+/* Forms inside the create modal: no card chrome, a real two-column layout, and the
+   only submit button is the modal footer's (the form's own one was a duplicate). */
+#admin-modal form{background:none;border:0;border-radius:0;padding:0;margin:0;
+  display:grid;grid-template-columns:1fr 1fr;gap:12px 16px;align-items:start}
+#admin-modal form > label{display:flex;flex-direction:column;gap:6px;margin:0;
+  font-size:12px;color:#aeb6c2;min-width:0}
+#admin-modal form > label > input,
+#admin-modal form > label > select,
+#admin-modal form > label > textarea{width:100%;box-sizing:border-box}
+/* wide things span the whole row: textareas, the provider JSON, the output note */
+#admin-modal form > label:has(textarea),
+#admin-modal form > label[style*="100%"]{grid-column:1/-1}
+/* a checkbox reads as one line: text then box */
+#admin-modal form > label:has(input[type=checkbox]){flex-direction:row;align-items:center;gap:8px}
+/* the form's own submit is the footer's job; keep extra buttons visible, full width */
+#admin-modal form > button[type=submit]{display:none}
+#admin-modal form > button[type=button]{grid-column:1/-1;justify-self:start}
+#admin-modal form > span{grid-column:1/-1;font-size:12px}
+/* the last field spans the row and leaves room for the browser's password bubble */
+#admin-modal form > label.field-last{grid-column:1/-1;margin-bottom:84px}
+#admin-modal #am-body{padding-bottom:10px}
 label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)}
+/* `class="row"` is the toolbar primitive used across the page; it was referenced
+   eight times but never defined, so labels/selets stacked instead of lining up. */
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.row > label{margin:0}
+/* a label that holds a checkbox reads as one line: text and box side by side */
+.inline{display:flex;flex-direction:row;align-items:center;gap:6px}
+/* icon-only action buttons: keep them the same height as the text ones */
+button.act.icon{padding:4px 8px;font-size:14px;line-height:1;min-width:30px}
+#admin-modal .modal-card.wide{max-width:940px}
+label.inline > input[type=checkbox]{margin:0}
 input,select{background:#0f1218;border:1px solid #303643;color:var(--fg);border-radius:8px;padding:6px 9px;font-size:13px;min-width:110px}
+/* A checkbox/radio is a ~13px box. The generic `min-width:110px` above also matched
+   them, so every checkbox was 110px wide: that is why ticks sat far from their labels,
+   and why the picker's tick column looked enormous. */
+input[type=checkbox],input[type=radio]{min-width:0;width:auto;padding:0;margin:0;
+  border-radius:0;background:none;vertical-align:middle}
+input[type=checkbox]{accent-color:var(--acc)}
 button.primary{background:var(--acc);border:0;color:#fff;border-radius:8px;padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer}
 button.primary:hover{background:#3f6ce8}
 .banner{background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.45);color:#ffd77a;border-radius:10px;padding:10px 14px;margin-bottom:14px;font-size:13px}
@@ -44,8 +84,26 @@ button.primary:hover{background:#3f6ce8}
   display:flex;flex-direction:column;gap:8px;max-width:min(760px,92vw);pointer-events:none}
 #flash .msg{margin:0;padding:10px 14px;border-radius:10px;background:#1b2230;border:1px solid #2b3240;
   box-shadow:0 8px 24px rgba(0,0,0,.45);pointer-events:auto;cursor:pointer;min-height:0}
-#provResult{min-height:18px}
 .muted{color:var(--dim);font-size:12px}
+@keyframes dshmu-spin{to{transform:rotate(360deg)}}
+/* model picker: ids must not wrap, grades read as small chips */
+/* table-layout:fixed keeps the declared widths (auto silently redistributed them and
+   made the checkbox column huge). */
+table.model-picker{width:100%;table-layout:fixed}
+table.model-picker td,table.model-picker th{vertical-align:middle}
+table.model-picker th.pick,table.model-picker td.pick{width:36px;text-align:center;padding-right:0}
+table.model-picker th.mid{width:40%}
+table.model-picker th.effort{width:110px}
+table.model-picker th.ok{width:58px}
+table.model-picker th.state{width:88px}
+table.model-picker td code{white-space:nowrap;font-size:12px;overflow:hidden;
+  text-overflow:ellipsis;display:block}
+table.model-picker td.state .pill{white-space:nowrap}
+table.model-picker .grade{display:inline-block;margin:1px 2px 1px 0;padding:0 5px;
+  border:1px solid #303643;border-radius:5px;font-size:11px;color:#aeb6c2;white-space:nowrap}
+table.model-picker input[type=radio],table.model-picker input[type=checkbox]{margin:0}
+.spinner{width:13px;height:13px;border:2px solid #2b3240;border-top-color:var(--acc);
+  border-radius:50%;display:inline-block;animation:dshmu-spin .8s linear infinite}
 details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
 </style>
 </head>
@@ -59,6 +117,7 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
   <button data-tab="overview" class="on">概览</button>
   <button data-tab="users">用户</button>
   <button data-tab="instances">实例</button>
+  <button data-tab="logs">实例日志</button>
   <button data-tab="providers">模型接入</button>
   <button data-tab="plugins">插件</button>
   <button data-tab="platform">平台</button>
@@ -75,31 +134,69 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
   </section>
 
   <section id="tab-users">
-    <form id="userForm">
-      <label>用户名<input name="name" placeholder="alice" required></label>
-      <label>角色<select name="role"><option value="user">user</option><option value="admin">admin</option></select></label>
-      <label>密码（留空=随机）<input name="password" type="password" autocomplete="new-password"></label>
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px">
+      <button class="primary" type="button" onclick="openCreate('userForm','创建用户','密码留空则随机生成；实例可选「自动同名」或「不创建」。')">＋ 创建用户</button>
+      <span class="muted" style="font-size:12px">账号建好后可在下方表格里改限额、强制下线、重置密码。</span>
+    </div>
+    <form id="userForm" hidden autocomplete="off" data-lpignore="true" data-1p-ignore>
+      <label>用户名<input name="name" placeholder="alice" required
+        autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+      <label>角色<select name="role" title="平台账号只能是普通用户；管理员只能是宿主机账号">
+        <option value="user">普通用户</option></select>
+        <span class="muted" style="font-size:11px">管理员只能是宿主机账号（root 或 ADMIN_SYSTEM_USERS）</span></label>
       <label>实例<select name="instance"><option value="auto">自动同名</option><option value="none">不创建</option></select></label>
+      <!-- Deliberately NOT type="password": Firefox/Chrome attach their own
+           "generate / manage password" bubble to every password-typed field, which
+           cannot be suppressed from the page. A plain text field has no bubble, and
+           the admin can read the value to hand it to the user. -->
+      <label class="field-last">密码（留空=随机）
+        <span style="display:flex;gap:8px">
+          <input name="password" type="text" autocomplete="off" spellcheck="false"
+                 data-lpignore="true" data-1p-ignore placeholder="留空则自动生成"
+                 style="flex:1;min-width:0">
+          <button class="act" type="button" onclick="fillRandomPassword()">随机生成</button>
+        </span>
+        <span class="muted" style="font-size:11px">明文输入：浏览器不会弹"保存密码"，你可以直接看到并转交给用户。</span>
+      </label>
       <button class="primary" type="submit">创建用户</button>
     </form>
     <div id="usersTable"></div>
   </section>
 
   <section id="tab-instances">
-    <form id="instForm">
+    <div class="row" style="align-items:center;gap:10px;margin-bottom:10px">
+      <button class="primary" type="button" onclick="openCreate('instForm','创建实例','留空的资源项用平台默认值；端口留空会自动分配。')">＋ 创建实例</button>
+      <span class="muted" style="font-size:12px">资源上限、端口、provider 都能在下方表格里随时改。</span>
+    </div>
+    <form id="instForm" hidden autocomplete="off" data-lpignore="true" data-1p-ignore>
       <label>实例名<input name="name" placeholder="alice" required></label>
       <label>所属用户<input name="user" placeholder="留空=同名"></label>
       <label>CPU<select name="cpu_cores"><option value="">默认</option><option value="max">不限</option><option value="0.5">0.5 核</option><option value="1">1 核</option><option value="2">2 核</option><option value="4">4 核</option></select></label>
       <label>内存<select name="mem_mb"><option value="">默认</option><option value="max">不限</option><option value="512">512 MB</option><option value="1024">1 GB</option><option value="2048">2 GB</option><option value="4096">4 GB</option></select></label>
       <label>进程数<select name="pids_num"><option value="">默认</option><option value="max">不限</option><option value="256">256</option><option value="512">512</option><option value="1024">1024</option></select></label>
-      <label>端口（留空=自动）<input name="port" placeholder="自动" style="min-width:90px"></label>
-      <label>端口（留空=自动）<input name="port" placeholder="3100"></label>
+      <label>端口（留空=自动）<input name="port" placeholder="3100" style="min-width:120px"></label>
       <button class="primary" type="submit">创建实例</button>
     </form>
     <div id="instTable"></div>
-    <div class="card" style="margin-top:14px">
-      <h3>宿主目录挂载 <span class="muted" style="font-weight:400">把宿主机目录映射进 jail</span></h3>
-      <form id="mountForm">
+    <h3 style="font-size:14px;margin:26px 0 8px">出网特殊规则 <span class="muted" style="font-weight:400">例外放行</span></h3>
+    <div class="muted" style="margin:0 0 10px;font-size:12px">
+      每个实例的策略在那一行的「<b>配置</b>」里选 ✓：
+      <b>全限制</b>=只允许下面这些目标（外加自身端口/relay/DNS）✓、
+      <b>禁内网</b>=公网随便、内网默认拒，下面这些目标例外放行 ✓、
+      <b>不限制</b>=什么都不拦 ✓。选<b>全部实例</b>就是给每个实例都加这条 ✓。
+      改完<b>立即生效</b>，不用重启实例 ✓。
+    </div>
+    <div class="row" style="margin-bottom:10px">
+      <button class="primary" type="button" onclick="openEgressRule()">＋ 添加规则</button>
+      <span class="muted" id="egMsg" style="font-size:12px"></span>
+    </div>
+    <div id="egRules"><div class="muted">加载中…</div></div>
+
+    <h3 style="font-size:14px;margin:26px 0 8px">宿主目录挂载 <span class="muted" style="font-weight:400">把宿主机目录映射进 jail</span></h3>
+      <div class="row" style="align-items:center;gap:10px;margin-bottom:8px">
+        <button class="primary" type="button" onclick="openCreate('mountForm','添加宿主目录挂载','只能挂真实存在的目录；平台内部路径、其他实例的 jail、jail 内的 /.dsh* 会被拒绝。改动需重启实例。')">＋ 添加挂载</button>
+      </div>
+      <form id="mountForm" hidden autocomplete="off" data-lpignore="true" data-1p-ignore>
         <label>实例<select name="instance" id="mountInst" required></select></label>
         <label>宿主路径<input name="host" placeholder="/srv/datasets" required></label>
         <label>jail 内路径<input name="jail" placeholder="留空=与宿主相同"></label>
@@ -108,54 +205,43 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
       </form>
       <div class="muted" style="margin:6px 0 10px">只能挂载宿主机上**真实存在的目录**。会被拒绝的：平台内部路径（/proc /sys /dev /etc /root /usr /boot /var/lib/dsh-mu）、其他实例的 jail 目录、jail 内的 / 与 /.dsh*、不存在的路径。默认只读，需读写请显式选择。改动需重启实例生效。</div>
       <div id="mountTable"></div>
-    </div>
 
-    <div class="card" style="margin-top:14px">
-      <h3>实例日志 <span class="muted" id="logName" style="font-weight:400"></span></h3>
-      <div class="row" style="margin:8px 0">
-        <select id="logInst" style="flex:1"></select>
-        <select id="logLines" style="flex:0 0 120px">
-          <option value="100">100 行</option>
-          <option value="300" selected>300 行</option>
-          <option value="1000">1000 行</option>
-        </select>
-        <label style="display:flex;align-items:center;gap:6px;flex:0 0 auto;white-space:nowrap">
-          <input type="checkbox" id="logLive"> 实时刷新
-        </label>
-        <button class="primary" id="logLoad">读取</button>
-      </div>
-      <pre id="logView" style="max-height:320px;overflow:auto;background:#0f131a;border:1px solid #2b3240;border-radius:10px;padding:10px;font-size:12px;white-space:pre-wrap"></pre>
-    </div>
+  </section>
 
-    <h2 style="margin-top:22px">实例的 provider / key</h2>
-    <p class="muted" style="margin:0 0 12px">
-      只在<b>没有套餐</b>或临时排障时用：有套餐时，实例的模型来自套餐，这里的设置不参与。
-      key 现在默认由网关代理注入，这里填的 key 只在 <code>relay_enabled=false</code> 时才会写进实例。
-    </p>
-    <div id="provAssign"></div>
-    <div id="instLogs"></div>
+  <section id="tab-logs">
+    <div class="row" style="margin-bottom:12px">
+      <label style="flex:0 0 240px">实例<select id="logInst"></select></label>
+      <label style="flex:0 0 120px">行数<select id="logLines">
+        <option value="100">100 行</option>
+        <option value="300" selected>300 行</option>
+        <option value="1000">1000 行</option>
+      </select></label>
+      <label class="inline"><input type="checkbox" id="logLive"> 实时刷新（2 秒）</label>
+      <button class="primary" id="logLoad">读取</button>
+      <span class="muted" id="logMeta" style="font-size:12px;margin-left:auto"></span>
+    </div>
+    <pre id="logView" style="max-height:60vh;overflow:auto;background:#0f131a;border:1px solid #2b3240;
+      border-radius:10px;padding:12px;font-size:12px;line-height:1.55;white-space:pre-wrap;
+      word-break:break-word;margin:0"></pre>
   </section>
 
   <section id="tab-providers">
-    <h3 style="font-size:14px;margin:0 0 8px">从线上模板库导入（最省事）</h3>
-    <div class="row" style="align-items:center;gap:8px">
-      <button class="primary" type="button" onclick="loadTemplates()">读取模板列表</button>
-      <span class="muted" id="tplSource" style="font-size:12px"></span>
+    <div class="row" style="margin-bottom:8px">
+      <button class="primary" type="button" onclick="openTemplates()">读取线上模板列表</button>
+      <button class="primary" type="button" onclick="openCreate('pkgForm','导入 provider 配置（JSON）','粘贴一个 dsh-mu.provider/v1 的 JSON。也可以先在弹窗里点「只校验」看看有没有问题。')">＋ 导入 provider（JSON）</button>
+      <span class="muted" style="font-size:12px">两种方式二选一：从模板库挑，或自己贴 JSON。导入后还要为它建一个套餐。</span>
     </div>
-    <div class="muted" style="margin:6px 0 10px;font-size:12px">
-      模板来自项目仓库的 <code>provider-packages/</code> 目录，下载后会**先按配置规范校验**再保存；
-      不会自动创建套餐，也不会覆盖同名 provider（除非你在提示里确认）。
+    <div class="muted" style="margin:0 0 10px;font-size:12px">
+      线上模板来自项目仓库的 <code>provider-packages/</code>：下载后**先按配置规范校验**再保存 ✓，
+      不会自动建套餐，也不会覆盖同名 provider（覆盖前会问你）✓。点按钮才去拉取，不会打开页面就请求。
     </div>
-    <div id="tplTable"></div>
-
-    <h3 style="font-size:14px;margin:22px 0 8px">用配置文件接 provider（推荐）</h3>
     <div class="banner" style="border-color:#2b3240;color:#aeb6c2;line-height:1.9">
       配置规范与"给 AI 的提示词"：<button class="act" type="button" onclick="showSpec()">查看 / 复制</button>
       <button class="act" type="button" onclick="downloadSpec()">下载为文件</button>
-      <span class="muted">把提示词连同供应商文档丢给 AI，让它输出一个 JSON，粘到下面导入即可。
+      <span class="muted">把提示词连同供应商文档丢给 AI，让它输出一个 JSON，粘到上面导入即可。
       支持按模型指定不同协议（例如 gpt 走 responses、claude 走 messages），也支持"去上游拉模型"和"读配额"。</span>
     </div>
-    <form id="pkgForm">
+    <form id="pkgForm" hidden autocomplete="off" data-lpignore="true" data-1p-ignore>
       <label style="flex:1 1 100%">provider 配置（JSON）
         <textarea name="text" rows="10" placeholder='{"schema":"dsh-mu.provider/v1","id":"my-llm",...}'
           style="width:100%;background:#0f1218;border:1px solid #303643;color:#e6e8eb;border-radius:8px;padding:8px;font:12px/1.5 ui-monospace,monospace"></textarea></label>
@@ -166,34 +252,65 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
     <h3 style="font-size:14px;margin:18px 0 8px">已导入的 provider 配置文件</h3>
     <div id="pkgTable"></div>
 
-    <h3 style="font-size:14px;margin:22px 0 8px">团队套餐（provider + key + 名字）</h3>
-    <form id="planForm">
+    <h3 style="font-size:14px;margin:24px 0 8px">默认模型（按优先级）</h3>
+    <div class="muted" style="margin:0 0 10px;font-size:12px">
+      新会话的**起始模型**：按顺序取**第一条这个用户能看到的**套餐+模型 ✓ ——
+      因为每个人能看到的套餐不同，所以可以有第一优先、第二优先…… 用户在该会话里换过模型后，
+      本会话以他的选择为准（DSH 按会话记 <code>lastUsed</code>）；新开会话再回到这里 ✓。
+    </div>
+    <div id="defChain"></div>
+    <div class="row" style="margin:10px 0 0">
+      <button class="primary" type="button" onclick="addChainRow()">＋ 添加一档</button>
+      <button class="act" type="button" onclick="saveChain()">保存默认模型</button>
+      <span class="muted" id="defChainMsg" style="font-size:12px"></span>
+    </div>
+    <div id="defOverrides" style="margin-top:14px"></div>
+
+    <h3 style="font-size:14px;margin:24px 0 8px">套餐（provider + key + 名字）</h3>
+    <div class="muted" style="margin:0 0 8px;font-size:12px">
+      「顺序」同时决定**抽屉里的展示顺序**和**web_search 用哪个套餐**（搜索取顺序最靠前、
+      能跑 DeepSeek 搜索的那个）✓；「隐藏」的套餐用户看不到、也选不到，但平台**仍然可以用它做搜索** ✓。
+      当前搜索将使用：<b id="searchPlanName">…</b>
+    </div>
+    <div class="muted" style="margin:0 0 8px;font-size:12px">
+      「范围」由创建时决定、之后<b>不能改</b> ✓：<b>团队</b> = 所有用户可见（也可以在创建时限定某几个人）✓；
+      <b>个人</b> = 只有 owner 自己可见（由用户在用户面板里自建 ✓）。想换类型就删掉重建 ✓。
+      <br><code>plan_default</code> 是**内置保底套餐** ✓：可停用、不可删除 ✓；
+      用户一个套餐都没有时，即使它被停用也仍然可用 ✓；升级时按新版本的内置定义覆盖内容 ✓。
+    </div>
+    <div class="row" style="margin-bottom:12px">
+      <button class="primary" type="button" onclick="openCreate('planForm','创建团队套餐','套餐名会成为用户模型选择器里的分组名；key 只写进 0600 文件。')">＋ 创建套餐</button>
+      <span class="muted" style="font-size:12px">建好后在下面表格里勾选可用模型、检测可用性、查配额。</span>
+    </div>
+    <form id="planForm" hidden autocomplete="off" data-lpignore="true" data-1p-ignore>
       <label>套餐名<input name="name" placeholder="公司的 opencode go" required></label>
       <label>provider<input name="provider" placeholder="opencode-go" required style="min-width:150px"></label>
-      <label>key<input name="key" type="password" placeholder="只写进 0600 文件" required style="min-width:200px"></label>
-      <label>可见用户<input name="visible_to" placeholder="留空=全部；或 alice,bob"></label>
+      <label>key<input name="key" type="password" placeholder="只写进 0600 文件" required
+        autocomplete="new-password" data-lpignore="true" style="min-width:200px"></label>
+      <label>可见用户<input name="visible_to" placeholder="留空=团队（所有人可见）">
+        <span class="muted" style="font-size:11px">填用户名则是个人套餐（只有他和你能看到）</span></label>
       <label>限定模型<input name="models" placeholder="留空=全部；或 m1,m2"></label>
-      <label>默认模型<input name="default_model" placeholder="留空=provider 默认"></label>
-      <label>设为默认<input type="checkbox" name="default"></label>
+      <span class="muted" style="font-size:11px">新会话的起始模型不在这里设 —— 见下方「默认模型（按优先级）」。</span>
       <button class="primary" type="submit">创建套餐</button>
     </form>
     <div id="planTable"></div>
   </section>
 
   <section id="tab-plugins">
-    <h2>插件清单</h2>
-    <p class="muted" style="margin:0 0 12px">清单里的插件用户可以直接安装；装清单外的包、或卸载清单内的插件，
-      用户需要输入**管理员密码**。插件装在各实例自己的 profile 里，重启实例后生效。</p>
-    <div class="row">
-      <input id="plugPkg" placeholder="@scope/dsh-plugin-x" style="flex:2">
-      <input id="plugVer" placeholder="版本（可留空）" style="flex:1">
-      <input id="plugNote" placeholder="说明（给用户看）" style="flex:2">
-      <button class="primary" id="plugAdd">添加到清单</button>
+    <h2>插件策略</h2>
+    <p class="muted" style="margin:0 0 12px">
+      插件由用户在自己的 DSH 界面里安装（<code>dsh-plugin-manager</code> 走 pnpm），平台不代管安装。
+      这里只做两件事：<b>受保护</b>（装了就删不掉，内核级只读挂载）和<b>强制安装</b>（新实例自动装上）。
+      两者独立勾选，只对<b>已装</b>该包的实例生效。
+    </p>
+    <div class="row" style="margin-bottom:10px">
+      <button class="primary" type="button" onclick="openPolicyAdd()">＋ 添加策略</button>
+      <span class="muted" style="font-size:12px">改完立即生效：受保护的包需要重启实例才能挂上只读。</span>
     </div>
-    <div id="plugRows"><div class="muted">加载中…</div></div>
-    <div class="msg" id="plugMsg"></div>
+    <div id="policyRows"><div class="muted">加载中…</div></div>
+    <div class="msg" id="policyMsg"></div>
 
-    <h2 style="margin-top:22px">各实例已装</h2>
+    <h2 style="margin-top:22px">各实例已装插件</h2>
     <p class="muted" style="margin:0 0 12px">用户自己装的也在里面（来源列写明）。</p>
     <div id="plugInstRows"><div class="muted">加载中…</div></div>
   </section>
@@ -271,10 +388,12 @@ document.querySelectorAll('nav button').forEach(b => b.addEventListener('click',
   if (b.dataset.tab === 'audit') loadAudit();
   if (b.dataset.tab === 'doctor') loadDoctor();
   if (b.dataset.tab === 'platform') loadConfig();
-  if (b.dataset.tab === 'providers') loadProviders(); loadPackages();
-  if (b.dataset.tab === 'plugins') loadPlugins();
-  if (b.dataset.tab === 'instances') { loadProviders(); fillLogInstances(); }
-  if (b.dataset.tab === 'providers') { loadTemplates(); }
+  if (b.dataset.tab === 'providers')  loadPackages();
+  if (b.dataset.tab === 'plugins') loadPolicies();
+  if (b.dataset.tab === 'instances') { fillLogInstances(); loadEgress().then(loadInstances); }
+
+  if (b.dataset.tab === 'logs') { fillLogInstances(); }
+  if (b.dataset.tab === 'providers') { loadChain(); }
   if (b.dataset.tab !== 'instances') {
     if (LOG_TIMER) { clearInterval(LOG_TIMER); LOG_TIMER = null; }
     const box = $('#logLive');
@@ -302,11 +421,24 @@ async function loadOverview() {
       <td><span class="pill ${i.live ? 'ok' : 'bad'}">${i.live ? 'listening' : 'closed'}</span></td>
       <td>${i.cookie ? '✅' : '—'}</td><td>${esc(i.provider)}${i.provider_model ? `<div class="muted">${esc(i.provider_model)}</div>` : ''}</td>
       <td>${mb(i.disk_mb)}</td>
-      <td>${actions(i.name)}</td></tr>`).join('')}</tbody></table>`;
+      <td>${actions(i.name, i.user)}</td></tr>`).join('')}</tbody></table>`;
 }
-const actions = (n) => ['start', 'stop', 'restart', 'refresh-cookie'].map(a =>
-  `<button class="act" onclick="instAction('${n}','${a}')">${a}</button>`).join('') +
-  `<button class="act" onclick="showLogs('${n}')">logs</button>`;
+const ICON = {
+  start: ['▶', '启动实例'],
+  stop: ['🛑', '停止实例'],
+  restart: ['⟳', '重启实例（按钮上会显示进度）'],
+  'refresh-cookie': ['🔑', '重建登录态（页面打不开时用；失败可再试一次）'],
+};
+
+const actions = (n, user, running) => {
+  const btn = (a) => `<button class="act icon" onclick="instAction('${n}','${a}')"
+      title="${ICON[a][1]}" aria-label="${ICON[a][1]}">${ICON[a][0]}</button>`;
+  return (running ? btn('stop') + btn('restart') : btn('start'))
+    + btn('refresh-cookie')
+    + `<button class="act" onclick="gotoLogs('${n}')" title="查看这个实例的日志">日志</button>`
+    + `<button class="act" onclick="editConfig('${n}')" title="限额、出网策略、个人默认">配置</button>`
+    + `<button class="act danger" onclick="instDel('${n}')">删除</button>`;
+};
 
 window.instAction = async (name, action) => {
   try {
@@ -323,9 +455,26 @@ window.instAction = async (name, action) => {
   };
   setTimeout(poll, 1500);
 };
-window.showLogs = async (name) => {
-  const d = await api(`instances/${name}/logs?lines=200`);
-  $('#instLogs').innerHTML = `<h3>${esc(name)} · ${esc(d.file)}</h3><pre>${esc((d.lines || []).join('\n'))}</pre>`;
+window.clearUserDefault = async (user) => {
+  if (!confirm(`清除 ${user} 的个人默认模型？\n\n清除后他/她的新会话将按「默认模型（按优先级）」走。`)) return;
+  try {
+    const r = await api(`users/${encodeURIComponent(user)}/default-clear`, { method: 'POST' });
+    flash(r.cleared ? `${user} 的个人默认已清除` : `${user} 本来就没有个人默认`);
+    loadChain(); loadUsers(); loadInstances();
+  } catch (e) { flash('清除失败：' + e.message, 'err'); }
+};
+
+window.gotoLogs = (name) => {
+  // Click the real nav button so the normal tab handler runs (classList + hooks),
+  // then preselect the instance and load it.
+  const btn = document.querySelector('nav button[data-tab="logs"], #tabs button[data-tab="logs"]');
+  if (btn) btn.click();
+  else document.querySelectorAll('main > section').forEach((s) => s.classList.toggle('on', s.id === 'tab-logs'));
+  fillLogInstances().then(() => {
+    const sel = $('#logInst');
+    if (sel) sel.value = name;
+    loadInstanceLog();
+  });
 };
 
 // ------------------------------------------------------------------ users
@@ -335,15 +484,19 @@ async function loadUsers() {
   LAST_USERS = d.users || [];
   $('#usersTable').innerHTML = `<table><thead><tr><th>用户</th><th>角色</th><th>状态</th><th>epoch</th><th>实例</th><th>需改密</th><th>操作</th></tr></thead>
     <tbody>${d.users.map(u => `<tr>
-      <td><b>${esc(u.name)}</b></td><td>${esc(u.role)}</td>
+      <td><b>${esc(u.name)}</b>${u.system ? ' <span class="pill ok" title="宿主机账号：口令在 /etc/shadow，管理员身份来自 ADMIN_SYSTEM_USERS">系统账号</span>' : ''}</td>
+      <td>${esc(u.role)}</td>
       <td><span class="pill ${u.enabled ? 'ok' : 'bad'}">${u.enabled ? 'enabled' : 'disabled'}</span></td>
       <td>${u.epoch}</td><td>${esc(u.instance || '—')}</td><td>${u.must_change ? '是' : '—'}</td>
-      <td>${u.enabled
-        ? `<button class="act" onclick="userToggle('${u.name}','disable')">停用</button>`
-        : `<button class="act" onclick="userToggle('${u.name}','enable')">启用</button>`}
-        <button class="act" onclick="userPasswd('${u.name}')">改密</button>
-        <button class="act" onclick="userKick('${u.name}')">踢下线</button>
-        <button class="act danger" onclick="userDel('${u.name}')">删除</button></td></tr>`).join('')}</tbody></table>`;
+      <td>${u.system
+        ? `<span class="muted" style="font-size:12px">口令用服务器上的 <code>passwd ${esc(u.name)}</code> 修改</span>
+           <button class="act" onclick="userKick('${u.name}')">踢下线</button>`
+        : `${u.enabled
+            ? `<button class="act" onclick="userToggle('${u.name}','disable')">停用</button>`
+            : `<button class="act" onclick="userToggle('${u.name}','enable')">启用</button>`}
+           <button class="act" onclick="userPasswd('${u.name}')">改密</button>
+           <button class="act" onclick="userKick('${u.name}')">踢下线</button>
+           <button class="act danger" onclick="userDel('${u.name}')">删除</button>`}</td></tr>`).join('')}</tbody></table>`;
 }
 window.userToggle = async (n, action) => { try { await api(`users/${n}/${action}`, { method: 'POST' }); flash(`${n} ${action}`); } catch (e) { flash(e.message, 'err'); } loadUsers(); };
 window.userKick = async (n) => { try { await api(`users/${n}/kick`, { method: 'POST' }); flash(`${n} 已强制下线（口令未改）`); } catch (e) { flash(e.message, 'err'); } loadUsers(); };
@@ -373,6 +526,7 @@ $('#userForm').addEventListener('submit', async (ev) => {
   try {
     const r = await api('users', { method: 'POST', body: JSON.stringify(Object.fromEntries(f)) });
     flash(r.generated_password ? `已创建 ${r.user.name}，一次性密码：${r.generated_password}` : `已创建 ${r.user.name}`);
+    closeCreate();
     ev.target.reset();
   } catch (e) { flash(e.message, 'err'); }
   loadUsers(); loadOverview();
@@ -412,18 +566,21 @@ window.mountDelete = async (instance, host, jail) => {
 };
 
 async function loadInstances() {
+  if (!(EGRESS.instances || []).length) {
+    // first paint: fetch the policy so the 出网 column is not blank
+    try { await loadEgress(); } catch (e) { /* keep going without it */ }
+  }
   const d = await api('instances');
-  $('#instTable').innerHTML = `<table><thead><tr><th>实例</th><th>用户</th><th>端口</th><th>状态</th><th>实测</th><th>限额 (cpu / mem / pids)</th><th>操作</th></tr></thead>
+  $('#instTable').innerHTML = `<table><thead><tr><th>实例</th><th>用户</th><th>端口</th><th>状态</th><th>实测</th><th>出网</th><th>限额 (cpu / mem / pids)</th><th>操作</th></tr></thead>
     <tbody>${d.instances.map(i => `<tr>
       <td><b>${esc(i.name)}</b></td><td>${esc(i.user)}</td><td>${i.port}</td>
       <td><span class="pill ${i.state === 'running' ? 'ok' : 'bad'}">${esc(i.state)}</span></td>
       <td><span class="pill ${i.live ? 'ok' : 'bad'}">${i.live ? 'listening' : 'closed'}</span></td>
+      <td>${egressBadge(i.name)}</td>
       <td class="muted">${esc((i.limits_human || {}).cpu || '-')} · ${esc((i.limits_human || {}).memory || '-')} · ${esc((i.limits_human || {}).pids || '-')} 进程</td>
-      <td>${actions(i.name)}
-        <button class="act" onclick="editLimits('${i.name}')">限额</button>
-        <button class="act" onclick="editProvider('${i.name}')">provider</button>
-        <button class="act danger" onclick="instDel('${i.name}')">删除</button></td></tr>`).join('')}</tbody></table>`;
+      <td>${actions(i.name, i.user, i.state === 'running' || i.live)}</td></tr>`).join('')}</tbody></table>`;
 }
+let EGRESS = { instances: [], allRules: [], default: 'no-intranet' };
 const CPU_CHOICES = [['max', '不限（用满主机）'], ['0.5', '0.5 核'], ['1', '1 核'], ['2', '2 核'], ['4', '4 核'], ['8', '8 核']];
 const MEM_CHOICES = [['max', '不限'], ['512', '512 MB'], ['1024', '1 GB'], ['2048', '2 GB'], ['4096', '4 GB'], ['8192', '8 GB']];
 const PIDS_CHOICES = [['max', '不限'], ['128', '128'], ['256', '256'], ['512', '512'], ['1024', '1024'], ['4096', '4096']];
@@ -439,18 +596,16 @@ window.editLimits = async (n) => {
   const opts = (list, sel) => list.map(([v, label]) =>
     `<option value="${v}" ${v === sel ? 'selected' : ''}>${label}</option>`).join('') +
     (list.some(([v]) => v === sel) ? '' : `<option value="${sel}" selected>当前：${sel}</option>`);
-  $('#instLogs').innerHTML = `<div class="card" style="max-width:520px">
-    <h3>${esc(n)} · 资源限额</h3>
+  openPanel(`${n} · 资源限额`, `
+    <div>
     <label>CPU（核数）<select id="lCpu">${opts(CPU_CHOICES, cur.cpu)}</select></label>
     <label>内存<select id="lMem">${opts(MEM_CHOICES, cur.mem)}</select></label>
     <label>进程数上限<select id="lPids">${opts(PIDS_CHOICES, cur.pids)}</select></label>
     <label>端口<input id="lPort" value="${esc(d.instance.port)}" style="min-width:90px">
       <span class="muted">范围 ${esc((d.instance.port_range || []).join(' - ') || '配置见 dsh-mu.conf')}；改端口需重启实例</span></label>
     <div class="muted" style="margin-top:6px">「不限」= cgroup 写 max。限额在实例运行时立即生效，无需重启。</div>
-    <button class="primary" id="lSave" style="margin-top:10px">保存</button>
-    <button class="act" onclick="$('#instLogs').innerHTML=''">取消</button>
-    <div class="msg" id="lMsg"></div></div>`;
-  $('#lSave').addEventListener('click', async () => {
+    <div class="msg" id="lMsg"></div></div>`, '保存');
+  $('#am-save').onclick = async () => {
     const body = { cpu_cores: $('#lCpu').value, mem_mb: $('#lMem').value, pids_num: $('#lPids').value };
     const newPort = $('#lPort').value.trim();
     if (newPort && String(d.instance.port) !== newPort) {
@@ -466,20 +621,84 @@ window.editLimits = async (n) => {
         ? '限额已立即生效：' + r.applied_live.join('，')
         : (r.detail || '已保存'));
       flash(`${n} 限额已更新`);
-      setTimeout(() => { $('#instLogs').innerHTML = ''; }, 1500);
     } catch (e) { $('#lMsg').className = 'msg err'; $('#lMsg').textContent = e.message; }
     loadInstances(); loadMounts();
+  };
+};
+// One "配置" dialog per instance: resource limits, egress policy + its own rules, and
+// the owning user's personal default model. Everything here is per-instance, which is
+// why the old separate 限额 / provider / 出网 buttons are gone.
+window.editConfig = async (n) => {
+  const [d, eg] = await Promise.all([api(`instances/${n}`), api('egress')]);
+  const l = d.instance.limits || {};
+  const cur = {
+    cpu: (l.cpu_max || 'max').split(' ')[0] === 'max' ? 'max'
+      : String(parseInt((l.cpu_max || '100000').split(' ')[0], 10) / 100000),
+    mem: (l.mem_max || 'max') === 'max' ? 'max'
+      : String(Math.round(parseInt(l.mem_max, 10) / 1048576)),
+    pids: (l.pids_max || 'max') === 'max' ? 'max' : String(l.pids_max),
+  };
+  const opts = (list, sel) => list.map(([v, label]) =>
+    `<option value="${v}" ${v === sel ? 'selected' : ''}>${label}</option>`).join('')
+    + (list.some(([v]) => v === sel) ? '' : `<option value="${sel}" selected>当前：${sel}</option>`);
+  const row = (eg.instances || []).find(r => r.instance === n) || { policy: 'no-intranet', own: [] };
+  const pol = ['allowlist', 'no-intranet', 'open']
+    .map(p => `<option value="${p}" ${row.policy === p ? 'selected' : ''}>${EG_LABEL[p]}</option>`).join('');
+
+  openPanel(`${n} · 配置`, `
+    <h4 style="margin:0 0 6px;font-size:13px">资源限额</h4>
+    <div class="row" style="margin-bottom:12px">
+      <label style="flex:1 1 140px">CPU<select id="cfCpu">${opts(CPU_CHOICES, cur.cpu)}</select></label>
+      <label style="flex:1 1 140px">内存<select id="cfMem">${opts(MEM_CHOICES, cur.mem)}</select></label>
+      <label style="flex:1 1 140px">进程数<select id="cfPids">${opts(PIDS_CHOICES, cur.pids)}</select></label>
+      <label style="flex:0 0 130px">端口<input id="cfPort" value="${esc(d.instance.port)}"></label>
+    </div>
+    <div class="muted" style="font-size:12px;margin:-6px 0 12px">
+      「不限」= cgroup 写 max；限额运行时立即生效，改端口需要重启。
+    </div>
+
+    <h4 style="margin:0 0 6px;font-size:13px">出网策略</h4>
+    <div class="row" style="margin-bottom:6px">
+      <label style="flex:0 0 200px">策略<select id="cfEgress">${pol}</select></label>
+    </div>
+    <div class="muted" style="font-size:12px;margin:0 0 12px">
+      ${(row.own || []).length
+        ? `当前放行：${esc((row.own || []).join('、'))}（在下面「出网特殊规则」里增减 ✓）`
+        : '本实例没有例外目标（「全部实例」的规则同样生效）✓ 例外在下面「出网特殊规则」里维护 ✓'}
+    </div>
+
+    <h4 style="margin:0 0 6px;font-size:13px">个人默认模型</h4>
+    <div class="muted" style="font-size:12px;margin-bottom:10px">
+      ${(function () {
+        return '这个实例的 owner 的用户级默认（优先级高于平台默认链）。';
+      })()}
+    </div>
+    <button class="act" type="button" onclick="clearUserDefault('${esc(d.instance.user || n)}')">
+      清除该用户的个人默认</button>
+    <div class="msg" id="cfMsg"></div>`, '保存', async () => {
+    const body = { cpu_cores: $('#cfCpu').value, mem_mb: $('#cfMem').value,
+                   pids_num: $('#cfPids').value };
+    const newPort = ($('#cfPort').value || '').trim();
+    if (newPort && String(d.instance.port) !== newPort) {
+      body.port = newPort;
+      if (confirm(`端口将从 ${d.instance.port} 改为 ${newPort}，需要重启该实例。现在重启吗？`)) {
+        body.restart = true;
+      }
+    }
+    try {
+      await api(`instances/${n}`, { method: 'PATCH', body: JSON.stringify(body) });
+      await api('egress', { method: 'POST',
+        body: JSON.stringify({ instance: n, policy: $('#cfEgress').value }) });
+      flash(`${n} 配置已保存`);
+      closeCreate();
+      loadInstances(); loadEgress();
+    } catch (e) {
+      const m = $('#cfMsg');
+      if (m) { m.className = 'msg err'; m.textContent = '保存失败：' + e.message; }
+    }
   });
 };
-window.editProvider = async (n) => {
-  const preset = prompt(`实例 ${n} 的 provider（deepseek / opencode-go / opencode）：`, 'opencode-go');
-  if (!preset) return;
-  const model = prompt('默认模型（留空用预设默认）：') || undefined;
-  const apiKey = prompt('API key（留空=不改动已存的 key）：') || undefined;
-  try { await api(`instances/${n}/provider`, { method: 'POST', body: JSON.stringify({ preset, model, api_key: apiKey }) }); flash(`${n} provider 已切换，重启后生效`); }
-  catch (e) { flash(e.message, 'err'); }
-  loadInstances();
-};
+
 window.instDel = async (n) => {
   if (!confirm(`删除实例 ${n}？（默认保留数据）`)) return;
   const purge = confirm('同时删除该实例的数据目录（rootfs/home/workspace）？选“取消”=保留数据。');
@@ -491,7 +710,7 @@ $('#instForm').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const body = Object.fromEntries(new FormData(ev.target));
   Object.keys(body).forEach(k => { if (!body[k]) delete body[k]; });
-  try { const r = await api('instances', { method: 'POST', body: JSON.stringify(body) }); flash(`已创建实例 ${r.instance.name}（端口 ${r.instance.port}）`); ev.target.reset(); }
+  try { const r = await api('instances', { method: 'POST', body: JSON.stringify(body) }); flash(`已创建实例 ${r.instance.name}（端口 ${r.instance.port}）`); closeCreate(); ev.target.reset(); }
   catch (e) { flash(e.message, 'err'); }
   loadInstances(); loadOverview();
 });
@@ -534,13 +753,20 @@ async function loadInstanceLog(keepScroll = false) {
   const name = $('#logInst').value;
   const lines = $('#logLines').value;
   if (!name) return;
-  $('#logName').textContent = '／ ' + name;
+  const meta = $('#logMeta');
+  if (meta) meta.textContent = '';
   const view = $('#logView');
   const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 8;
   try {
     const d = await api(`instances/${encodeURIComponent(name)}/logs?lines=${lines}`);
     const rows = Array.isArray(d.lines) ? d.lines : [];
     const src = d.source || '';
+    const meta = $('#logMeta');
+    if (meta) {
+      const when = d.mtime ? new Date(d.mtime * 1000).toLocaleTimeString() : '';
+      meta.textContent = `${name} · ${d.file || ''} · ${src}` + (when ? ` · ${when}` : '')
+        + (rows.length ? ` · ${rows.length} 行` : ' · 空');
+    }
     if (rows.length) {
       const note = src === 'rotated'
         ? `（当前日志为空：已轮转，下面是 ${d.file} 的最后 ${rows.length} 行）`
@@ -594,120 +820,412 @@ document.addEventListener('DOMContentLoaded', () => {
   if (linesSel) linesSel.addEventListener('change', () => { if (LOG_TIMER) loadInstanceLog(); });
 });
 
-async function loadPlugins() {
+// 出网：每个实例一档策略（在实例表格里选）+ 一张"特殊规则"清单。
+// 全限制 = 只允许清单里的目标（外加自身端口/relay/DNS）；禁内网 = 公网自由、清单例外。
+const EG_LABEL = { allowlist: '全限制', 'no-intranet': '禁内网', open: '不限制' };
+
+function egressOf(name) {
+  return (EGRESS.instances || []).find(r => r.instance === name) || { policy: 'no-intranet', allow: [] };
+}
+
+// Read-only on purpose: the policy is visible here but only editable in 「配置」, so
+// there is exactly one place that can change it.
+function egressBadge(name) {
+  const row = egressOf(name);
+  const label = EG_LABEL[row.policy] || row.policy;
+  const cls = row.policy === 'open' ? 'warn' : 'ok';
+  const extra = (row.own || []).length;
+  const tip = (row.own || []).length ? `本实例例外：${(row.own || []).join(', ')}` : label;
+  return `<span class="pill ${cls}" title="${esc(tip)}">${esc(label)}</span>`
+    + (extra ? ` <span class="muted" title="${esc((row.own || []).join(', '))}">+${extra}</span>` : '');
+}
+
+async function loadEgress() {
   try {
-    const d = await api('plugins');
-    const rows = d.plugins || [];
-    $('#plugRows').innerHTML = rows.length ? `<table><thead><tr><th>包名</th><th>版本</th><th>说明</th><th>操作</th></tr></thead>
-      <tbody>${rows.map(e => `<tr>
-        <td><code>${esc(e.pkg)}</code></td>
-        <td>${esc(e.version || 'latest')}</td>
-        <td class="muted">${esc(e.note || '')}</td>
-        <td><button class="act danger" onclick="removePlugin('${esc(e.pkg)}')">移出清单</button></td>
-      </tr>`).join('')}</tbody></table>`
-      : '<div class="muted">清单为空：用户装任何插件都需要管理员密码。</div>';
-    const insts = d.instances || {};
-    const flat = [];
-    for (const [name, rows] of Object.entries(insts)) {
-      for (const r of rows || []) flat.push({ name, ...r });
+    const d = await api('egress');
+    EGRESS = { instances: d.instances || [], allRules: d.all_rules || [],
+               default: (d.global || {}).policy || 'no-intranet' };
+    const known = EGRESS.instances.map(r => r.instance);
+    const sel = $('#egRuleInst');
+    if (sel) sel.innerHTML = '<option value="__all__">全部实例</option>'
+      + known.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+    const rows = [];
+    for (const target of d.all_rules || []) rows.push({ instance: '__all__', policy: 'all', target });
+    for (const r of EGRESS.instances) {
+      for (const target of r.own || []) rows.push({ instance: r.instance, policy: r.policy, target });
     }
-    $('#plugInstRows').innerHTML = flat.length
-      ? `<table><thead><tr><th>实例</th><th>插件</th><th>版本</th><th>来源</th><th>操作人</th></tr></thead>
-         <tbody>${flat.map(r => `<tr>
-           <td><b>${esc(r.name)}</b></td>
-           <td><code>${esc(r.pkg)}</code></td>
-           <td>${esc(r.version || '-')}</td>
-           <td>${r.source === 'curated'
-                ? '<span class="pill ok">清单内</span>'
-                : '<span class="pill warn">自装</span>'}</td>
-           <td class="muted">${esc(r.by || '-')}</td>
-         </tr>`).join('')}</tbody></table>`
+    const box = $('#egRules');
+    if (!box) return;
+    box.innerHTML = rows.length ? `<table><thead><tr>
+        <th>实例</th><th>该实例策略</th><th>例外目标</th><th style="width:90px">操作</th>
+      </tr></thead><tbody>${rows.map(r => `<tr>
+        <td><b>${r.instance === '__all__' ? '全部实例' : esc(r.instance)}</b></td>
+        <td>${r.instance === '__all__' ? '所有实例' : (EG_LABEL[r.policy] || r.policy)}</td>
+        <td><code>${esc(r.target)}</code></td>
+        <td><button class="act danger" onclick="dropEgressRule('${esc(r.instance)}','${esc(r.target)}')">删除</button></td>
+      </tr>`).join('')}</tbody></table>`
+      : '<div class="muted">还没有特殊规则：所有实例都只按上面选的策略走。</div>';
+    if (!d.nft) {
+      box.insertAdjacentHTML('afterbegin',
+        '<div class="msg err">宿主没有装 nftables，策略不会生效：<code>apk add nftables</code> '
+        + '然后 <code>dsh-muctl sync</code></div>');
+    }
+  } catch (e) {
+    const box = $('#egRules');
+    if (box) box.innerHTML = `<div class="msg err">读取失败：${esc(e.message)}</div>`;
+  }
+}
+
+async function postEgress(body, ok) {
+  const msg = $('#egMsg');
+  if (msg) msg.textContent = '正在应用…';
+  try {
+    const r = await api('egress', { method: 'POST', body: JSON.stringify(body) });
+    if (msg) msg.textContent = `已生效（${r.enforced || 0} 个实例）`;
+    flash(ok);
+    loadEgress();
+    loadInstances();
+  } catch (e) {
+    if (msg) msg.textContent = '失败：' + e.message;
+    flash('应用失败：' + e.message, 'err');
+  }
+}
+
+window.openEgressRule = () => {
+  const known = (EGRESS.instances || []).map(r => r.instance);
+  const opts = '<option value="__all__">全部实例</option>'
+    + known.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+  openPanel('添加出网特殊规则', `
+    <label style="display:block;margin-bottom:10px">实例
+      <select id="egRuleInst" style="width:100%">${opts}</select></label>
+    <label style="display:block;margin-bottom:6px">目标
+      <input id="egRuleTarget" style="width:100%"
+        placeholder="192.168.13.11 / 192.168.5.0-192.168.5.100:10000-11000"></label>
+    <div class="muted" style="font-size:12px">
+      支持 <code>ip</code>、<code>ip/24</code>、<code>ip1-ip2</code>，并可带
+      <code>:443</code> 或 <code>:10000-11000</code> ✓（IPv6 带端口写
+      <code>[2001:db8::1]:443</code> ✓）。改完立即生效 ✓。
+    </div>`, '添加', () => {
+    const instance = $('#egRuleInst').value;
+    const target = ($('#egRuleTarget').value || '').trim();
+    if (!target) { flash('先填一个目标', 'err'); return; }
+    addEgressRule(instance, target);
+  });
+};
+
+window.addEgressRule = (instance, target) => {
+  if (!instance || !target) return flash('先选实例并填目标', 'err');
+  const isAll = instance === '__all__';
+  const current = isAll ? (EGRESS.allRules || []) : (egressOf(instance).own || []);
+  const allow = current.concat([target]);
+  postEgress(isAll ? { scope: 'all', allow } : { instance, allow },
+    `${isAll ? '全部实例' : instance}: 已放行 ${target}`).then(() => closeCreate());
+};
+
+window.dropEgressRule = (instance, target) => {
+  const isAll = instance === '__all__';
+  const current = isAll ? (EGRESS.allRules || []) : (egressOf(instance).own || []);
+  const allow = current.filter(t => t !== target);
+  postEgress(isAll ? { scope: 'all', allow } : { instance, allow },
+    `${isAll ? '全部实例' : instance}: 已取消放行 ${target}`);
+};
+
+// 插件策略：受保护（删不掉）+ 强制安装（新实例自动装）。平台不再维护"可装清单"，
+// 用户在自己的 DSH 界面里装插件。
+let POLICIES = {};
+
+async function loadPolicies() {
+  try {
+    const d = await api('plugin-policy');
+    POLICIES = d.policy || {};
+    const installed = d.installed || {};
+    const pkgs = new Set([...Object.keys(POLICIES), ...Object.keys(installed)]);
+    const box = $('#policyRows');
+    box.innerHTML = pkgs.size ? `<table><thead><tr>
+        <th>包</th><th style="width:90px">受保护</th><th style="width:100px">强制安装</th>
+        <th>已装实例</th><th style="width:120px">操作</th></tr></thead>
+      <tbody>${[...pkgs].sort().map(pkg => {
+        const row = POLICIES[pkg] || {};
+        const where = installed[pkg] || [];
+        return `<tr>
+          <td><code>${esc(pkg)}</code></td>
+          <td><input type="checkbox" ${row.protected ? 'checked' : ''}
+              onchange="setPolicy('${esc(pkg)}','protected',this.checked)"></td>
+          <td><input type="checkbox" ${row.mandatory ? 'checked' : ''}
+              onchange="setPolicy('${esc(pkg)}','mandatory',this.checked)"></td>
+          <td class="muted">${where.length ? esc(where.join(', ')) : '（未安装）'}</td>
+          <td><button class="act danger" onclick="dropPolicy('${esc(pkg)}')">清除策略</button></td>
+        </tr>`;
+      }).join('')}</tbody></table>`
+      : '<div class="muted">还没有策略。点「＋ 添加策略」指定某个包。</div>';
+
+    const flat = [];
+    for (const [name, rows] of Object.entries(d.installed || {})) {
+      for (const pkg of rows || []) flat.push({ name, pkg });
+    }
+    const insts = d.instances || {};
+    const list = [];
+    for (const [name, rows] of Object.entries(insts)) {
+      for (const r of rows || []) list.push({ name, ...r });
+    }
+    $('#plugInstRows').innerHTML = list.length
+      ? `<table><thead><tr><th>实例</th><th>插件</th><th>版本</th><th>来源</th>
+           <th>受保护</th><th>强制</th></tr></thead>
+         <tbody>${list.map(r => {
+           const pol = POLICIES[r.pkg] || {};
+           return `<tr>
+             <td><b>${esc(r.name)}</b></td>
+             <td><code>${esc(r.pkg)}</code></td>
+             <td>${esc(r.version || '-')}</td>
+             <td>${r.source === 'curated'
+                  ? '<span class="pill ok">平台</span>'
+                  : '<span class="pill warn">自装</span>'}</td>
+             <td>${pol.protected ? '<span class="pill ok">是</span>' : '<span class="muted">—</span>'}</td>
+             <td>${pol.mandatory ? '<span class="pill ok">是</span>' : '<span class="muted">—</span>'}</td>
+           </tr>`;
+         }).join('')}</tbody></table>`
       : '<div class="muted">还没有实例装过插件。</div>';
-  } catch (e) { flash(e.message, 'err'); }
+  } catch (e) {
+    const box = $('#policyRows');
+    if (box) box.innerHTML = `<div class="msg err">读取失败：${esc(e.message)}</div>`;
+  }
 }
 
-async function addPlugin() {
-  const pkg = $('#plugPkg').value.trim();
-  const version = $('#plugVer').value.trim();
-  const note = $('#plugNote').value.trim();
-  if (!pkg) return flash('先填包名', 'err');
+window.openPolicyAdd = () => {
+  openPanel('添加插件策略', `
+    <label style="display:block;margin-bottom:10px">包名
+      <input id="polPkg" placeholder="@scope/dsh-plugin-x" style="width:100%"></label>
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+      <input type="checkbox" id="polProt" checked> 受保护（装了就删不掉，只读挂载）</label>
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+      <input type="checkbox" id="polMand"> 强制安装（新实例自动装上）</label>
+    <div class="muted" style="font-size:12px">两者独立。只对已装该包的实例立即生效；
+      受保护还需要重启实例才挂上只读。</div>`, '添加并保存', async () => {
+    const pkg = ($('#polPkg').value || '').trim();
+    if (!pkg) return flash('先填包名', 'err');
+    try {
+      await api('plugin-policy', { method: 'POST', body: JSON.stringify({
+        pkg, protected: $('#polProt').checked, mandatory: $('#polMand').checked }) });
+      closeCreate();
+      flash('已保存策略：' + pkg);
+      loadPolicies();
+    } catch (e) { flash('保存失败：' + e.message, 'err'); }
+  });
+};
+
+window.setPolicy = async (pkg, field, value) => {
+  const body = { pkg };
+  body[field] = !!value;
+  const row = POLICIES[pkg] || {};
+  body.protected = field === 'protected' ? !!value : !!row.protected;
+  body.mandatory = field === 'mandatory' ? !!value : !!row.mandatory;
   try {
-    await api('plugins', { method: 'POST', body: JSON.stringify({ action: 'add', pkg, version, note }) });
-    $('#plugPkg').value = ''; $('#plugVer').value = ''; $('#plugNote').value = '';
-    flash('已加入清单：' + pkg, 'good');
-    loadPlugins();
-  } catch (e) { flash(e.message, 'err'); }
-}
+    await api('plugin-policy', { method: 'POST', body: JSON.stringify(body) });
+    flash(`${pkg}: ${field === 'protected' ? '受保护' : '强制安装'} = ${value ? '开' : '关'}`);
+    loadPolicies();
+  } catch (e) { flash('保存失败：' + e.message, 'err'); loadPolicies(); }
+};
 
-async function removePlugin(pkg) {
+window.dropPolicy = async (pkg) => {
+  if (!confirm(`清除 ${pkg} 的策略？（受保护/强制安装都取消，插件本身不动）`)) return;
   try {
-    await api('plugins', { method: 'POST', body: JSON.stringify({ action: 'remove', pkg }) });
-    flash('已移出清单：' + pkg, 'good');
-    loadPlugins();
-  } catch (e) { flash(e.message, 'err'); }
-}
+    await api('plugin-policy', { method: 'POST', body: JSON.stringify({
+      pkg, protected: false, mandatory: false }) });
+    flash('策略已清除：' + pkg);
+    loadPolicies();
+  } catch (e) { flash('清除失败：' + e.message, 'err'); }
+};
 
-document.addEventListener('DOMContentLoaded', () => {
-  const btn = $('#plugAdd');
-  if (btn) btn.addEventListener('click', addPlugin);
-});
+// ------------------------------------------- 默认模型（按优先级 / 可回退）
+let CHAIN = [];
+let CHAIN_PLANS = [];
 
-async function loadProviders() {
-  const d = await api('providers');
-  PROVS = d.providers;
-  const names = Object.keys(PROVS).sort();
-  const inst = (await api('instances')).instances;
-  const box = $('#provAssign');
+async function loadChain() {
+  const box = $('#defChain');
   if (!box) return;
-  box.innerHTML = `<table><thead><tr><th>实例</th><th>provider</th><th>模型（留空=预设默认）</th><th>凭据</th><th>操作</th></tr></thead>
-    <tbody>${inst.map(i => { const p = PROVS[i.provider] || {}; return `<tr>
-      <td><b>${esc(i.name)}</b></td>
-      <td><select onchange="assignProvider('${i.name}', this.value)">
-        ${names.map(n => `<option ${n === i.provider ? 'selected' : ''}>${n}</option>`).join('')}</select></td>
-      <td><input value="${esc(i.provider_model || '')}" placeholder="${esc(p.model || '')}" onchange="assignModel('${i.name}', this.value)" style="min-width:150px"></td>
-      <td>${i.key_set
-        ? `<span class="pill ok">已设置</span> <span class="muted">${i.key_source === 'platform' ? '来自平台 key' : '实例自己的 key'}</span>`
-        : `<span class="pill warn">未设置</span> <span class="muted">点右边「填 API key」</span>`}</td>
-      <td><button class="act" onclick="testInstance('${i.name}')">测试连通性</button>
-        <button class="act" onclick="setInstanceKey('${i.name}')">填 API key</button>
-        <button class="act" onclick="clearInstanceKey('${i.name}')">清除 key</button>
-        <button class="act" onclick="showPatch('${i.name}')">查看 patch</button></td></tr>`; }).join('')}</tbody></table>
-    <div id="provResult"></div>`;
-}
-// ------------------------------------------------------- 线上 provider 模板库
-async function loadTemplates() {
-  const box = $('#tplTable');
   box.innerHTML = '<div class="muted">读取中…</div>';
   try {
-    const d = await api('provider-templates');
-    $('#tplSource').textContent = d.source ? '来源：' + d.source : '';
-    const rows = d.templates || [];
-    box.innerHTML = rows.length
-      ? `<table><thead><tr><th>模板</th><th>说明</th><th>协议</th><th>模型</th><th>状态</th><th></th></tr></thead>
-         <tbody>${rows.map(t => `<tr>
-           <td><b>${esc(t.label || t.name)}</b><div class="muted">${esc(t.name)}</div></td>
-           <td class="muted">${esc(t.description || '')}</td>
-           <td class="muted">${esc(t.api || '-')}</td>
-           <td>${t.models || '-'}</td>
-           <td>${t.imported ? '<span class="pill ok">已导入</span>' : '<span class="muted">未导入</span>'}</td>
-           <td><button class="act" onclick="importTemplate('${esc(t.name)}',${t.imported ? 'true' : 'false'})">${t.imported ? '重新导入' : '导入'}</button></td>
-         </tr>`).join('')}</tbody></table>`
-      : '<div class="muted">模板库里没有模板。</div>';
+    const [d, plans] = await Promise.all([api('default-chain'), api('plans')]);
+    CHAIN = d.chain || [];
+    renderOverrides(d.user_overrides || []);
+    CHAIN_PLANS = (plans.plans || []).map(p => ({
+      id: p.id, name: p.name,
+      models: (p.effective_models && p.effective_models.length ? p.effective_models : p.models) || [],
+    }));
+    renderChain();
   } catch (e) {
-    box.innerHTML = '';
-    flash('读取模板失败：' + e.message, 'err');
-    $('#tplTable').innerHTML = `<div class="muted">读取失败：${esc(e.message)}</div>`;
+    box.innerHTML = `<div class="msg err">读取失败：${esc(e.message)}</div>`;
   }
+}
+
+function renderOverrides(rows) {
+  const box = $('#defOverrides');
+  if (!box) return;
+  if (!rows.length) {
+    box.innerHTML = '<div class="muted" style="font-size:12px">没有用户设置个人默认 ✓'
+      + '（用户可以在自己的抽屉里设一条，优先于上面的链）</div>';
+    return;
+  }
+  box.innerHTML = `<div class="muted" style="font-size:12px;margin-bottom:6px">
+      已有 ${rows.length} 个用户设置了自己的默认 ✓ 他们优先级<strong>高于</strong>上面的链 ✓
+      <button class="act" type="button" onclick="clearAllUserDefaults()">一键清除全部用户默认</button></div>
+    <table><thead><tr><th>用户</th><th>套餐</th><th>模型</th><th>操作</th></tr></thead>
+    <tbody>${rows.map(r => `<tr>
+      <td><b>${esc(r.user)}</b></td>
+      <td>${esc(r.plan_name)}<div class="muted">${esc(r.plan)}</div></td>
+      <td>${esc(r.model || '（套餐默认）')}</td>
+      <td><button class="act" onclick="clearUserDefault('${esc(r.user)}')">清除</button></td>
+    </tr>`).join('')}</tbody></table>`;
+}
+
+window.clearAllUserDefaults = async () => {
+  if (!confirm('清除**所有**用户的个人默认模型？\n\n之后所有新会话都会按上面的优先级链走。')) return;
+  try {
+    const r = await api('user-defaults/clear-all', { method: 'POST' });
+    flash(r.count ? `已清除 ${r.count} 个用户的个人默认` : '没有用户设置个人默认');
+    loadChain();
+  } catch (e) { flash('清除失败：' + e.message, 'err'); }
+};
+
+function renderChain() {
+  const box = $('#defChain');
+  if (!box) return;
+  if (!CHAIN.length) {
+    box.innerHTML = '<div class="muted">还没有设置：新会话会用"这个用户能看到的第一个套餐"。</div>';
+    return;
+  }
+  box.innerHTML = `<table><thead><tr><th style="width:88px">优先级</th><th style="width:34%">套餐</th><th>模型（新会话起始）</th><th style="width:190px">操作</th></tr></thead>
+    <tbody>${CHAIN.map((row, i) => {
+      const plan = CHAIN_PLANS.find(p => p.id === row.plan) || { models: [] };
+      const models = plan.models || [];
+      const opts = ['<option value="">（套餐默认）</option>']
+        .concat(models.map(m => `<option value="${esc(m)}" ${m === row.model ? 'selected' : ''}>${esc(m)}</option>`))
+        .join('');
+      // 优先级不用数字：第一行"高"、最后一行"低"、中间"中"（两行时就是 高/低）
+      const rank = CHAIN.length === 1 ? '高'
+        : i === 0 ? '高'
+        : i === CHAIN.length - 1 ? '低'
+        : '中';
+      return `<tr>
+        <td><b class="rank">${rank}</b></td>
+        <td><select onchange="chainPickPlan(${i}, this.value)">
+          ${CHAIN_PLANS.map(p => `<option value="${esc(p.id)}" ${p.id === row.plan ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}
+        </select></td>
+        <td><select onchange="CHAIN[${i}].model=this.value">${opts}</select></td>
+        <td>
+          <button class="act" onclick="chainMove(${i},-1)" ${i === 0 ? 'disabled' : ''}>↑</button>
+          <button class="act" onclick="chainMove(${i},1)" ${i === CHAIN.length - 1 ? 'disabled' : ''}>↓</button>
+          <button class="act danger" onclick="chainRemove(${i})">删除</button>
+        </td></tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+window.chainPickPlan = (index, planId) => { CHAIN[index] = { plan: planId, model: '' }; renderChain(); };
+window.chainMove = (index, delta) => {
+  const to = index + delta;
+  if (to < 0 || to >= CHAIN.length) return;
+  const [row] = CHAIN.splice(index, 1);
+  CHAIN.splice(to, 0, row);
+  renderChain();
+};
+window.chainRemove = (index) => { CHAIN.splice(index, 1); renderChain(); };
+window.addChainRow = () => {
+  if (!CHAIN_PLANS.length) return flash('还没有套餐可加', 'err');
+  CHAIN.push({ plan: CHAIN_PLANS[0].id, model: '' });
+  renderChain();
+};
+window.saveChain = async () => {
+  const msg = $('#defChainMsg');
+  if (msg) msg.textContent = '保存中…';
+  try {
+    await api('default-chain', { method: 'POST', body: JSON.stringify({ chain: CHAIN }) });
+    if (msg) msg.textContent = '已保存；重启实例后新会话生效';
+    flash('默认模型已保存（重启实例后生效）');
+    loadChain();
+  } catch (e) {
+    if (msg) msg.textContent = '保存失败：' + e.message;
+    flash('保存失败：' + e.message, 'err');
+  }
+};
+
+// ------------------------------------------------------- 线上 provider 模板库
+// Nothing is fetched until the operator clicks the button (the list lives in a modal,
+// because it is a "browse and pick" action, not part of the page).
+// A plain content panel in the shared modal (no form form-field swapping involved).
+// `saveLabel` empty means "only a 关闭 button".
+window.openPanel = (title, html, saveLabel = '', onSave = null) => {
+  const m = ensureAdminModal();
+  m.querySelector('#am-title').textContent = title;
+  m.querySelector('#am-body').innerHTML = html;
+  m.querySelector('#am-all').style.display = 'none';
+  m.querySelector('#am-none').style.display = 'none';
+  const save = m.querySelector('#am-save');
+  save.textContent = saveLabel || '关闭';
+  save.onclick = saveLabel ? () => onSave && onSave() : () => closeCreate();
+  m.querySelector('.modal-card')?.classList.remove('wide');
+  m.style.display = 'flex';
+  m.querySelector('#am-body').scrollTop = 0;
+  return m;
+};
+
+window.openTemplates = async () => {
+  const m = ensureAdminModal();
+  m.querySelector('#am-title').textContent = '线上 provider 模板';
+  m.querySelector('#am-all').style.display = 'none';
+  m.querySelector('#am-none').style.display = 'none';
+  const save = m.querySelector('#am-save');
+  save.textContent = '关闭';
+  save.onclick = () => closeCreate();
+  m.querySelector('#am-body').innerHTML =
+    '<div class="muted" id="tplSource" style="font-size:12px;margin:0 0 10px"></div>' +
+    '<div id="tplTable"></div>';
+  m.style.display = 'flex';
+  await loadTemplates();
+};
+
+async function loadTemplates() {
+  const box = document.getElementById('tplTable');
+  if (!box) return;
+  // the remote fetch can take seconds: say so instead of an empty box
+  box.innerHTML = '<div class="muted" style="display:flex;align-items:center;gap:8px;padding:10px 0">' +
+    '<span class="spinner"></span> 正在从模板库读取…（首次可能要几秒）</div>';
+  let d;
+  try {
+    d = await api('provider-templates');
+  } catch (e) {
+    box.innerHTML = `<div class="msg err">读取失败：${esc(e.message)}</div>`;
+    return;
+  }
+  const src = document.getElementById('tplSource');
+  if (src) src.textContent = d.source ? '来源：' + d.source : '';
+  const rows = d.templates || [];
+  box.innerHTML = rows.length
+    ? `<table><thead><tr><th>模板</th><th>说明</th><th>协议</th><th>模型</th><th>状态</th><th></th></tr></thead>
+       <tbody>${rows.map(t => `<tr>
+         <td><b>${esc(t.label || t.name)}</b><div class="muted">${esc(t.name)}</div></td>
+         <td class="muted">${esc(t.description || '')}</td>
+         <td class="muted">${esc(t.api || '-')}</td>
+         <td>${t.models || '-'}</td>
+         <td>${t.imported ? '<span class="pill ok">已导入</span>' : '<span class="muted">未导入</span>'}</td>
+         <td><button class="act" onclick="importTemplate('${esc(t.name)}',${t.imported ? 'true' : 'false'})">${t.imported ? '重新导入' : '导入'}</button></td>
+       </tr>`).join('')}</tbody></table>`
+    : '<div class="muted">模板库里没有模板。</div>';
 }
 
 window.importTemplate = async (name, exists) => {
   if (exists && !confirm(`${name} 已经导入过，覆盖它吗？`)) return;
+  const box = document.getElementById('tplTable');
+  if (box) box.innerHTML = `<div class="muted" style="display:flex;align-items:center;gap:8px;padding:10px 0">` +
+    `<span class="spinner"></span> 正在导入 ${esc(name)}…</div>`;
   try {
     const r = await api('provider-templates/import', { method: 'POST',
       body: JSON.stringify({ name, force: !!exists }) });
     flash(`已导入 ${r.label || r.id}（${r.models} 个模型，sha256 ${String(r.sha256).slice(0, 12)}…）。下一步：为它建一个套餐。`);
-    loadTemplates(); loadPackages();
-  } catch (e) { flash('导入失败：' + e.message, 'err'); }
+    await loadTemplates(); loadPackages();
+  } catch (e) {
+    flash('导入失败：' + e.message, 'err');
+    if (document.getElementById('tplTable')) await loadTemplates();
+  }
 };
 
 // --------------------------------------------------- provider 配置文件（package）
@@ -734,31 +1252,62 @@ async function loadPlans() {
   try {
     const d = await api('plans');
     PLANS = d.plans; PLAN_DEFAULT = d.default || '';
-    $('#planTable').innerHTML = PLANS.length ? `<table><thead><tr><th>套餐</th><th>provider</th><th>范围</th><th>key</th><th>模型</th><th>状态</th><th>操作</th></tr></thead>
-      <tbody>${PLANS.map(p => `<tr>
-        <td><b>${esc(p.name)}</b>${p.id === PLAN_DEFAULT ? ' <span class="pill ok">默认</span>' : ''}<div class="muted">${esc(p.id)}</div></td>
+    const sp = d.search_plan;
+    const spEl = $('#searchPlanName');
+    if (spEl) {
+      spEl.textContent = sp
+        ? `${sp.name}（${sp.id}${sp.order == null ? '' : `，顺序 ${sp.order}`}${sp.hidden ? '，隐藏' : ''}）`
+        : '没有可用于搜索的套餐（需要一个 api.deepseek.com 的 anthropic-messages 套餐）';
+    }
+    $('#planTable').innerHTML = PLANS.length ? `<table><thead><tr><th>顺序</th><th>套餐</th><th>provider</th><th>范围</th><th>key</th><th>模型</th><th>状态</th><th>操作</th></tr></thead>
+      <tbody>${PLANS.map((p, idx) => `<tr style="${p.hidden ? 'opacity:.6' : ''}">
+        <td class="muted" style="white-space:nowrap">${p.order == null ? '—' : p.order}
+          <button class="act" title="上移" onclick="planMove('${p.id}',-1)" ${idx === 0 ? 'disabled' : ''}>↑</button>
+          <button class="act" title="下移" onclick="planMove('${p.id}',1)" ${idx === PLANS.length - 1 ? 'disabled' : ''}>↓</button></td>
+        <td><b>${esc(p.name)}</b>${p.id === PLAN_DEFAULT ? ' <span class="pill ok">默认</span>' : ''}${p.hidden ? ' <span class="pill warn" title="用户看不到；平台仍可用它做 web_search">隐藏</span>' : ''}<div class="muted">${esc(p.id)}</div></td>
         <td>${esc(p.provider)}</td>
-        <td>${p.owner === '*' ? '团队' : '个人:' + esc(p.owner)}<div class="muted">${esc((p.visible_to || []).join(',') || '全部')}</div></td>
+        <td>${planScopeLabel(p)}</td>
         <td>${p.has_key ? '<span class="pill ok">有</span>' : '<span class="pill warn">缺</span>'}</td>
         <td>${planModelCell(p)}</td>
         <td>${p.enabled ? '<span class="pill ok">on</span>' : '<span class="pill warn">off</span>'}</td>
         <td><button class="act" onclick="planProbe('${p.id}')">检测可用模型</button>
             <button class="act" onclick="planUsage('${p.id}')">配额</button>
             <button class="act" onclick="planModels('${p.id}')">编辑模型</button>
+            <button class="act" onclick="planKey('${p.id}')">改 key</button>
             <button class="act" onclick="planAction('${p.id}','${p.enabled ? 'disable' : 'enable'}')">${p.enabled ? '停用' : '启用'}</button>
-            <button class="act" onclick="planAction('${p.id}','default')">设默认</button>
-            <button class="act danger" onclick="deletePlan('${p.id}')">删除</button></td></tr>`).join('')}</tbody></table>`
-      : '<div class="muted">还没有套餐。用上面的表单创建第一个（团队套餐）。</div>';
+            <button class="act" onclick="planAction('${p.id}','${p.hidden ? 'show' : 'hide'}')">${p.hidden ? '取消隐藏' : '隐藏'}</button>
+            ${p.id === 'plan_default'
+              ? '<span class="muted" style="font-size:12px">内置，随版本更新</span>'
+              : `<button class="act danger" onclick="deletePlan('${p.id}')">删除</button>`}</td></tr>`).join('')}</tbody></table>`
+      : '<div class="muted">还没有套餐。点上面的「＋ 创建套餐」建第一个。</div>';
   } catch (e) { flash(e.message, 'err'); }
 }
 let PLANS = []; let PLAN_DEFAULT = '';
+
+// Scope is derived, not edited: a plan is either personal (one owner) or team
+// (everyone), and a team plan may additionally be limited to named users at creation.
+// Showing owner and visible_to as two lines made it look like two separate settings.
+function planScopeLabel(p) {
+  const visible = (p.visible_to || []).filter(v => v !== '*');
+  if (p.owner !== '*') {
+    const extra = visible.filter(v => v !== p.owner);
+    return `<span class="pill">个人</span> ${esc(p.owner)}`
+      + (extra.length ? `<div class="muted">另加 ${esc(extra.join(','))}</div>` : '');
+  }
+  if (!visible.length) return '<span class="pill ok">团队</span> 所有用户';
+  return `<span class="pill ok">团队</span> 限 ${esc(visible.join('、'))}`;
+}
 
 // What a plan will actually advertise: selected ∩ proven-usable.
 function planModelCell(p) {
   const eff = p.effective_models || [];
   const selected = (p.models || []).length;
   const avail = p.available_models;
-  const head = eff.length ? `${eff.length} 个生效` : '全部（未筛选）';
+  // `default_model` is the plan's own fallback; the platform start model comes from
+  // 默认模型（按优先级）, so don't call this "新会话默认" (it would be a lie when the
+  // chain pins a different model for this user).
+  const head = (eff.length ? `${eff.length} 个生效` : '全部（未筛选）')
+    + (p.default_model ? `，套餐默认 <code>${esc(p.default_model)}</code>` : '');
   let tail = '';
   if (avail === null || avail === undefined) {
     tail = '<div class="muted">未检测：点「检测可用模型」用该 key 实测</div>';
@@ -777,8 +1326,8 @@ function ensureAdminModal() {
   const m = document.getElementById('admin-modal');
   if (!m.dataset.wired) {
     m.dataset.wired = '1';
-    m.querySelector('#am-close').onclick = () => { m.style.display = 'none'; };
-    m.onclick = (e) => { if (e.target === m) m.style.display = 'none'; };
+    m.querySelector('#am-close').onclick = () => closeCreate();
+    m.onclick = (e) => { if (e.target === m) closeCreate(); };
   }
   return m;
 }
@@ -820,17 +1369,17 @@ function modelRowsHtml(catalog, selected, avail) {
       ? (checked ? '<span class="pill ok">已选</span>' : '<span class="muted">未选</span>')
       : '<span class="pill warn">该 key 不可用</span>';
     const efforts = typeof m === 'string' ? null : m.reasoningEfforts;
+    const grades = (efforts && typeof efforts === 'object') ? Object.keys(efforts) : null;
     const effortText = efforts === false ? '<span class="muted">非推理</span>'
-      : (efforts && typeof efforts === 'object')
-        ? Object.keys(efforts).join(' / ')
+      : grades ? grades.map(g => `<span class="grade">${esc(g)}</span>`).join('')
         : '<span class="muted">-</span>';
     return `<tr style="${usable ? '' : 'opacity:.55'}">
-      <td style="width:36px"><input type="checkbox" value="${esc(id)}" ${checked ? 'checked' : ''} ${usable ? '' : 'disabled'}></td>
-      <td><code>${esc(id)}</code></td>
+      <td class="pick"><input type="checkbox" value="${esc(id)}" ${checked ? 'checked' : ''} ${usable ? '' : 'disabled'}></td>
+      <td class="mid"><code title="${esc(id)}">${esc(id)}</code></td>
       <td class="muted">${esc(name) || '-'}</td>
       <td class="muted">${effortText}</td>
-      <td>${usable ? '✅' : '⛔'}</td>
-      <td>${state}</td></tr>`;
+      <td class="ok" style="text-align:center">${usable ? '✅' : '⛔'}</td>
+      <td class="state">${state}</td></tr>`;
   }).join('');
 }
 
@@ -847,9 +1396,77 @@ function modelTableHtml(catalog, selected, avail, probe) {
   const diffLine = diff.length
     ? `<div class="muted" style="margin-bottom:8px">上次检测变化：${diff.join(' · ')}</div>` : '';
   return head + diffLine
-    + `<table><thead><tr><th></th><th>模型 id</th><th>名称</th><th>推理等级</th><th>可用?</th><th>状态</th></tr></thead>
+    + `<table class="model-picker"><thead><tr>
+      <th class="pick" title="勾选 = 这个套餐提供它"></th>
+      <th class="mid">模型 id</th>
+      <th>名称</th>
+      <th class="effort">推理等级</th>
+      <th class="ok" title="用这个 key 实测可用">可用</th>
+      <th class="state">状态</th>
+    </tr></thead>
        <tbody>${catalog.length ? modelRowsHtml(catalog, selected, avail) : '<tr><td colspan="6" class="muted">这个 provider 目录里没有模型</td></tr>'}</tbody></table>`;
 }
+
+// ---------------------------------------------------------- create-in-a-modal
+// One button per section opens its form in the shared modal; the form node is MOVED
+// (not cloned), so the submit listeners wired elsewhere keep working untouched.
+let CREATE_RETURN = null;
+
+window.fillRandomPassword = () => {
+  // readable on purpose: the admin copies this to the user by hand
+  const abc = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = new Uint32Array(16);
+  crypto.getRandomValues(bytes);
+  const pw = Array.from(bytes, (n) => abc[n % abc.length]).join('');
+  const f = document.getElementById('userForm');
+  if (f) f.querySelector('input[name=password]').value = pw;
+};
+
+window.openCreate = (formId, title, hint) => {
+  const form = document.getElementById(formId);
+  if (!form) return;
+  const m = ensureAdminModal();
+  m.querySelector('#am-title').textContent = title;
+  CREATE_RETURN = { form, parent: form.parentNode, next: form.nextSibling };
+  const body = m.querySelector('#am-body');
+  body.replaceChildren(form);
+  body.scrollTop = 0;
+  form.hidden = false;
+  const note = document.createElement('div');
+  note.className = 'muted';
+  note.style.cssText = 'margin:0 0 10px;font-size:12px;line-height:1.6';
+  note.textContent = hint || '';
+  body.prepend(note);
+  m.querySelector('#am-all').style.display = 'none';
+  m.querySelector('#am-none').style.display = 'none';
+  const save = m.querySelector('#am-save');
+  // mirror the form's own verb so the footer button says what it will do
+  const own = form.querySelector('button[type=submit]');
+  save.textContent = (own && own.textContent.trim()) || '确认创建';
+  save.onclick = () => form.requestSubmit();
+  m.style.display = 'flex';
+  const first = form.querySelector('input:not([type=checkbox]), textarea, select');
+  if (first) setTimeout(() => first.focus(), 30);
+};
+
+window.closeCreate = () => {
+  const m = document.getElementById('admin-modal');
+  if (!m) return;
+  if (CREATE_RETURN) {
+    CREATE_RETURN.form.hidden = true;
+    const { parent, next, form } = CREATE_RETURN;
+    if (next && next.parentNode === parent) parent.insertBefore(form, next);
+    else parent.appendChild(form);
+    CREATE_RETURN = null;
+  }
+  m.style.display = 'none';
+  const card = m.querySelector('.modal-card');
+  if (card) card.classList.remove('wide');
+  m.querySelector('#am-all').style.display = '';
+  m.querySelector('#am-none').style.display = '';
+  m.querySelector('#am-save').textContent = '保存';
+  m.querySelector('#am-save').onclick = null;
+};
 
 window.planUsage = async (id) => {
   try {
@@ -870,7 +1487,10 @@ window.planModels = async (id) => {
   } catch (e) { flash('读不到 provider 目录：' + e.message, 'err'); return; }
   const avail = plan.available_models;
   const selected = (plan.models || []).length ? plan.models : (avail || catalog.map(m => m.id || m));
+  catalog = Array.isArray(catalog) ? catalog : [];
   const m = ensureAdminModal();
+  const card = m.querySelector('.modal-card');
+  if (card) card.classList.add('wide');
   m.querySelector('#am-title').textContent = `${plan.name} · 模型（${plan.provider}）`;
   m.querySelector('#am-body').innerHTML = modelTableHtml(catalog, selected, avail, plan.last_probe || {});
   m.querySelector('#am-all').onclick = () => {
@@ -883,7 +1503,8 @@ window.planModels = async (id) => {
     const picked = [...m.querySelectorAll('#am-body input[type=checkbox]')]
       .filter(cb => cb.checked).map(cb => cb.value);
     try {
-      const r = await api(`plans/${id}/models`, { method: 'POST', body: JSON.stringify({ models: picked }) });
+      const r = await api(`plans/${id}/models`, { method: 'POST',
+        body: JSON.stringify({ models: picked }) });
       m.style.display = 'none';
       flash(`已保存 ${r.count} 个模型；重启相关实例后生效。`);
       loadPlans();
@@ -935,8 +1556,9 @@ $('#pkgForm').addEventListener('submit', async (ev) => {
   try {
     const r = await api('packages', { method: 'POST', body: JSON.stringify({ text }) });
     flash(`已导入 ${r.id}（${r.models} 个模型，默认 ${r.default_model}）`);
+    closeCreate();
     ev.target.reset(); $('#pkgResult').textContent = '';
-    loadPackages(); loadProviders();
+    loadPackages(); 
   } catch (e) { flash(e.message, 'err'); }
 });
 $('#mountForm').addEventListener('submit', async (ev) => {
@@ -950,6 +1572,7 @@ $('#mountForm').addEventListener('submit', async (ev) => {
     if (!body.instance) return flash('请先创建至少一个实例', 'err');
     const r = await api('mounts', { method: 'POST', body: JSON.stringify(body) });
     flash(`已添加（${(r.targets || []).join(', ')}）；重启实例后生效`);
+    closeCreate();
     ev.target.reset();
     loadMounts();
   } catch (e) {
@@ -964,11 +1587,21 @@ $('#planForm').addEventListener('submit', async (ev) => {
     name: f.name, provider: f.provider, key: f.key,
     visible_to: (f.visible_to || '').split(/[,\s]+/).filter(Boolean),
     models: (f.models || '').split(/[,\s]+/).filter(Boolean),
-    default_model: f.default_model || '', default: !!f.default,
+
   };
   try {
-    const r = await api('plans', { method: 'POST', body: JSON.stringify(body) });
+    let r;
+    try {
+      r = await api('plans', { method: 'POST', body: JSON.stringify(body) });
+    } catch (e) {
+      // Same name = same plan id. Overwriting is legitimate but must be deliberate.
+      if (!/already exists/.test(e.message)) throw e;
+      if (!confirm(`已经有同名套餐「${body.name}」（${e.message}）。\n\n用新配置覆盖它吗？`)) return;
+      r = await api('plans', { method: 'POST',
+        body: JSON.stringify(Object.assign({}, body, { replace: true })) });
+    }
     flash(`套餐已创建：${r.plan.name}（${r.plan.id}）`);
+    closeCreate();
     ev.target.reset(); loadPlans();
   } catch (e) { flash(e.message, 'err'); }
 });
@@ -1001,7 +1634,7 @@ window.exportPackage = async (id) => {
 };
 window.deletePackage = async (id) => {
   if (!confirm(`删除 provider 配置文件 ${id}？已建好的套餐会失去 provider。`)) return;
-  try { await api(`packages/${id}`, { method: 'DELETE' }); flash(`${id} 已删除`); loadPackages(); loadProviders(); }
+  try { await api(`packages/${id}`, { method: 'DELETE' }); flash(`${id} 已删除`); loadPackages();  }
   catch (e) { flash(e.message, 'err'); }
 };
 window.deletePlan = async (id) => {
@@ -1009,6 +1642,39 @@ window.deletePlan = async (id) => {
   try { await api(`plans/${id}`, { method: 'DELETE' }); flash('套餐已删除'); loadPlans(); }
   catch (e) { flash(e.message, 'err'); }
 };
+// Rotate a plan's credential. The key never round-trips: it is write-only here.
+window.planKey = async (id) => {
+  const plan = (PLANS || []).find(p => p.id === id) || { name: id };
+  const key = prompt(`给「${plan.name}」设置新的 key（会被替换，旧 key 立即失效）：`);
+  if (key === null) return;
+  if (!key.trim()) return flash('key 不能为空', 'err');
+  try {
+    const r = await api(`plans/${id}/key`, { method: 'POST', body: JSON.stringify({ key: key.trim() }) });
+    flash(`已更换 key（尾号 ${r.tail}）；重启实例后生效`);
+    loadPlans();
+  } catch (e) { flash('更换失败：' + e.message, 'err'); }
+};
+
+// Reorder by rewriting the `order` numbers of the whole list (10, 20, 30 …), which
+// keeps them stable and readable instead of trying to swap sparse values.
+window.planMove = async (id, delta) => {
+  const list = (PLANS || []).slice();
+  const idx = list.findIndex(p => p.id === id);
+  const to = idx + delta;
+  if (idx < 0 || to < 0 || to >= list.length) return;
+  const [row] = list.splice(idx, 1);
+  list.splice(to, 0, row);
+  try {
+    for (let i = 0; i < list.length; i += 1) {
+      const want = (i + 1) * 10;
+      if (list[i].order === want) continue;
+      await api(`plans/${list[i].id}/order`, { method: 'POST', body: JSON.stringify({ order: want }) });
+    }
+    flash('顺序已更新（同时影响抽屉展示与搜索优先级）');
+    loadPlans();
+  } catch (e) { flash('调整失败：' + e.message, 'err'); loadPlans(); }
+};
+
 window.planAction = async (id, action) => {
   try { await api(`plans/${id}/${action}`, { method: 'POST' }); flash(`套餐 ${id}: ${action} ok`); loadPlans(); }
   catch (e) { flash(e.message, 'err'); }
@@ -1017,7 +1683,6 @@ window.planAction = async (id, action) => {
 window.delProvider = async (n) => {
   if (!confirm(`删除自定义 provider ${n}？已使用它的实例不受影响（其 patch 已落盘）。`)) return;
   try { await api(`providers/${n}`, { method: 'DELETE' }); flash(`${n} 已删除`); } catch (e) { flash(e.message, 'err'); }
-  loadProviders();
 };
 window.testProvider = async (n) => {
   flash(`正在用平台 key 探测 ${n}…`);
@@ -1025,44 +1690,23 @@ window.testProvider = async (n) => {
   catch (e) { flash(e.message, 'err'); }
 };
 const provResult = (label, r) => {
-  $('#provResult').innerHTML = `<div class="banner" style="border-color:${r.ok ? 'rgba(63,185,80,.5)' : 'rgba(248,81,73,.5)'};color:${r.ok ? '#7ee787' : '#ff9c9c'}">
-    <b>${esc(label)}</b> · ${r.ok ? 'OK' : 'FAIL'} · status=${esc(r.status)} · ${esc(r.ms)}ms · model=${esc(r.model)} · key=${esc(r.key_source || '-')}
+  openPanel(`${label} · 连通性测试`, `<div class="banner"
+      style="border-color:${r.ok ? 'rgba(63,185,80,.5)' : 'rgba(248,81,73,.5)'};color:${r.ok ? '#7ee787' : '#ff9c9c'}">
+    <b>${esc(label)}</b> · ${r.ok ? 'OK' : 'FAIL'} · status=${esc(r.status)} · ${esc(r.ms)}ms ·
+    model=${esc(r.model)} · key=${esc(r.key_source || '-')}
     <div class="muted" style="color:inherit">${esc(r.endpoint || '')}</div>
-    <div style="font-size:12px">${esc(r.detail || '')}</div></div>`;
-};
-window.testInstance = async (n) => {
-  flash(`正在用 ${n} 的凭据探测…`);
-  try { const r = await api(`instances/${n}/provider/test`, { method: 'POST' }); provResult(n, r); }
-  catch (e) { flash(e.message, 'err'); }
-};
-window.setInstanceKey = async (n) => {
-  const key = prompt(`为实例 ${n} 写入 API key（写入实例自己的凭据库，0600；留空取消）：`);
-  if (!key) return;
-  try { const r = await api(`instances/${n}/key`, { method: 'POST', body: JSON.stringify({ api_key: key }) });
-    flash(`${n} 已写入 key（长度 ${r.key_length}），重启实例生效`); } catch (e) { flash(e.message, 'err'); }
-};
-window.clearInstanceKey = async (n) => {
-  if (!confirm(`清除实例 ${n} 自己的 key？之后将回落到平台 key。`)) return;
-  try { await api(`instances/${n}/key`, { method: 'DELETE' }); flash(`${n} 实例 key 已清除，重启生效`); }
-  catch (e) { flash(e.message, 'err'); }
+    <div style="font-size:12px">${esc(r.detail || '')}</div></div>`);
 };
 window.showPatch = async (n) => {
   const r = await api(`instances/${n}/patch`);
-  $('#provResult').innerHTML = `<h3 style="font-size:13px">${esc(n)} · ${esc(r.patch_path)} · key_source=${esc(r.key_source)} (len ${r.key_length})</h3>
-    <pre>${esc(r.patch || '(无 patch：使用 DSH 默认)')}</pre>`;
+  openPanel(`${n} · provider patch`, `
+    <div class="muted" style="font-size:12px;margin-bottom:8px">
+      ${esc(r.patch_path)} · key_source=${esc(r.key_source)}（len ${r.key_length}）
+    </div>
+    <pre style="max-height:60vh;overflow:auto;background:#0f131a;border:1px solid #2b3240;
+      border-radius:10px;padding:12px;font-size:12px;line-height:1.55;
+      white-space:pre-wrap;margin:0">${esc(r.patch || '(无 patch：使用 DSH 默认)')}</pre>`);
 };
-window.assignProvider = async (n, preset) => {
-  try { await api(`instances/${n}/provider`, { method: 'POST', body: JSON.stringify({ preset }) });
-    flash(`${n} -> ${preset}，重启实例生效`); } catch (e) { flash(e.message, 'err'); }
-  loadProviders();
-};
-window.assignModel = async (n, model) => {
-  if (!model) return;
-  try { await api(`instances/${n}/provider`, { method: 'POST', body: JSON.stringify({ preset: (await api(`instances/${n}`)).instance.provider, model }) });
-    flash(`${n} 模型 -> ${model}，重启实例生效`); } catch (e) { flash(e.message, 'err'); }
-};
-// ------------------------------------------------------------------ platform
-let CFG = {};
 async function loadConfig() {
   const d = await api('config');
   CFG = d.config;
@@ -1145,7 +1789,7 @@ window.changeOwnPassword = async () => {
 boot().catch(e => flash(`初始化失败：${e.message}（${e.status || ''}）`, 'err'));
 </script>
 <div id="admin-modal" style="position:fixed;inset:0;background:rgba(8,10,14,.66);display:none;align-items:center;justify-content:center;z-index:2147483647">
-  <div style="background:#151a22;border:1px solid #2b3240;border-radius:12px;max-width:620px;width:92vw;max-height:84vh;display:flex;flex-direction:column;color:#e6e8eb">
+  <div class="modal-card" style="background:#151a22;border:1px solid #2b3240;border-radius:12px;max-width:760px;width:94vw;max-height:86vh;display:flex;flex-direction:column;color:#e6e8eb">
     <div style="padding:14px 16px;border-bottom:1px solid #232a35;display:flex;justify-content:space-between;align-items:center">
       <b id="am-title">模型</b><button class="act" id="am-close">关闭</button></div>
     <div id="am-body" style="padding:12px 16px;overflow:auto"></div>

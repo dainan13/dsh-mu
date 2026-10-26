@@ -190,6 +190,27 @@ if "$CLI" instance list >/dev/null 2>&1 && "$CLI" instance list --help >/dev/nul
 	ok "instance list --help works"
 fi
 
+# Every subcommand must construct its parser. A duplicate flag (e.g. adding --model
+# twice) is invisible until someone runs the command: argparse then dies with
+# "conflicting option string" and the WHOLE subcommand stops working.
+# argparse itself lists the real choices when you hand it an invalid one
+SUBS=$("$CLI" __dshmu_no_such_command__ 2>&1 \
+	| sed -n "s/.*choose from //p" | tr -d "'()" | tr ',' ' ')
+broken=""
+checked=0
+for sub in $SUBS; do
+	case "$sub" in -*|"") continue ;; esac
+	checked=$((checked + 1))
+	if ! "$CLI" "$sub" --help >/dev/null 2>&1; then
+		broken="$broken $sub"
+	fi
+done
+if [ -n "$broken" ]; then
+	bad "subcommands whose parser is broken:$broken"
+else
+	ok "all $checked subcommands build their parser (no conflicting flags)"
+fi
+
 echo
 echo "=== CLI CONTRACT: PASS=$PASS FAIL=$FAIL ==="
 [ "$FAIL" = 0 ] && echo "CLI CONTRACT PASSED" || echo "CLI CONTRACT FAILED"

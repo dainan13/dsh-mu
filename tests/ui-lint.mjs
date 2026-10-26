@@ -174,6 +174,71 @@ function defined(name, code) {
   }
 }
 
+// n ------------------------------- `hidden` really hides (display rules outrank it)
+{
+  const html = read('admin/index.html');
+  const usesHidden = /<form[^>]*\bhidden\b/.test(html) || /\bhidden>/.test(html);
+  // A class/element rule like `form{display:flex}` overrides the UA rule for [hidden],
+  // which shipped once as a form sitting next to its own create button ("双份").
+  const wins = /\[hidden\]\s*\{\s*display\s*:\s*none\s*!important/.test(html);
+  if (!usesHidden) ok('no element relies on the hidden attribute');
+  else if (wins) ok('[hidden] is forced to display:none, so hidden elements stay hidden');
+  else bad('the page uses hidden="" but no `[hidden]{display:none!important}` rule exists');
+}
+
+// n ------------------------------- layout classes used in markup are defined
+{
+  const html = read('admin/index.html');
+  const css = html.slice(html.indexOf('<style'), html.indexOf('</style>'));
+  const used = new Set();
+  for (const m of html.matchAll(/class="([^"]+)"/g)) {
+    for (const c of m[1].split(/\s+/)) if (c) used.add(c);
+  }
+  // every `.name` that appears in any selector counts as "styled"
+  const styled = new Set();
+  for (const m of css.matchAll(/(^|\})([^{}]+)\{/g)) {
+    for (const c of m[2].matchAll(/\.([\w-]+)/g)) styled.add(c[1]);
+  }
+  const layout = ['row', 'inline', 'card', 'msg', 'muted', 'banner', 'spinner'];
+  // must have its OWN rule (`.cls{`), not merely appear inside some selector: a class
+  // referenced only as `label.cls > input` still leaves the markup unstyled.
+  const own = new Set();
+  for (const c of css.matchAll(/(?:^|[\n}])\s*\.([\w-]+)\s*\{/gm)) own.add(c[1]);
+  const missing = layout.filter((c) => used.has(c) && !own.has(c));
+  if (missing.length === 0) ok('layout classes used in the page are actually defined');
+  else bad(`classes used but never styled: ${missing.join(', ')}`);
+}
+
+// n ------------------------------- global input sizing must exempt checkboxes
+{
+  const html = read('admin/index.html');
+  const css = html.slice(html.indexOf('<style'), html.indexOf('</style>'));
+  const globalSizing = /input\s*,\s*select\s*\{[^}]*min-width\s*:\s*\d+px/.test(css);
+  const exempt = /input\[type=checkbox\][^{]*\{[^}]*min-width\s*:\s*0/.test(css);
+  if (!globalSizing) ok('no global min-width on inputs (nothing to exempt)');
+  else if (exempt) ok('checkboxes/radios are exempt from the global input min-width');
+  else bad('a global `input,select{min-width:...}` rule also sizes checkboxes into wide boxes');
+}
+
+// n --------------------------- panel reads must be forwarded by me.lua
+{
+  // /me builds its payload as an explicit whitelist. Three separate bugs came from
+  // adding a field to the backend and forgetting the lua projection (resources,
+  // my_default, started_at), so assert the contract explicitly.
+  const me = read('gateway/lua/me.lua');
+  const panel = read('gateway/static/panel.js');
+  const required = [
+    ['instance started_at', /\n\s*started_at\s*=\s*started_at/, /i\.started_at/],
+    ['instance resources', /resources\s*=/, /i\.resources/],
+    ['my_default', /my_default\s*=/, /data\.my_default/],
+  ];
+  const missing = required
+    .filter(([, inLua, inPanel]) => inPanel.test(panel) && !inLua.test(me))
+    .map(([label]) => label);
+  if (missing.length === 0) ok('me.lua forwards every field the panel reads');
+  else bad(`panel reads fields me.lua does not forward: ${missing.join(', ')}`);
+}
+
 console.log(`\n=== UI LINT: PASS=${pass} FAIL=${fail} ===`);
 console.log(fail === 0 ? 'UI CHECKS PASSED' : 'UI CHECKS FAILED');
 process.exit(fail === 0 ? 0 : 1);

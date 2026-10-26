@@ -66,9 +66,13 @@ local function instance_payload()
 	-- upstreams.json is written by sync, so it cannot carry live cgroup numbers;
 	-- ask the backend (the same view the admin page uses) instead.
 	local resources = nil
+	local started_at = tonumber(inst.started_at) or 0
 	local full = mu.internal_get("/instances/" .. inst_name)
 	if full and type(full.instance) == "table" then
 		resources = full.instance.resources
+		-- the state file is the source of truth, but the backend view is fresher
+		-- (a restart updates it), so prefer a non-zero value from there.
+		started_at = tonumber(full.instance.started_at) or started_at
 	end
 	return {
 		name = inst_name,
@@ -79,6 +83,7 @@ local function instance_payload()
 		model = provider.model or "",
 		user = inst.user or name,
 		resources = resources,
+		started_at = started_at,
 	}
 end
 
@@ -87,7 +92,6 @@ local method = ngx.req.get_method()
 if method == "GET" then
 	local cfg = mu.config()
 	local plans, perr = mu.internal_get("/me/plans", name)
-	local plugins = mu.internal_get("/me/plugins", name)
 	return json(200, {
 		user = name,
 		role = (mu.is_system_admin(name) and "admin" or "user"),
@@ -104,11 +108,18 @@ if method == "GET" then
 			return as_array(out)
 		end)(),
 		defaultPlan = (plans and plans.default) or "",
+		-- the user's own default (one entry, outranks the operator chain). Without this
+		-- the drawer saved it and still rendered "未设置".
+		my_default = (function()
+			local d = plans and plans.my_default
+			if type(d) ~= "table" then return { plan = "", model = "" } end
+			return { plan = tostring(d.plan or ""), model = tostring(d.model or "") }
+		end)(),
 		providers = as_array((plans and plans.providers) or {}),
 		plans_error = perr or nil,
-		pluginCatalog = as_array((plugins and plugins.catalog) or {}),
-		installed = as_array((plugins and plugins.installed) or {}),
-		pluginProfile = (plugins and plugins.profile) or "",
+		-- plugins are managed inside each instance's own DSH UI now; the platform
+		-- only keeps a read-only view (admin) plus protected/mandatory policy.
+
 	})
 end
 
@@ -174,12 +185,13 @@ if action == "restart" then
 end
 
 if action == "plan-add" or action == "plan-rename" or action == "plan-delete"
-	or action == "plan-models" or action == "plan-probe" then
+	or action == "plan-models" or action == "plan-probe"
+	or action == "plan-default" or action == "plan-default-clear" then
 	local result, err, status = mu.internal_post("/me/plans", name, {
 		action = action:gsub("^plan%-", ""),
 		id = payload.id, name = payload.name, provider = payload.provider,
 		key = payload.key, models = payload.models, default_model = payload.default_model,
-		all_available = payload.all_available,
+		model = payload.model, all_available = payload.all_available,
 	})
 	if not result then
 		return json(status == 403 and 403 or 502, { error = err or "plan request failed",

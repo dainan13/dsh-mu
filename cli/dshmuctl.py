@@ -15,6 +15,8 @@ import contextlib
 import fcntl
 import glob
 import getpass
+import gzip
+import ipaddress
 import grp
 import hashlib
 import hmac
@@ -101,7 +103,11 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
      "对外主机名 / 域名：登录页展示、/login 跳转目标、实例代理的 Host 归属"),
     ("GATEWAY_LISTEN", "gateway_listen", "int", 80,
      "网关 nginx 监听端口"),
-    ("INSTANCE_KEEP_CAPS", "instance_keep_caps", "optstr", "sys_admin,setuid,setgid",
+    ("INSTANCE_EGRESS", "instance_egress", "str", "no-intranet",
+     "实例出网策略：open（不限制）/ no-intranet（禁内网，默认）/ allowlist（只允许白名单）"),
+    ("INSTANCE_EGRESS_ALLOW", "instance_egress_allow", "str", "",
+     "白名单/豁免：逗号分隔的 ip 或 cidr，可带 :端口（如 10.1.2.3:443,192.168.5.0/24:5432）"),
+    ("INSTANCE_KEEP_CAPS", "instance_keep_caps", "optstr", "",
      "实例保留的 capability（逗号分隔，空=全部丢弃）。DSH 的命令工具用 bwrap 沙箱，"
      "在 jail 里需要 sys_admin（建命名空间/挂载）+ setuid/setgid（uid 映射）"),
     ("TLS_ENABLED", "tls_enabled", "bool", False,
@@ -112,9 +118,13 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
      "启用 HTTPS 后把 80 的请求 301 到 https（与 tls_keep_http 互斥时以本项为准）"),
     ("RELAY_ENABLED", "relay_enabled", "bool", True,
      "套餐的 key 走网关代理（实例里只有占位符 `mu-relay`）；关掉则回到直连、真 key 写进实例"),
+    ("DEFAULT_MODEL_CHAIN", "default_model_chain", "str", "",
+     "新会话起始模型的优先级链（JSON：[{plan,model},…]，第一档=原 default_plan）"),
     ("PROVIDER_TEMPLATE_BASE", "provider_template_base", "str",
      "https://raw.githubusercontent.com/dainan13/dsh-mu/main/provider-packages",
      "线上 provider 模板库地址（https://… 或 file://…；留空用项目仓库默认）"),
+    ("WEB_SEARCH_PLAN", "web_search_plan", "str", "",
+     "web_search 工具用哪个套餐（留空=自动挑一个 deepseek 系套餐）"),
     ("RELAY_LISTEN", "relay_listen", "int", 8099,
      "代理监听的 loopback 端口（只给本机 jail 用，不对外）"),
     # 24h by default: an unattended browser tab should not stay signed in for a week.
@@ -897,6 +907,8 @@ def render_instance_conf(st: dict, name: str):
         f"KEEP_CAPS=\"{st['config'].get('instance_keep_caps') or ''}\"",
         f"DSH_PERMISSION_MODE=\"{st['config'].get('instance_permission_mode', 'danger-full-access')}\"",
         f"EXTRA_MOUNTS=\"{inst.get('extra_mounts', '')}\"",
+        # read-only, same-path binds for protected plugins (kernel-enforced EROFS)
+        f"RO_PATHS=\"{','.join(protected_paths(name))}\"",
         "",
     ]
     atomic_write(f"{INST_CONF_DIR}/{name}.conf", "\n".join(lines), mode=0o644)
@@ -1208,6 +1220,273 @@ def install_admin(cfg: dict, restart: bool = True) -> bool:
     return True
 
 
+EGRESS_NFT = f"{ETC}/egress.nft"
+EGRESS_POLICIES = ("open", "no-intranet", "allowlist")
+EGRESS_PRIVATE4 = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                   "100.64.0.0/10", "169.254.0.0/16")
+EGRESS_PRIVATE6 = ("fc00::/7", "fe80::/10")
+RELAY_PORT_FALLBACK = 8099
+
+_EGRESS_HOST_RE = re.compile(r"^[0-9a-fA-F:.]+(/[0-9]{1,3})?$")
+_EGRESS_PORT_RE = re.compile(r"^[0-9]{1,5}$")
+
+
+_EGRESS_PORT_SPEC_RE = re.compile(r"^(\d{1,5})(?:-(\d{1,5}))?$")
+
+
+def _parse_addr(spec: str) -> str:
+    """ip / cidr / `a-b` range (v4 or v6). Validated with the stdlib, not a regex."""
+    raw = spec.strip()
+    if not raw:
+        raise ValueError("empty address")
+    if "-" in raw:
+        left, _, right = raw.partition("-")
+        left, right = left.strip(), right.strip()
+        try:
+            lo = ipaddress.ip_address(left)
+            hi = ipaddress.ip_address(right)
+        except ValueError:
+            raise ValueError(f"bad range: {raw} (expected 10.0.0.1-10.0.0.9)") from None
+        if lo.version != hi.version:
+            raise ValueError(f"mixed families in range: {raw}")
+        if int(lo) > int(hi):
+            raise ValueError(f"range start is after its end: {raw}")
+        return f"{lo}-{hi}"
+    if "/" in raw:
+        try:
+            net = ipaddress.ip_network(raw, strict=False)
+        except ValueError:
+            raise ValueError(f"bad network: {raw}") from None
+        if net.prefixlen == 0:
+            raise ValueError(f"{raw} would disable the whole policy")
+        return str(net)
+    try:
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        raise ValueError(f"bad address: {raw}") from None
+    if int(addr) == 0:
+        raise ValueError(f"{raw} would disable the whole policy")
+    return str(addr)
+
+
+def _parse_port(spec: str) -> str:
+    m = _EGRESS_PORT_SPEC_RE.match(spec.strip())
+    if not m:
+        raise ValueError(f"bad port: {spec} (expected 443 or 10000-11000)")
+    lo = int(m.group(1))
+    hi = int(m.group(2)) if m.group(2) else lo
+    if not (0 < lo < 65536 and 0 < hi < 65536):
+        raise ValueError(f"port out of range: {spec}")
+    if lo > hi:
+        raise ValueError(f"port range start is after its end: {spec}")
+    return f"{lo}" if lo == hi else f"{lo}-{hi}"
+
+
+def _looks_like_port(spec: str) -> bool:
+    try:
+        _parse_port(spec)
+        return True
+    except ValueError:
+        return False
+
+
+def parse_egress_allow(raw) -> list[dict]:
+    """Parse allowlist entries into {addr, port, text}.
+
+    Accepted: `ip`, `ip/len`, `ip1-ip2`, each optionally followed by `:port` or
+    `:10000-11000`. IPv6 with a port must be bracketed: `[2001:db8::1]:443`.
+    """
+    if isinstance(raw, (list, tuple, set)):
+        items = [str(x) for x in raw]
+    else:
+        items = str(raw or "").replace(",", " ").split()
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        spec = item.strip()
+        if not spec:
+            continue
+        addr_spec, port_spec = spec, ""
+        if spec.startswith("["):
+            end_bracket = spec.find("]")
+            if end_bracket < 0:
+                raise ValueError(f"missing ] in {spec}")
+            addr_spec = spec[1:end_bracket]
+            rest = spec[end_bracket + 1:]
+            if rest:
+                if not rest.startswith(":") or not _looks_like_port(rest[1:]):
+                    raise ValueError(f"bad port in {spec}")
+                port_spec = rest[1:]
+        else:
+            # try the whole thing as an address first: "2001:db8::1" must not be read
+            # as address "2001:db8:" plus port 1
+            try:
+                _parse_addr(spec)
+            except ValueError:
+                head, sep, tail = spec.rpartition(":")
+                if not (sep and tail and _looks_like_port(tail)):
+                    raise
+                addr_spec, port_spec = head, tail
+        addr = _parse_addr(addr_spec)
+        port = _parse_port(port_spec) if port_spec else ""
+        if ":" in addr and port:
+            text = f"[{addr}]:{port}"
+        else:
+            text = f"{addr}:{port}" if port else addr
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append({"addr": addr, "port": port, "text": text})
+    return out
+
+
+def instance_egress(st: dict, name: str) -> tuple[str, list[dict]]:
+    """Effective egress policy for one instance.
+
+    The allow list is the union of the all-instances list (`INSTANCE_EGRESS_ALLOW`, the
+    "全部实例" rules) and this instance's own rules — so a shared rule is not shadowed
+    by having a personal one.
+    """
+    inst = st["instances"].get(name) or {}
+    cfg = st["config"]
+    policy = str(inst.get("egress") or cfg.get("instance_egress") or "no-intranet").strip().lower()
+    if policy not in EGRESS_POLICIES:
+        policy = "no-intranet"
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for source in (cfg.get("instance_egress_allow") or "", inst.get("egress_allow") or []):
+        try:
+            rows = parse_egress_allow(source)
+        except ValueError:
+            rows = []
+        for row in rows:
+            if row["text"] in seen:
+                continue
+            seen.add(row["text"])
+            merged.append(row)
+    return policy, merged
+
+
+def global_egress_allow(st: dict) -> list[dict]:
+    """The rules marked "全部实例" (stored in the config)."""
+    try:
+        return parse_egress_allow(st["config"].get("instance_egress_allow") or "")
+    except ValueError:
+        return []
+
+
+def egress_resolvers(name: str) -> list[str]:
+    """The DNS servers this instance is configured to use (must stay reachable)."""
+    out: list[str] = []
+    for path in (f"{INSTANCES_DIR}/{name}/rootfs/etc/resolv.conf", "/etc/resolv.conf"):
+        with contextlib.suppress(OSError):
+            for line in (read_text(path) or "").splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    addr = parts[1].strip("[]")
+                    if _EGRESS_HOST_RE.match(addr) and addr not in out:
+                        out.append(addr)
+        if out:
+            break
+    return out
+
+
+def _nft_chain(name: str) -> str:
+    return "eg_" + re.sub(r"[^A-Za-z0-9_]", "_", name)
+
+
+def render_egress_rules(st: dict) -> str:
+    """The whole nftables table, rendered from state (empty string = no table)."""
+    relay_port = int(st["config"].get("relay_listen") or RELAY_PORT_FALLBACK)
+    enforced = [(name, *instance_egress(st, name)) for name in sorted(st["instances"])]
+    enforced = [row for row in enforced if row[1] != "open"]
+    if not enforced:
+        return ""
+    lines = ["table inet dshmu {", "\tchain egress {",
+             "\t\ttype filter hook output priority 0; policy accept;"]
+    for name, _policy, _allow in enforced:
+        lines.append(f'\t\tsocket cgroupv2 level 2 "dsh-mu/{name}" jump {_nft_chain(name)}')
+    lines += ["\t}", ""]
+    for name, policy, allow in enforced:
+        inst = st["instances"].get(name) or {}
+        port = int(inst.get("port") or 0)
+        resolvers = egress_resolvers(name)
+        lines.append(f"\tchain {_nft_chain(name)} {{")
+        # replies must always pass: without this the instance itself becomes unreachable
+        lines.append("\t\tct state established,related accept")
+        if port:
+            lines.append(f'\t\toifname "lo" tcp dport {{ {port}, {relay_port} }} accept')
+        else:
+            lines.append(f'\t\toifname "lo" tcp dport {relay_port} accept')
+        for addr in resolvers:
+            lines.append(f"\t\tip daddr {addr} udp dport 53 accept")
+            lines.append(f"\t\tip daddr {addr} tcp dport 53 accept")
+        for rule in allow:
+            addr, port = rule["addr"], rule["port"]
+            proto = "ip6" if ":" in addr else "ip"
+            if port:
+                lines.append(f"\t\t{proto} daddr {addr} tcp dport {port} accept")
+                lines.append(f"\t\t{proto} daddr {addr} udp dport {port} accept")
+            else:
+                lines.append(f"\t\t{proto} daddr {addr} accept")
+        lines.append('\t\toifname "lo" reject with icmpx type admin-prohibited')
+        if policy == "no-intranet":
+            lines.append("\t\tip daddr { " + ", ".join(EGRESS_PRIVATE4)
+                         + " } reject with icmpx type admin-prohibited")
+            lines.append("\t\tip6 daddr { " + ", ".join(EGRESS_PRIVATE6)
+                         + " } reject with icmpx type admin-prohibited")
+            lines.append("\t\taccept")
+        else:  # allowlist: nothing else leaves the box
+            lines.append("\t\tmeta nfproto ipv4 reject with icmpx type admin-prohibited")
+            lines.append("\t\tmeta nfproto ipv6 reject with icmpx type admin-prohibited")
+        lines.append("\t}")
+        lines.append("")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def nft_available() -> bool:
+    return bool(run(["sh", "-c", "command -v nft"], check=False, capture=True).stdout.strip())
+
+
+def apply_egress(st: dict, quiet: bool = True) -> dict:
+    """Render + load the egress table. Idempotent; a no-op when nothing is enforced."""
+    rules = render_egress_rules(st)
+    os.makedirs(ETC, exist_ok=True)
+    if not rules:
+        with contextlib.suppress(OSError):
+            os.unlink(EGRESS_NFT)
+        if nft_available():
+            run(["nft", "delete", "table", "inet", "dshmu"], check=False, capture=True)
+        if not quiet:
+            info("egress: no restriction (policy=open)")
+        return {"enforced": 0, "loaded": False}
+    atomic_write(EGRESS_NFT, rules, mode=0o644)
+    if not nft_available():
+        if not quiet:
+            info("egress: rules written to " + EGRESS_NFT
+                 + " but nft is not installed (apk add nftables)")
+        return {"enforced": rules.count("chain eg_"), "loaded": False}
+    # delete + create in ONE nft transaction: nft applies a file atomically, so no
+    # packet ever sees a half-written table.
+    script = "delete table inet dshmu\n" + rules
+    tmp = "/run/dshmu-egress.nft"
+    with contextlib.suppress(OSError):
+        atomic_write(tmp, script, mode=0o600)
+    res = run(["nft", "-f", tmp], check=False, capture=True)
+    with contextlib.suppress(OSError):
+        os.unlink(tmp)
+    ok = res.returncode == 0
+    if not ok and "No such file or directory" in (res.stderr or ""):
+        res = run(["nft", "-f", EGRESS_NFT], check=False, capture=True)
+        ok = res.returncode == 0
+    if not quiet:
+        info(f"egress: {rules.count('chain eg_')} instance(s) enforced"
+             + ("" if ok else f" (nft failed: {(res.stderr or '').strip()[:120]})"))
+    return {"enforced": rules.count("chain eg_"), "loaded": ok,
+            "error": None if ok else (res.stderr or "").strip()}
+
+
 def sync_all(st: dict):
     os.makedirs(INST_CONF_DIR, exist_ok=True)
     # /etc/dsh-mu/dsh-mu.conf is the single source of truth: a `config` write must
@@ -1219,12 +1498,18 @@ def sync_all(st: dict):
     ensure_system_admins(st)
     ensure_cgroup_service()
     for name in st["instances"]:
+        with contextlib.suppress(Exception):
+            install_mandatory_plugins(st, name)
+        with contextlib.suppress(Exception):
+            for change in reconcile_protected_plugins(st, name):
+                info(f"{name}: {change}")
         render_instance_conf(st, name)
         render_service(st, name)
         # Model plans (provider + key per user) are rendered as launch patches.
         with contextlib.suppress(OSError):
             sync_instance_plans(st, name)
     ensure_instance_autostart(st)
+    apply_egress(st)
     render_gateway(st)
     if str(st["config"].get("gateway_mode") or "host") == "jail":
         with contextlib.suppress(OSError):
@@ -1817,14 +2102,27 @@ def wait_for_banner(name: str, port: int, timeout: float = 90.0) -> str | None:
     pattern = re.compile(rf"http://127\.0\.0\.1:{port}/\?token=([A-Za-z0-9_-]+)")
     deadline = time.time() + timeout
     announced = False
+    # logrotate keeps 4 files with copytruncate: the banner we need is often in the
+    # rotated one right after a restart, which made refresh-cookie report "no token".
+    candidates = [log, log + ".1", log + ".2", log + ".3", log + ".4", log + ".gz"]
     while time.time() < deadline:
-        if os.path.exists(log):
-            with open(log, errors="replace") as fh:
-                m = None
-                for m in pattern.finditer(fh.read()):
-                    pass
-                if m:
-                    return m.group(1)
+        for path in candidates:
+            if not os.path.exists(path):
+                continue
+            try:
+                if path.endswith(".gz"):
+                    with gzip.open(path, "rt", errors="replace") as fh:
+                        text = fh.read()
+                else:
+                    with open(path, errors="replace") as fh:
+                        text = fh.read()
+            except OSError:
+                continue
+            m = None
+            for m in pattern.finditer(text):
+                pass
+            if m:
+                return m.group(1)
         if not announced:
             info(f"instance {name}: waiting for the harness launch banner (first boot installs the profile; "
                  f"this can take a few minutes) ...")
@@ -2776,30 +3074,59 @@ def ensure_system_admins(st: dict) -> list[dict]:
     return report
 
 
-def ensure_default_kilo_plan() -> str | None:
-    """Make the keyless Kilo preset usable out of the box.
+DEFAULT_PLAN_ID = "plan_default"
+DEFAULT_PLAN_NAME = "Kilo Free（默认）"
 
-    Creates (once) a team plan `kilo-free` owned by "*" so every user sees it,
-    makes it the platform default when nothing else is set, and leaves operator
-    plans untouched.
+
+def builtin_default_plan() -> dict:
+    """The platform's fallback plan: keyless Kilo, usable with no credential at all."""
+    return {
+        "schema": PLAN_SCHEMA,
+        "id": DEFAULT_PLAN_ID,
+        "name": DEFAULT_PLAN_NAME,
+        "provider": "kilo",
+        "owner": "*",
+        "visible_to": ["*"],
+        "enabled": True,
+        "models": ["kilo-auto/free"],
+        "default_model": "kilo-auto/free",
+        "keyless": True,
+        "builtin": True,
+    }
+
+
+def ensure_default_kilo_plan() -> str | None:
+    """Keep `plan_default` present and matching the current build.
+
+    This is deliberately *not* "create once": the id is fixed, so a later release that
+    ships a different built-in default must be able to take over that slot. Only the
+    built-in fields are refreshed (`enabled` is preserved: an operator may stop it).
     """
-    pid = "plan_kilo_free"
+    pid = DEFAULT_PLAN_ID
+    fresh = builtin_default_plan()
     existing = load_plan(pid)
     if existing is None:
-        plan = {
-            "schema": PLAN_SCHEMA,
-            "id": pid,
-            "name": "Kilo Free（默认）",
-            "provider": "kilo",
-            "owner": "*",
-            "visible_to": ["*"],
-            "enabled": True,
-            "models": ["kilo-auto/free"],
-            "default_model": "kilo-auto/free",
-            "keyless": True,
-        }
-        save_plan(plan)
-        info("default plan created: kilo-free (keyless, model kilo-auto/free)")
+        # migrate the pre-0.18 id so upgrades do not leave a stale duplicate behind
+        legacy = load_plan("plan_kilo_free")
+        if legacy is not None:
+            fresh["enabled"] = bool(legacy.get("enabled", True))
+            with contextlib.suppress(OSError):
+                os.unlink(f"{PLANS_DIR}/plan_kilo_free.json")
+            info("default plan renamed: plan_kilo_free -> plan_default")
+        save_plan(fresh)
+        info("default plan created: plan_default (keyless, model kilo-auto/free)")
+    else:
+        changed = {}
+        for key, value in fresh.items():
+            if key in ("enabled",):
+                continue
+            if existing.get(key) != value:
+                changed[key] = value
+        if changed:
+            existing.update(changed)
+            save_plan(existing)
+            info("default plan refreshed: plan_default ("
+                 + ", ".join(sorted(changed)) + ")")
     cfg = load_config()
     if not str(cfg.get("default_plan") or ""):
         cfg["default_plan"] = pid
@@ -2911,6 +3238,14 @@ def cmd_install(args):
     # Out-of-the-box model access: a keyless team plan on Kilo's free gateway, so a
     # fresh install can talk to a model before the operator configures any key.
     with contextlib.suppress(Exception):
+        if str(st["config"].get("instance_keep_caps") or "") == "sys_admin,setuid,setgid":
+            # 0.19.0: instances no longer keep CAP_SYS_ADMIN. Keeping it let a jailed
+            # root unmount the read-only bind mounts that protect plugins.
+            st["config"]["instance_keep_caps"] = ""
+            save_config(st["config"])
+            info("instance_keep_caps: dropped the legacy sys_admin,setuid,setgid default")
+        if not nft_available():
+            info("hint: apk add nftables  (needed for instance_egress)")
         ensure_default_kilo_plan()
         sync_all(load_state())
     started = reconcile_instances(load_state())
@@ -2995,8 +3330,26 @@ def cmd_user_list(args):
         print("  ".join(c.ljust(width[i]) for i, c in enumerate(r)))
 
 
+def refuse_system_account(name: str, what: str):
+    """System accounts (root, ADMIN_SYSTEM_USERS) are the host's own accounts.
+
+    Their password lives in /etc/shadow and their admin role comes from the host, so a
+    platform "password change" would silently do nothing, while disabling or deleting
+    the record locks the operator out of the web UI. Refuse, and say what to do instead.
+    """
+    if name not in system_admin_names(load_config()):
+        return
+    if what == "password":
+        die(f"{name} is a system account: change its password on the host with "
+            f"`passwd {name}` (the platform cannot set it)")
+    die(f"{name} is a system account: {what} is not allowed from the platform "
+        f"(it would lock the web UI out).\n"
+        f"  to stop it being an admin: remove {name} from ADMIN_SYSTEM_USERS")
+
+
 def cmd_user_passwd(args):
     ensure_root()
+    refuse_system_account(args.name, "password")
     st = load_state()
     u = st["users"].get(args.name) or die(f"no such user: {args.name}")
     password = args.password or (sys.stdin.readline().strip() if not sys.stdin.isatty() else None)
@@ -3030,6 +3383,7 @@ def cmd_user_kick(args):
 
 def cmd_user_toggle(args, enabled: bool):
     ensure_root()
+    refuse_system_account(args.name, "disable/enable")
     st = load_state()
     u = st["users"].get(args.name) or die(f"no such user: {args.name}")
     u["enabled"] = enabled
@@ -3042,6 +3396,7 @@ def cmd_user_toggle(args, enabled: bool):
 
 def cmd_user_del(args):
     ensure_root()
+    refuse_system_account(args.name, "delete")
     st = load_state()
     if args.name not in st["users"]:
         die(f"no such user: {args.name}")
@@ -3295,6 +3650,178 @@ def instance_plugins(name: str) -> list[dict]:
     return rows
 
 
+PLUGIN_POLICY_KEY = "plugin_policy"
+
+
+def plugin_policy(st: dict) -> dict:
+    """Per-package policy: protected (cannot be removed) + mandatory (always present)."""
+    raw = st.get(PLUGIN_POLICY_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for pkg, row in raw.items():
+        if not isinstance(row, dict):
+            continue
+        entry = {"protected": bool(row.get("protected")),
+                 "mandatory": bool(row.get("mandatory"))}
+        if row.get("note"):
+            entry["note"] = str(row["note"])
+        if entry["protected"] or entry["mandatory"] or entry.get("note"):
+            out[str(pkg)] = entry
+    return out
+
+
+def set_plugin_policy(st: dict, pkg: str, protected: bool | None = None,
+                      mandatory: bool | None = None, note: str | None = None) -> dict:
+    if not PLUGIN_PKG_RE.match(pkg):
+        raise ValueError(f"invalid package name: {pkg}")
+    table = st.setdefault(PLUGIN_POLICY_KEY, {})
+    entry = table.setdefault(pkg, {})
+    if protected is not None:
+        entry["protected"] = bool(protected)
+    if mandatory is not None:
+        entry["mandatory"] = bool(mandatory)
+    if note is not None:
+        entry["note"] = str(note)
+    if not entry.get("protected") and not entry.get("mandatory") and not entry.get("note"):
+        table.pop(pkg, None)
+    return plugin_policy(st).get(pkg, {})
+
+
+def protected_paths(name: str) -> list[str]:
+    """Rootfs-relative dirs to mount read-only for protected plugins in this instance."""
+    st = load_state()
+    policy = plugin_policy(st)
+    profile = instance_profile(name)
+    base = f"/home/dsh/.dsh/profiles/{profile}/node_modules"
+    out = []
+    for pkg, row in sorted(policy.items()):
+        if not row.get("protected"):
+            continue
+        # a scoped package lives one level deeper; bind the package dir itself so a
+        # sibling package in the same scope is still ordinary
+        rel = f"{base}/{pkg}"
+        # inside the jail the profile lives at /home/dsh/.dsh/... ; on the host the same
+        # tree is <instance_home>/.dsh/...
+        host_path = instance_home(name) + rel[len("/home/dsh"):]
+        if os.path.isdir(host_path):
+            out.append(rel)
+    return out
+
+
+def plugin_manifest_path(name: str) -> str:
+    return f"{instance_home(name)}/.dsh/profiles/{instance_profile(name)}/package.json"
+
+
+def installed_package_dirs(name: str) -> set[str]:
+    """Package names physically present in the profile's node_modules."""
+    # the profile lives in the instance home (bind-mounted into the jail at runtime),
+    # not under the read-only rootfs template
+    base = (f"{instance_home(name)}/.dsh/profiles/{instance_profile(name)}/node_modules")
+    found: set[str] = set()
+    with contextlib.suppress(OSError):
+        for entry in os.listdir(base):
+            if entry.startswith("."):
+                continue
+            if entry.startswith("@"):
+                with contextlib.suppress(OSError):
+                    for sub in os.listdir(os.path.join(base, entry)):
+                        found.add(f"{entry}/{sub}")
+            else:
+                found.add(entry)
+    return found
+
+
+def reconcile_protected_plugins(st: dict, name: str) -> list[str]:
+    """Keep protected/mandatory plugins present and enabled in one instance.
+
+    DSH's own manager removes the dependency + the bundle entry from package.json
+    before running pnpm, so a read-only node_modules alone would still "uninstall" it.
+    This puts the bookkeeping back; a restart re-applies the ro mount.
+    """
+    profile = instance_profile(name)
+    path = plugin_manifest_path(name)
+    text = read_text(path)
+    if not text:
+        return []
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    installed = installed_package_dirs(name) | {r["pkg"] for r in instance_plugins(name)}
+    policy = plugin_policy(st)
+    deps = doc.setdefault("dependencies", {})
+    prof = ((doc.get("dsh") or {}).get("profile") or {})
+    bundles = prof.get("bundles")
+    if not isinstance(bundles, list):
+        bundles = []
+    changed = []
+    for pkg, row in sorted(policy.items()):
+        if pkg not in installed:
+            continue
+        if row.get("protected") or row.get("mandatory"):
+            if pkg not in deps:
+                deps[pkg] = deps.get(pkg, "*")
+                changed.append(f"{pkg}: dependency restored")
+            if pkg not in bundles:
+                bundles.append(pkg)
+                changed.append(f"{pkg}: bundle re-enabled")
+    for pkg, row in sorted(policy.items()):
+        if row.get("protected") and pkg not in installed:
+            info(f"WARNING: {name}: protected plugin {pkg} is not installed "
+                 f"(DSH pruned it). Toggle 强制安装 / install it again to restore.")
+    if changed:
+        prof["bundles"] = bundles
+        doc.setdefault("dsh", {})["profile"] = prof
+        atomic_write(path, json.dumps(doc, indent=2) + "\n", mode=0o600)
+        with contextlib.suppress(OSError):
+            os.chown(path, int((st["instances"].get(name) or {}).get("uid", 0)),
+                     int((st["instances"].get(name) or {}).get("uid", 0)))
+    # a `disabled: true` patch entry would keep it unloaded even with the files there
+    patch = f"{instance_home(name)}/.dsh/profiles/{profile}/cordis.patch.yml"
+    ptext = read_text(patch)
+    if ptext:
+        lines, skip, out = ptext.splitlines(), False, []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("- id:"):
+                ident = stripped.split(":", 1)[1].strip()
+                skip = any(p.split("/")[-1] == ident and plugin_policy(st).get(p, {}).get("protected")
+                           for p in plugin_policy(st))
+            if skip and stripped.replace(" ", "") in ("disabled:true", "disabled:true"):
+                changed.append("patch: dropped a disabled:true for a protected plugin")
+                continue
+            out.append(line)
+        new_text = "\n".join(out) + "\n"
+        if new_text != ptext:
+            atomic_write(patch, new_text, mode=0o600)
+    return changed
+
+
+def install_mandatory_plugins(st: dict, name: str) -> list[str]:
+    """Best-effort install of every `mandatory` package into one instance."""
+    done = []
+    for pkg, row in sorted(plugin_policy(st).items()):
+        # only `mandatory` installs itself; `protected` protects what is already there
+        if not row.get("mandatory"):
+            continue
+        have = installed_package_dirs(name) | {r["pkg"] for r in instance_plugins(name)}
+        if pkg in have:
+            continue
+        try:
+            ok, out = plugin_exec(name, "add", pkg)
+        except Exception as exc:  # noqa: BLE001
+            ok, out = False, str(exc)
+        if ok:
+            record_plugin(load_state(), name, pkg, _installed_version(name, pkg) or "*",
+                          "mandatory", "platform")
+            done.append(pkg)
+        else:
+            info(f"WARNING: mandatory plugin {pkg} could not be installed into {name}: "
+                 f"{out[-160:]}")
+    return done
+
+
 def plugin_exec(name: str, verb: str, pkg: str, version: str | None = None) -> tuple[bool, str]:
     """Run `dsh plugin --profile <p> <verb> <pkg>[@ver]` inside the instance jail."""
     profile = instance_profile(name)
@@ -3332,9 +3859,55 @@ def replay_instance_plugins(name: str) -> list[str]:
     return installed
 
 
+def cmd_plugin_policy(st: dict, args) -> int:
+    action = getattr(args, "policy_action", "")
+    if action in ("", "list", "policy", None):
+        rows = plugin_policy(st)
+        if args.json:
+            print(json.dumps({"policy": rows}, indent=2, ensure_ascii=False))
+            return 0
+        if not rows:
+            info("no plugin policy set")
+            return 0
+        for pkg, row in sorted(rows.items()):
+            flags = []
+            if row.get("protected"):
+                flags.append("受保护")
+            if row.get("mandatory"):
+                flags.append("强制安装")
+            info(f"  {pkg:40} {' + '.join(flags) or '-'}"
+                 + (f"   # {row['note']}" if row.get("note") else ""))
+        return 0
+    if not args.pkg:
+        die("plugin <protect|require|unprotect|unrequire> needs a package name")
+    pkg = args.pkg
+    try:
+        if action == "protect":
+            set_plugin_policy(st, pkg, protected=True)
+        elif action == "unprotect":
+            set_plugin_policy(st, pkg, protected=False)
+        elif action == "require":
+            set_plugin_policy(st, pkg, mandatory=True)
+        elif action == "unrequire":
+            set_plugin_policy(st, pkg, mandatory=False)
+        else:
+            die(f"unknown policy action: {action}")
+    except ValueError as exc:
+        die(str(exc))
+    save_state(st)
+    row = plugin_policy(st).get(pkg, {})
+    sync_all(load_state())
+    info(f"{pkg}: protected={bool(row.get('protected'))} mandatory={bool(row.get('mandatory'))}")
+    info("restart the affected instances: dsh-muctl instance restart <name>")
+    return 0
+
+
 def cmd_plugin(args):
-    """Maintain the curated catalog: the packages users may install without a password."""
+    """Plugin policy (protected / mandatory) and the legacy curated catalog."""
     ensure_root()
+    if args.action in ("protect", "unprotect", "require", "unrequire", "policy"):
+        args.policy_action = args.action
+        return cmd_plugin_policy(load_state(), args)
     st = load_state()
     catalog = [dict(e) for e in (st.get("plugins_catalog") or [])]
     if args.action == "list":
@@ -4370,10 +4943,83 @@ def cmd_gateway(args):
                   f"cookie={'yes' if cookie else 'NO'}  live={instance_status(name)}")
 
 
+def lua_files() -> list[str]:
+    out = []
+    lua_dir = os.path.join(LIB, "lua")
+    for name in sorted(os.listdir(lua_dir)) if os.path.isdir(lua_dir) else []:
+        if name.endswith(".lua"):
+            out.append(os.path.join(lua_dir, name))
+    return out
+
+
+def gateway_started_at() -> float:
+    """When the running openresty master started (0 when it is not running)."""
+    candidates = []
+    for pattern in ("/run/*gateway*.pid", "/var/run/*gateway*.pid",
+                    "/run/openresty.pid", "/var/run/openresty.pid",
+                    "/run/nginx.pid", "/var/run/nginx.pid"):
+        candidates.extend(sorted(glob.glob(pattern)))
+    for pidfile in candidates:
+        try:
+            with open(pidfile) as fh:
+                pid = int(fh.read().strip() or 0)
+        except (OSError, ValueError):
+            continue
+        try:
+            # /proc/<pid>/stat field 22 is the start time in clock ticks since boot;
+            # it is exactly what tells us "started before or after this file change".
+            with open(f"/proc/{pid}/stat") as fh:
+                fields = fh.read().rsplit(")", 1)[1].split()
+            started_ticks = int(fields[19])
+            with open("/proc/uptime") as fh:
+                uptime = float(fh.read().split()[0])
+            with open("/proc/stat") as fh:
+                btime = next(int(line.split()[1]) for line in fh
+                             if line.startswith("btime"))
+            ticks = os.sysconf("SC_CLK_TCK") or 100
+            return btime + started_ticks / ticks
+        except (OSError, ValueError, IndexError, StopIteration):
+            with contextlib.suppress(OSError):
+                return os.stat(pidfile).st_mtime
+    return 0.0
+
+
+def stale_lua_files() -> list[str]:
+    """Lua files changed after the gateway started: openresty caches them in memory."""
+    started = gateway_started_at()
+    if not started:
+        return []
+    return [path for path in lua_files()
+            if os.stat(path).st_mtime > started + 1]
+
+
+def reload_gateway_if_stale(quiet: bool = False) -> bool:
+    """Re-exec openresty when a .lua shipped by an upgrade is newer than the worker.
+
+    nginx runs with `lua_code_cache on`, so a replaced lua/*.lua keeps executing the
+    cached bytecode until a reload. That bit us: the drawer's new plan-default action
+    answered "unknown action" until the gateway was restarted.
+    """
+    stale = stale_lua_files()
+    if not stale:
+        return False
+    if not quiet:
+        info("gateway is running stale Lua (" + ", ".join(os.path.basename(p) for p in stale)
+             + "); reloading it")
+    cfg = load_config()
+    if str(cfg.get("gateway_mode") or "jail") == "jail":
+        # openresty runs inside the gateway jail; its master needs a real reload
+        run(["/sbin/rc-service", "dsh-mu-gateway", "restart"], check=False)
+    else:
+        run(["/sbin/rc-service", "openresty", "reload"], check=False)
+    return True
+
+
 def cmd_sync(args):
     ensure_root()
     st = load_state()
     sync_all(st)
+    reload_gateway_if_stale()
     info("gateway views and instance configs re-rendered")
 
 
@@ -5366,10 +6012,59 @@ def plan_key(plan: dict) -> str:
     return (read_text(plan_key_path(plan["id"])) or "").strip()
 
 
+def plan_order_key(plan: dict):
+    """Sort key: explicit `order` first, then name (so unset plans stay alphabetical)."""
+    order = plan.get("order")
+    try:
+        num = int(order)
+    except (TypeError, ValueError):
+        num = 1_000_000
+    return (num, str(plan.get("name") or plan.get("id") or ""))
+
+
+def sorted_plans(plans) -> list[dict]:
+    return sorted(plans, key=plan_order_key)
+
+
+def plan_is_search_capable(plan: dict) -> bool:
+    """Only DeepSeek's own Anthropic endpoint serves its server-side web_search tool."""
+    pkg = plan_package(plan) or {}
+    api = str(pkg.get("api") or "")
+    base = str(pkg.get("base_url") or "")
+    for model in pkg.get("models") or []:
+        base = base or str(model.get("base_url") or "")
+        api = api or str(model.get("api") or "")
+    return api == "anthropic-messages" and "api.deepseek.com" in base
+
+
+def search_plan(st: dict) -> dict | None:
+    """The plan that serves web_search for everyone (hidden ones included).
+
+    Picked by `order` so the operator controls it from the same list that the drawer
+    shows: the first search-capable plan in order wins.
+    """
+    wanted = str(load_config().get("web_search_plan") or "").strip()
+    if wanted:
+        plan = load_plan(wanted)
+        if plan and plan_is_search_capable(plan):
+            return plan
+    capable = [p for p in list_plans().values() if plan_is_search_capable(p)]
+    return sorted_plans(capable)[0] if capable else None
+
+
 def plan_visible_to_user(plan: dict, user: str) -> bool:
-    """Team plans are forced visible; personal plans belong to one user."""
-    if not plan.get("enabled", True):
+    """Team plans are forced visible; personal plans belong to one user.
+
+    `hidden` plans are platform-internal (e.g. the one that pays for web_search):
+    users never see or select them, but `search_plan()` can still use them.
+    """
+    if plan.get("hidden"):
         return False
+    # `plan_default` is the last resort: if a user has no other plan at all they may
+    # still use it even when an operator disabled it (otherwise such a user has no
+    # working model and the UI has nothing to offer).
+    if not plan.get("enabled", True):
+        return plan.get("id") == DEFAULT_PLAN_ID and not other_plans_for_user(user)
     owner = str(plan.get("owner") or "*")
     if owner != "*":
         return owner == user
@@ -5377,6 +6072,17 @@ def plan_visible_to_user(plan: dict, user: str) -> bool:
     if "*" in visible:
         return True
     return user in visible
+
+
+def other_plans_for_user(user: str) -> list[dict]:
+    """Usable plans for this user, ignoring the disabled built-in default."""
+    out = []
+    for plan in list_plans().values():
+        if plan.get("id") == DEFAULT_PLAN_ID:
+            continue
+        if plan_visible_to_user(plan, user):
+            out.append(plan)
+    return out
 
 
 def plans_for_user(user: str) -> list[dict]:
@@ -5390,6 +6096,10 @@ def plan_package(plan: dict) -> dict | None:
 
 
 RELAY_PLACEHOLDER = "mu-relay"
+SEARCH_ROUTE = "__search"
+# The search route's credential is never a real key: the relay injects it. This name is
+# only what the plugin reads, so the instance must hold a placeholder value.
+SEARCH_KEY_ENV = "DSHMU_SEARCH"
 
 # The instance already runs inside our jail + cgroup; DSH's own confinement runner
 # (bwrap, then Landlock) cannot create a namespace there and fails closed, which
@@ -5462,6 +6172,22 @@ def relay_document(st: dict) -> dict:
                     "auth": "" if keyless else relay_auth_type(route),
                     "key": "" if keyless else key,
                 }
+        # web_search is a platform capability: it always goes through the plan picked
+        # by `search_plan()` (hidden plans included), never through the user's own
+        # chat plans. A fixed route id keeps relay.lua unchanged.
+        sp = search_plan(st)
+        if sp is not None:
+            skey = plan_key(sp)
+            for route in plan_routes(sp, user):
+                if str(route.get("api")) != "anthropic-messages":
+                    continue
+                routes[SEARCH_ROUTE] = {
+                    "plan": sp["id"],
+                    "upstream": route["base_url"].rstrip("/"),
+                    "auth": relay_auth_type(route),
+                    "key": skey,
+                }
+                break
         if routes:
             tokens[relay_token(st, name)] = {"instance": name, "routes": routes}
     return {"version": 1, "placeholder": RELAY_PLACEHOLDER, "tokens": tokens}
@@ -5551,8 +6277,12 @@ def plan_probe_usage(plan: dict) -> dict:
 
 
 def set_plan_models(plan: dict, models: list[str], select_all_available: bool = False,
-                    clear: bool = False) -> dict:
-    """Replace the plan's model subset, validated against the provider catalog."""
+                    clear: bool = False, default_model: str | None = None) -> dict:
+    """Replace the plan's model subset (and optionally its default model).
+
+    `default_model` is what a brand-new session starts on (`agent-default-model` in the
+    instance patch), so it must be one of the models this plan actually offers.
+    """
     pkg = plan_package(plan)
     if not pkg:
         return {"ok": False, "error": "plan has no provider package"}
@@ -5575,8 +6305,19 @@ def set_plan_models(plan: dict, models: list[str], select_all_available: bool = 
                         "unusable": unusable}
         chosen = wanted
     plan["models"] = chosen
+    wanted = str(default_model or "").strip()
+    if wanted:
+        offered = [m["id"] for m in (pkg.get("models") or [])]
+        if wanted not in offered:
+            return {"ok": False, "error": "default model is not in this provider",
+                    "unknown": [wanted]}
+        plan["default_model"] = wanted
+    elif default_model is not None and plan.get("default_model"):
+        # explicitly cleared: fall back to the provider's own default
+        plan.pop("default_model", None)
     save_plan(plan)
-    return {"ok": True, "models": chosen, "count": len(chosen)}
+    return {"ok": True, "models": chosen, "count": len(chosen),
+            "default_model": plan.get("default_model") or ""}
 
 
 def plan_routes(plan: dict, user: str) -> list[dict]:
@@ -5639,8 +6380,14 @@ def plan_routes(plan: dict, user: str) -> list[dict]:
                         # instance never learns the model can think (no 推理等级 in
                         # the selector) even when the catalog declares it.
                         "reasoningEfforts": m.get("reasoningEfforts")} for m in rows],
-            "default_model": (plan.get("default_model")
-                              or pkg.get("default_model") or rows[0]["id"]),
+            # A plan's default_model must be one of the models this plan actually
+            # offers, otherwise agent-default-model names a model that is not in the
+            # patch (the harness would then fall back to something arbitrary).
+            "default_model": next(
+                (m for m in (plan.get("default_model"),
+                             pkg.get("default_model"), rows[0]["id"])
+                 if m and any(r["id"] == m for r in rows)),
+                rows[0]["id"]),
             "plan": plan,
         })
     return routes
@@ -5648,6 +6395,7 @@ def plan_routes(plan: dict, user: str) -> list[dict]:
 
 def plans_patch_yaml(user: str, instance: str,
                      default_plan: dict | None = None,
+                     default_model: str = "",
                      relay_token_value: str = "") -> tuple[str, dict]:
     """Render every plan visible to this user as one pi-ai provider per base URL."""
     plans = plans_for_user(user)
@@ -5739,10 +6487,241 @@ def plans_patch_yaml(user: str, instance: str,
                 lines.append("            input: [" +
                              ", ".join(m["inputModalities"]) + "]")
     if default_route:
+        pinned = str(default_model or "").strip()
+        offered = [m["id"] for m in default_route["models"]]
+        if pinned and pinned in offered:
+            start = pinned
+        else:
+            start = default_route["default_model"]
         lines += ["- id: agent-default-model", "  config:",
                   f"    provider: {json.dumps(default_route['route'])}",
-                  f"    model: {json.dumps(default_route['default_model'])}"]
+                  f"    model: {json.dumps(start)}"]
+
+    # The web_search tool has its OWN endpoint and credential (it appends `/messages`
+    # to baseURL). Left alone it reads DEEPSEEK_API_KEY - which under the relay is the
+    # `mu-relay` placeholder - and calls api.deepseek.com directly, so every search
+    # fails with HTTP 401 "your api key ****elay is invalid". Point it at the relay too:
+    # the placeholder goes out, the relay swaps in the plan's real key.
+    lines += render_web_search_patch(routes, relay, relay_token_value)
     return "\n".join(lines) + "\n", credentials
+
+
+def render_web_search_patch(routes: list[dict], relay: bool,
+                            relay_token_value: str) -> list[str]:
+    """Configure (or explicitly disable) the DeepSeek web-search plugin."""
+    wanted = str(load_config().get("web_search_plan") or "")
+    candidates = [r for r in routes if r.get("plan")]
+    # A platform-owned search plan (possibly hidden) wins: it is the operator's way to
+    # let users with no DeepSeek plan search at all.
+    if relay and relay_token_value:
+        sp = search_plan(st={"instances": {}, "config": load_config()})
+        if sp is not None:
+            base = (f"http://127.0.0.1:{int(load_config().get('relay_listen') or 8099)}"
+                    f"/mu-llm/{relay_token_value}/{SEARCH_ROUTE}")
+            return ["- id: web-search-deepseek", "  config:",
+                    f"    baseURL: {json.dumps(base + '/v1')}",
+                    f"    apiKeyEnv: {json.dumps(SEARCH_KEY_ENV)}"]
+    # The plugin speaks the Anthropic Messages dialect: it appends `/messages` to
+    # baseURL. Pointing it at an OpenAI-only gateway (Kilo, most proxies) can only
+    # fail, which is worse than saying "not configured". So: same protocol only.
+    messages = [r for r in candidates if str(r.get("api") or "") == "anthropic-messages"]
+    chosen = None
+    if wanted:
+        chosen = next((r for r in messages if r["plan"]["id"] == wanted), None)
+        if chosen is None and any(r["plan"]["id"] == wanted for r in candidates):
+            # explicitly requested an incompatible plan: refuse rather than silently
+            # search against the wrong protocol
+            return ["- id: web-search-deepseek", "  disabled: true"]
+    if chosen is None:
+        # The plugin is DeepSeek's: its server-side `web_search` tool only exists on
+        # DeepSeek's own endpoint. Guessing another Anthropic-compatible gateway is
+        # exactly the mistake that produced 401 (Kilo) and 403 (opencode) reports, so
+        # only api.deepseek.com is used automatically; anything else must be named
+        # explicitly through `web_search_plan`.
+        chosen = next((r for r in messages
+                       if "api.deepseek.com" in str(r.get("base_url") or "")), None)
+    if chosen is None:
+        # Do NOT disable the plugin: dsh-web's `searchProvider` still names it, and a
+        # disabled plugin is "not registered" - a worse error than anything about keys.
+        # Keep it registered but deliberately unavailable (apiKeyEnv points at a
+        # variable nobody sets): DSH then reports
+        #   configured web provider "deepseek-official" is registered but unavailable
+        # which is the honest, actionable message ("give me a key").
+        base = (f"http://127.0.0.1:{int(load_config().get('relay_listen') or 8099)}"
+                if relay else "https://api.deepseek.com/anthropic")
+        # Keep the provider registered (dsh-web names it) but hide the TOOL, so the agent
+        # never calls it and the user sees no error at all. `tool-web` has separate
+        # switches; web_fetch keeps working.
+        return ["- id: web-search-deepseek", "  config:",
+                f"    baseURL: {json.dumps(base + '/v1')}",
+                "    apiKeyEnv: DSHMU_WEB_SEARCH_UNCONFIGURED",
+                "- id: tool-web", "  config:", "    search: false"]
+    if relay and chosen.get("api_key_env"):
+        # real endpoint shape is <base>/v1/messages; the relay forwards the path as-is
+        base = f"http://127.0.0.1:{int(load_config().get('relay_listen') or 8099)}"
+        lines = [
+            "- id: web-search-deepseek",
+            "  config:",
+            f"    baseURL: {json.dumps(base + '/mu-llm/' + relay_token_value + '/' + chosen['route'] + '/v1')}",
+            f"    apiKeyEnv: {chosen['api_key_env']}",
+        ]
+        return lines
+    if not relay and chosen.get("api_key_env"):
+        base = str(chosen.get("base_url") or "").rstrip("/")
+        lines = ["- id: web-search-deepseek", "  config:",
+                 f"    baseURL: {json.dumps(base + '/v1')}",
+                 f"    apiKeyEnv: {chosen['api_key_env']}"]
+        return lines
+    return ["- id: web-search-deepseek", "  disabled: true"]
+
+
+DEFAULT_CHAIN_KEY = "default_model_chain"
+
+
+def default_chain(cfg: dict) -> list[dict]:
+    """Ordered (plan, model) fallbacks for a new session's starting model.
+
+    Users see different plans, so a single "default plan" cannot serve everyone: the
+    first entry whose plan is visible to that user wins. Stored as JSON text because
+    the config file is a flat key=value list.
+    """
+    raw = str(cfg.get(DEFAULT_CHAIN_KEY) or "").strip()
+    if raw:
+        try:
+            rows = json.loads(raw)
+        except json.JSONDecodeError:
+            rows = []
+        out = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            plan = str(row.get("plan") or "").strip()
+            if not plan:
+                continue
+            # A plan can disappear (deleted, or renamed by an upgrade like
+            # plan_kilo_free -> plan_default). Skipping unknown ids keeps a stale
+            # entry from silently pinning nothing and hiding the real fallback.
+            if load_plan(plan) is None:
+                continue
+            out.append({"plan": plan, "model": str(row.get("model") or "").strip()})
+        if out:
+            return out
+    # No chain configured: fall back to the legacy single default plan.
+    plan = str(cfg.get("default_plan") or "").strip()
+    return [{"plan": plan, "model": ""}] if plan else []
+
+
+def save_default_chain(cfg: dict, rows: list[dict]) -> list[dict]:
+    cleaned = []
+    for row in rows:
+        plan = str(row.get("plan") or "").strip()
+        if not plan:
+            continue
+        if load_plan(plan) is None:
+            raise ValueError(f"no such plan: {plan}")
+        model = str(row.get("model") or "").strip()
+        if model:
+            pkg = plan_package(load_plan(plan))
+            catalog = [m["id"] for m in (pkg or {}).get("models") or []]
+            if model not in catalog:
+                raise ValueError(f"plan {plan} has no model {model}")
+        cleaned.append({"plan": plan, "model": model})
+    cfg[DEFAULT_CHAIN_KEY] = json.dumps(cleaned, ensure_ascii=False) if cleaned else ""
+    cfg["default_plan"] = cleaned[0]["plan"] if cleaned else ""
+    return cleaned
+
+
+def user_default_override(st: dict, user: str) -> dict:
+    """The (plan, model) this user picked for themselves; empty when unset."""
+    row = (st.get("users") or {}).get(user) or {}
+    entry = row.get("default_override") or {}
+    if not isinstance(entry, dict):
+        return {}
+    plan = str(entry.get("plan") or "").strip()
+    if not plan:
+        return {}
+    return {"plan": plan, "model": str(entry.get("model") or "").strip()}
+
+
+def set_user_default_override(st: dict, user: str, plan: str, model: str = "") -> dict:
+    """Validate and store a user's own default. Raises ValueError when unusable."""
+    if user not in (st.get("users") or {}):
+        raise ValueError(f"no such user: {user}")
+    target = load_plan(plan)
+    if target is None:
+        raise ValueError(f"no such plan: {plan}")
+    if not plan_visible_to_user(target, user):
+        raise ValueError(f"plan {plan} is not available to {user}")
+    wanted = str(model or "").strip()
+    if wanted:
+        # Validate against the provider catalog first: a plan with "all models" has an
+        # empty selection, so `plan_effective_models` alone would accept anything.
+        pkg = plan_package(target) or {}
+        catalog = [m["id"] for m in (pkg.get("models") or [])]
+        if catalog and wanted not in catalog:
+            raise ValueError(f"provider {pkg.get('id') or '?'} has no model {wanted}")
+        offered = plan_effective_models(target)
+        if offered and wanted not in offered:
+            raise ValueError(f"plan {plan} does not offer model {wanted}")
+    st["users"][user]["default_override"] = {"plan": plan, "model": wanted,
+                                             "updated_at": int(time.time())}
+    return {"plan": plan, "model": wanted}
+
+
+def clear_user_default_override(st: dict, user: str) -> bool:
+    row = (st.get("users") or {}).get(user)
+    if not row or not row.get("default_override"):
+        return False
+    row.pop("default_override", None)
+    return True
+
+
+def clear_all_user_default_overrides(st: dict) -> list[str]:
+    cleared = []
+    for name, row in (st.get("users") or {}).items():
+        if row.get("default_override"):
+            row.pop("default_override", None)
+            cleared.append(name)
+    return cleared
+
+
+def users_with_default_override(st: dict) -> list[dict]:
+    rows = []
+    for name, row in sorted((st.get("users") or {}).items()):
+        entry = row.get("default_override") or {}
+        if isinstance(entry, dict) and entry.get("plan"):
+            plan = load_plan(entry["plan"]) or {}
+            rows.append({"user": name, "plan": entry["plan"],
+                         "plan_name": plan.get("name") or entry["plan"],
+                         "model": entry.get("model") or ""})
+    return rows
+
+
+def _with_user_override(st: dict, user: str) -> dict:
+    """Config view whose chain starts with the user's own pick (or is empty)."""
+    override = user_default_override(st, user)
+    if not override:
+        return {"default_model_chain": ""}
+    return {"default_model_chain": json.dumps([override])}
+
+
+def resolve_default_route(routes: list[dict], cfg: dict) -> dict | None:
+    """Pick the starting route for one user: first chain entry that is usable."""
+    chain = default_chain(cfg)
+    for entry in chain:
+        for route in routes:
+            plan = route.get("plan") or {}
+            if plan.get("id") != entry["plan"]:
+                continue
+            offered = [m["id"] for m in route["models"]]
+            if not offered:
+                break
+            if not entry["model"]:
+                return route
+            if entry["model"] in offered:
+                return dict(route, default_model=entry["model"])
+            break
+    return None
 
 
 def sync_instance_plans(st: dict, name: str) -> dict:
@@ -5765,8 +6744,19 @@ def sync_instance_plans(st: dict, name: str) -> dict:
             with contextlib.suppress(OSError):
                 write_instance_refs(cred_path, {}, int(inst.get("uid", 0)))
         return {"plans": 0, "patch": None}
-    default_id = str(st["config"].get("default_plan") or "")
-    default = next((p for p in plans if p["id"] == default_id), None)
+    # The starting model comes from the priority chain (first entry this user can see);
+    # the legacy `default_plan` is only the first entry of that chain.
+    routes_for_user = [r for plan in plans for r in plan_routes(plan, user)]
+    # A user's own pick outranks the operator's chain: they know what they want to
+    # start on. Re-validated here because plans can vanish or lose models; if the
+    # user's pick no longer works we fall through to the operator's chain.
+    chosen = resolve_default_route(routes_for_user, _with_user_override(st, user))
+    if chosen is None:
+        chosen = resolve_default_route(routes_for_user, st["config"])
+    default = (chosen or {}).get("plan")
+    if default is None:
+        default_id = str(st["config"].get("default_plan") or "")
+        default = next((p for p in plans if p["id"] == default_id), None)
     if default is None and plans:
         default = sorted(plans, key=lambda p: str(p.get("name") or p["id"]))[0]
     # Mint the relay token on *this* state object before rendering; the renderer
@@ -5775,8 +6765,15 @@ def sync_instance_plans(st: dict, name: str) -> dict:
     token = ensure_relay_token(st, name) if relay else ""
     if relay:
         save_state(st)
+    if chosen and not chosen.get("default_model"):
+        chosen = None          # nothing pinned: let the renderer use the plan default
     yaml, credentials = plans_patch_yaml(user, name, default_plan=default,
+                                         default_model=(chosen or {}).get("default_model", ""),
                                          relay_token_value=token)
+    if relay and search_plan(st) is not None:
+        # web_search goes through the fixed `__search` relay route; the plugin still
+        # wants an env value, and the relay replaces whatever we put here.
+        credentials.setdefault(SEARCH_KEY_ENV, RELAY_PLACEHOLDER)
     if default:
         # Compatibility: conversations created before the plans existed still name
         # `deepseek-official`. With the relay on, that route also gets the
@@ -6192,7 +7189,7 @@ def cmd_plan(args):
             print("no plans yet (dsh-muctl plan add --name ... --provider ... --key-file ...)")
             return 0
         default = str(st["config"].get("default_plan") or "")
-        for pid, plan in sorted(plans.items(), key=lambda kv: str(kv[1].get("name") or kv[0])):
+        for pid, plan in sorted(plans.items(), key=lambda kv: plan_order_key(kv[1])):
             scope = "团队" if str(plan.get("owner") or "*") == "*" else f"个人:{plan['owner']}"
             mark = " *默认" if pid == default else ""
             print(f"{pid:18} {str(plan.get('name') or ''):24} {plan.get('provider',''):16} "
@@ -6207,6 +7204,12 @@ def cmd_plan(args):
         if not pkg:
             die(f"no such provider: {args.provider} (dsh-muctl provider list)")
         pid = plan_id_for(args.name)
+        existing = load_plan(pid)
+        if existing and not getattr(args, "replace", False):
+            die(f"a plan with this id already exists: {pid} "
+                f"({existing.get('name')} → {existing.get('provider')})\n"
+                f"  ids are derived from the name, so the same name = the same plan;\n"
+                f"  pick another name, or pass --replace to overwrite it")
         owner = str(args.user or "*")
         visible = [v.strip() for v in (args.visible or "").replace(",", " ").split() if v.strip()]
         if owner != "*" and not visible:
@@ -6225,6 +7228,7 @@ def cmd_plan(args):
             die("plan add needs a credential: --key-file <file> or --key <key>")
         plan = {"schema": PLAN_SCHEMA, "id": pid, "name": args.name.strip(),
                 "provider": args.provider, "owner": owner,
+                **({"order": int(args.order)} if getattr(args, "order", None) is not None else {}),
                 "visible_to": visible or ["*"], "enabled": True,
                 "models": models, "default_model": args.model or ""}
         saved = save_plan(plan, key=key)
@@ -6241,6 +7245,9 @@ def cmd_plan(args):
         if not args.id:
             die("plan rm needs the plan id")
         plan = load_plan(args.id) or die(f"no such plan: {args.id}")
+        if str(plan.get("id")) == DEFAULT_PLAN_ID:
+            die(f"{DEFAULT_PLAN_ID} is the built-in fallback plan: it cannot be deleted "
+                f"(disable it instead with `dsh-muctl plan disable {DEFAULT_PLAN_ID}`)")
         with contextlib.suppress(OSError):
             os.unlink(f"{PLANS_DIR}/{args.id}.json")
         with contextlib.suppress(OSError):
@@ -6278,6 +7285,29 @@ def cmd_plan(args):
         sync_all(st)
         info(f"plan {args.id} ({plan.get('name')}): credential rotated "
              f"(…{key[-4:]}); restart the instances that use it")
+        return 0
+    if action in ("hide", "show", "order"):
+        if not args.id:
+            die(f"plan {action} needs the plan id")
+        plan = load_plan(args.id) or die(f"no such plan: {args.id}")
+        if action in ("hide", "show"):
+            plan["hidden"] = action == "hide"
+        else:
+            fallback = getattr(args, "policy", "")
+            raw = str(args.order if args.order is not None else fallback or "").strip()
+            if not raw.lstrip("-").isdigit():
+                die("usage: dsh-muctl plan order <plan-id> --order <number>   "
+                    "(lower = earlier; also the display order users see)")
+            plan["order"] = int(raw)
+        save_plan(plan)
+        sync_all(st)
+        if action == "hide":
+            info(f"plan {args.id} is now hidden (users cannot see or select it; "
+                 f"web_search may still use it)")
+        elif action == "show":
+            info(f"plan {args.id} is visible again")
+        else:
+            info(f"plan {args.id}: order = {plan['order']}")
         return 0
     if action == "default":
         if not args.id:
@@ -6349,6 +7379,20 @@ def cmd_plan(args):
             info(f"{window.get('name') or window.get('id')}: "
                  f"{window.get('remaining')}/{window.get('limit')} remaining")
         return 0
+    if action == "default-model":
+        if not args.id:
+            die("plan default-model needs the plan id")
+        plan = load_plan(args.id) or die(f"no such plan: {args.id}")
+        model = str(args.model or "").strip()
+        if not model:
+            die("usage: dsh-muctl plan default-model <plan-id> <model-id>")
+        res = set_plan_models(plan, plan.get("models") or [], default_model=model)
+        if not res.get("ok"):
+            die(res.get("error") or "could not set the default model")
+        info(f"plan {args.id}: default model = {model}")
+        info("new sessions start on it; restart running instances to apply: "
+             "dsh-muctl instance restart <name>")
+        return 0
     if action == "sync":
         for name in st["instances"]:
             res = sync_instance_plans(st, name)
@@ -6408,6 +7452,206 @@ def cmd_template(args):
         info("restart the instances that will use the new plan")
         return 0
     die(f"unknown template action: {action}")
+
+
+def cmd_egress(args):
+    """Inspect and edit the per-instance egress policy (nftables, cgroup-matched)."""
+    ensure_root()
+    st = load_state()
+    action = args.action
+
+    def save_and_apply(note: str):
+        save_state(st)
+        res = apply_egress(st, quiet=False)
+        if res.get("error"):
+            die(f"nft rejected the rules: {res['error'][:300]}")
+        info(note)
+
+    def fmt(rules: list[dict]) -> str:
+        return ", ".join(r["text"] for r in rules) or "(none)"
+
+    if action == "show":
+        info("new-instance default : " + str(st["config"].get("instance_egress") or "no-intranet"))
+        info("rules for ALL         : " + fmt(global_egress_allow(st)))
+        if args.json:
+            rows = []
+            for name in sorted(st["instances"]):
+                policy, allow = instance_egress(st, name)
+                own = [r["text"] for r in parse_egress_allow(
+                    (st["instances"][name] or {}).get("egress_allow") or [])]
+                rows.append({"instance": name, "policy": policy,
+                             "allow": [r["text"] for r in allow], "own": own,
+                             "port": int((st["instances"][name] or {}).get("port") or 0)})
+            print(json.dumps({"default": st["config"].get("instance_egress"),
+                              "all": [r["text"] for r in global_egress_allow(st)],
+                              "instances": rows, "nft": nft_available(),
+                              "rules_file": EGRESS_NFT}, indent=2, ensure_ascii=False))
+            return 0
+        for name in sorted(st["instances"]):
+            policy, allow = instance_egress(st, name)
+            info(f"  {name:12} {policy:12} allow=" + fmt(allow))
+        info("nft installed: " + ("yes" if nft_available() else "NO (apk add nftables)"))
+        info("rules file   : " + EGRESS_NFT)
+        return 0
+
+    if action == "set":
+        if not args.policy:
+            die("usage: dsh-muctl egress set open|no-intranet|allowlist")
+        policy = args.policy.strip().lower()
+        if policy not in EGRESS_POLICIES:
+            die(f"unknown policy {policy!r} (open | no-intranet | allowlist)")
+        st["config"]["instance_egress"] = policy
+        save_and_apply(f"new-instance default egress = {policy}")
+        return 0
+
+    if action in ("allow", "allow-add", "allow-rm"):
+        if not args.allow:
+            die("usage: dsh-muctl egress allow|allow-add|allow-rm --allow "
+                "'10.0.0.0-10.0.0.9:10000-11000'   (规则作用于全部实例)")
+        try:
+            new = parse_egress_allow(args.allow)
+        except ValueError as exc:
+            die(str(exc))
+        current = global_egress_allow(st)
+        if action == "allow":
+            merged = new
+        elif action == "allow-add":
+            have = {r["text"] for r in current}
+            merged = current + [r for r in new if r["text"] not in have]
+        else:
+            drop = {r["text"] for r in new}
+            merged = [r for r in current if r["text"] not in drop]
+        st["config"]["instance_egress_allow"] = ", ".join(r["text"] for r in merged)
+        save_and_apply("rules for ALL instances: " + fmt(merged))
+        return 0
+
+    if action == "instance":
+        name = args.name or ""
+        if name in ("all", "__all__", "*"):
+            # same list, exposed under the same name the page uses
+            return cmd_egress(argparse.Namespace(action="allow-add", policy=None,
+                                                 name=None, allow=args.allow,
+                                                 reset=False, json=False))
+        if name not in st["instances"]:
+            die(f"no such instance: {name}")
+        inst = st["instances"][name]
+        if args.reset:
+            inst.pop("egress", None)
+            inst.pop("egress_allow", None)
+            save_and_apply(f"{name}: back to the default policy")
+            return 0
+        if args.policy:
+            policy = args.policy.strip().lower()
+            if policy not in EGRESS_POLICIES:
+                die(f"unknown policy {policy!r} (open | no-intranet | allowlist)")
+            inst["egress"] = policy
+        if args.allow is not None:
+            try:
+                inst["egress_allow"] = [r["text"] for r in parse_egress_allow(args.allow)]
+            except ValueError as exc:
+                die(str(exc))
+        policy, allow = instance_egress(st, name)
+        save_and_apply(f"{name}: policy={policy} allow=" + fmt(allow))
+        return 0
+    die(f"unknown egress action: {action}")
+
+
+def cmd_default(args):
+    """Inspect and edit the priority chain that decides a new session's model."""
+    ensure_root()
+    st = load_state()
+    cfg = load_config()
+    action = args.action
+    chain = default_chain(cfg)
+    if action in ("user-set", "user-clear"):
+        if not args.plan and action == "user-set":
+            die("usage: dsh-muctl default user-set <user> <plan-id> [--model <model-id>]")
+        if action == "user-set":
+            user = str(args.plan or "").strip()
+            plan_id = str(args.id or "").strip()
+            if not plan_id:
+                die("usage: dsh-muctl default user-set <user> <plan-id> [--model <model-id>]")
+            try:
+                saved = set_user_default_override(st, user, plan_id, args.model or "")
+            except ValueError as exc:
+                die(str(exc))
+            save_state(st)
+            sync_all(st)
+            info(f"{user} 的个人默认: {plan_id} / {saved['model'] or '套餐默认'} "
+                 f"(优先于平台默认链；重启实例后生效)")
+            return 0
+        if getattr(args, "all", False):
+            cleared = clear_all_user_default_overrides(st)
+            save_state(st)
+            sync_all(st)
+            info(f"已清除 {len(cleared)} 个用户的个人默认"
+                 + (": " + ", ".join(cleared) if cleared else ""))
+            return 0
+        user = str(args.plan or "").strip()
+        if not user:
+            die("usage: dsh-muctl default user-clear <user>   (or --all)")
+        if clear_user_default_override(st, user):
+            save_state(st)
+            sync_all(st)
+            info(f"{user} 的个人默认已清除（回到平台默认链）")
+        else:
+            info(f"{user} 没有个人默认")
+        return 0
+    if action in ("list", "show"):
+        if args.plan in (None, ""):
+            overrides = users_with_default_override(st)
+            if overrides:
+                info("用户个人默认（优先于下面的链）:")
+                for row in overrides:
+                    info(f"  {row['user']:12} {row['plan_name']} [{row['plan']}] -> "
+                         f"{row['model'] or '(套餐默认)'}")
+            else:
+                info("没有用户设置个人默认")
+            info("")
+        if not chain:
+            info("no default chain configured; new sessions use the first visible plan")
+            return 0
+        for index, row in enumerate(chain, 1):
+            plan = load_plan(row["plan"]) or {}
+            model = row["model"] or (plan.get("default_model") or "(套餐默认)")
+            name = plan.get("name") or row["plan"]
+            info(f"  {index}. {name} [{row['plan']}] -> {model}")
+        info("first entry whose plan a user can see wins")
+        return 0
+    if action in ("add", "set"):
+        if not args.plan:
+            die("usage: dsh-muctl default add <plan-id> [--model <model-id>]")
+        entry = {"plan": args.plan, "model": args.model or ""}
+        rows = (chain + [entry]) if action == "add" else [entry]
+        try:
+            cleaned = save_default_chain(cfg, rows)
+        except ValueError as exc:
+            die(str(exc))
+        save_config(cfg)
+        info("default chain: " + " → ".join(f"{r['plan']}/{r['model'] or '默认'}" for r in cleaned))
+        info("apply with: dsh-muctl sync && dsh-muctl instance restart <name>")
+        return 0
+    if action in ("rm", "delete"):
+        if not args.plan:
+            die("usage: dsh-muctl default rm <plan-id|index>")
+        rows = list(chain)
+        target = str(args.plan)
+        removed = False
+        if target.isdigit() and 1 <= int(target) <= len(rows):
+            rows.pop(int(target) - 1)
+            removed = True
+        else:
+            rows = [r for r in rows if r["plan"] != target]
+            removed = len(rows) != len(chain)
+        if not removed:
+            die(f"not in the default chain: {target}")
+        cleaned = save_default_chain(cfg, rows)
+        save_config(cfg)
+        info("default chain: " + (" → ".join(f"{r['plan']}/{r['model'] or '默认'}" for r in cleaned)
+                                  if cleaned else "(empty)"))
+        info("apply with: dsh-muctl sync && dsh-muctl instance restart <name>")
+        return 0
+    die(f"unknown default action: {action}")
 
 
 def cmd_mount(args):
@@ -6936,6 +8180,50 @@ def doctor_checks(st: dict) -> list[dict]:
                     f"host path is missing: {row['host']}",
                     f"recreate it, or drop the mount (dsh-muctl mount rm {row['host']} "
                     f"--instance {inst_name})")
+
+    # ------------------------------------------------------------- web search plan
+    sp = search_plan(st)
+    if sp is None:
+        add("web search plan", DOCTOR_WARN,
+            "no search-capable plan (needs api.deepseek.com + anthropic-messages)",
+            "add a DeepSeek plan and mark it hidden if it is platform-owned")
+    else:
+        add("web search plan", DOCTOR_PASS,
+            f"{sp.get('name') or sp['id']} (order={sp.get('order')}"
+            + (", hidden" if sp.get("hidden") else "") + ")")
+
+    # ------------------------------------------------------------------- egress
+    policy = str(cfg.get("instance_egress") or "no-intranet")
+    enforced = [n for n in st["instances"] if instance_egress(st, n)[0] != "open"]
+    if policy == "open" and not enforced:
+        add("egress policy", DOCTOR_PASS, "open: instances may reach the intranet")
+    elif not nft_available():
+        add("egress nft", DOCTOR_WARN, "nft is not installed, the policy is not enforced",
+            "apk add nftables && dsh-muctl sync")
+    else:
+        probed = run(["nft", "list", "table", "inet", "dshmu"], check=False, capture=True)
+        if probed.returncode != 0:
+            add("egress rules", DOCTOR_WARN,
+                f"policy={policy} but no nft table is loaded",
+                "dsh-muctl sync   (re-applies the table)")
+        else:
+            missing = [n for n in enforced
+                       if f"jump {_nft_chain(n)}" not in (probed.stdout or "")]
+            if missing:
+                add("egress rules", DOCTOR_WARN,
+                    "no chain for: " + ", ".join(missing), "dsh-muctl sync")
+            else:
+                add("egress rules", DOCTOR_PASS,
+                    f"policy={policy}, {len(enforced)} instance(s) enforced")
+
+    # ------------------------------------------------------- gateway lua freshness
+    stale = stale_lua_files()
+    if not stale:
+        add("gateway lua", DOCTOR_PASS, "workers are running the installed Lua")
+    else:
+        add("gateway lua", DOCTOR_WARN,
+            "stale after upgrade: " + ", ".join(os.path.basename(p) for p in stale),
+            "dsh-muctl sync   (reloads the gateway when a shipped .lua is newer)")
 
     # ------------------------------------------------------------------ state
     if os.path.exists(STATE_PATH):
@@ -7707,8 +8995,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="with `models --refresh`: probe each new model to learn its protocol")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_provider)
-    sp = sub.add_parser("plugin", help="curated plugin catalog (what users may install)")
-    sp.add_argument("action", choices=["list", "add", "remove"])
+    sp = sub.add_parser("plugin", help="plugin policy: protected (cannot be removed) / mandatory (always installed)")
+    sp.add_argument("action", choices=["policy", "protect", "unprotect", "require", "unrequire",
+                                       "list", "add", "remove"])
+    sp.add_argument("--policy-action", dest="policy_action", default="",
+                    help="internal")
     sp.add_argument("pkg", nargs="?", help="npm package name, e.g. @scope/dsh-plugin-x")
     sp.add_argument("--version", help="pin a version (default: latest)")
     sp.add_argument("--note", help="one line shown in the panel")
@@ -7716,8 +9007,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_plugin)
     sp = sub.add_parser("plan", help="model plans: provider + credential + display name")
     sp.add_argument("action", choices=["list", "add", "rm", "delete", "enable", "disable",
-                                       "default", "show", "sync", "key",
-                                       "probe", "models", "usage"])
+                                       "default", "show", "sync", "key", "hide", "show",
+                                       "order", "probe", "models", "usage", "default-model"])
     sp.add_argument("--set", help="comma separated model ids (plan models)")
     sp.add_argument("--all", action="store_true", help="select every model the key can use")
     sp.add_argument("--clear", action="store_true", help="clear the model selection")
@@ -7726,6 +9017,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--provider", help="provider id (an imported package or a preset)")
     sp.add_argument("--user", help="owner username; omit for a team plan")
     sp.add_argument("--visible", help="comma/space separated users a team plan is visible to")
+    sp.add_argument("--replace", action="store_true",
+                    help="overwrite an existing plan with the same name (plan add)")
+    sp.add_argument("--order", type=int, help="sort/priority number (plan order)")
     sp.add_argument("--models", help="restrict the plan to these model ids (all by default)")
     sp.add_argument("--model", help="default model id for this plan")
     sp.add_argument("--key-file", dest="key_file", help="file containing the credential")
@@ -7733,6 +9027,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--default", action="store_true", help="make this team plan the default")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_plan)
+    sp = sub.add_parser("egress", help="per-instance egress policy (nftables, cgroup-matched)")
+    sp.add_argument("action", choices=["show", "set", "allow", "allow-add", "allow-rm", "instance"])
+    sp.add_argument("policy", nargs="?", help="open | no-intranet | allowlist")
+    sp.add_argument("name", nargs="?", help="instance name (egress instance)")
+    sp.add_argument("--allow", help="allowlist entries, e.g. 10.1.2.3:443,192.168.5.0/24")
+    sp.add_argument("--reset", action="store_true", help="drop the per-instance override")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_egress)
+    sp = sub.add_parser("default", help="priority chain for the starting model (plan + model)")
+    sp.add_argument("action", choices=["list", "show", "add", "set", "rm", "delete",
+                                       "user-set", "user-clear"])
+    sp.add_argument("plan", nargs="?", help="plan id (or an index for rm)")
+    sp.add_argument("--model", help="model id to pin for that plan")
+    sp.set_defaults(func=cmd_default)
     sp = sub.add_parser("template", help="import provider templates from the project repo")
     sp.add_argument("action", choices=["list", "import", "source"])
     sp.add_argument("name", nargs="?", help="template name (without .json)")

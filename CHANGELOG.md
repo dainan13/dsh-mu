@@ -1,5 +1,562 @@
 # CHANGELOG
 
+> **关于版本号**：`0.16.1` / `0.18.2` / `0.18.3` / `0.18.5` 是当天连续排障时的**中间构建** ✓，
+> 它们的修复已合并进相邻条目（`0.16.0`、`0.18.1`、`0.18.4`）✓，没有单独记 ✓。
+> 当前版本见 `VERSION` 文件 ✓。
+
+## 0.21.1（`plan order` 的用法提示）
+
+- `dsh-muctl plan order <id> 20` 会被 argparse 拒 ✗ —— 顺序是 `--order` 选项 ✓；
+  现在提示直接写成 `plan order <plan-id> --order <number>` ✓，并说明"越小越靠前，也就是用户看到的顺序" ✓。
+- 顺带修掉一个 AttributeError ✓：`plan order` 的兜底读了 `args.policy` ✓，而 `plan` 子命令没有这个属性 ✗
+  （只有 `egress` 有 ✓）→ 用 `getattr(args, "policy", "")` ✓。
+- 另外说明一个重要现象 ✓：**把平台搜索套餐删掉之后 `doctor` 会 WARN（web search plan）** ✓ ——
+  这是故意的 ✓（没有可用搜索套餐时应当可见 ✓），加一个隐藏的 DeepSeek 套餐就会恢复 PASS ✓。
+
+## 0.21.0（套餐加「隐藏」与「顺序」；web_search 用平台套餐）
+
+按讨论落地 ✓：搜索变成**平台能力** ✓，不再依赖用户自己的官网套餐 ✓。
+
+- **套餐新增两个字段** ✓：
+  - `hidden`：用户**看不到、选不到**（不进抽屉、不进模型选择器、不进默认链 ✓），
+    但平台内部**仍然能用它跑 web_search** ✓；
+  - `order`：数字，越小越靠前 ✓ —— 同时决定 **① 抽屉展示顺序 ✓ ② web_search 用哪个套餐** ✓；
+    **不影响默认模型** ✓（默认模型只由「默认模型（按优先级）」那条链决定 ✓）；
+- **搜索选择规则**（`search_plan()`）✓：按 `order` 取**第一个能跑 DeepSeek 搜索**的套餐
+  （`api=anthropic-messages` 且 `base_url` 指向 `api.deepseek.com` ✓，**含隐藏套餐** ✓）；
+- **relay 新增固定路由 `__search`** ✓：每个实例的 `relay.json` 里多一条 `__search` ✓，
+  指向上面那个套餐 ✓ —— 于是 patch 里可以写成
+  `/mu-llm/<token>/__search/v1` ✓，**relay.lua 不用改** ✓，用户也拿不到套餐 route ✓；
+  对应的凭据占位符是 `DSHMU_SEARCH` ✓（真实 key 永不进 jail ✓）；
+- 没有平台搜索套餐时，行为回退到原来的"用户自己的官网 DeepSeek" ✓，再没有就"注册但不可用 + 隐藏 tool-web.search" ✓；
+- 后台「套餐」表：新增「顺序」列（↑↓ 一键重排 ✓，自动写成 10/20/30… ✓）和「隐藏 / 取消隐藏」✓，
+  隐藏行淡显 + 徽章 ✓；表格上方显示 **当前搜索将使用：<套餐>** ✓（把隐式关系变可见 ✓）；
+- CLI：`dsh-muctl plan hide|show <id>` ✓、`plan order <id> <n>` ✓、`plan add --order N` ✓；
+- `doctor` 新增 **web search plan** 检查 ✓（没有可用套餐时 WARN ✓）；
+- 说明：隐藏套餐 = **平台买单的共享资源** ✓（本项目是给小型团队用的 ✓，不打算就别加隐藏套餐 ✓）。
+
+## 0.20.7（出网状态列恢复，但只读）
+
+- 0.20.5 我把「出网」列整个删掉了 ✗ —— 我的理解偏了 ✓：要的是**不能改**，不是**看不见** ✓；
+- 现在这列回来了 ✓，但渲染成**只读徽章**（`禁内网` / `全限制` / `不限制`）✓，
+  有本实例例外时后面跟 `+N` ✓，悬停显示例外清单 ✓；**没有下拉、不能改** ✓；
+- 修改入口仍然只有实例行的「配置」✓（一处能改 ✓，一处能看 ✓）。
+
+## 0.20.6（特殊规则也改成"先按钮后弹窗"）
+
+- 「出网特殊规则」卡片原来把表单**平铺**在页面上 ✗（实例下拉 + 目标输入 + 添加按钮 ✓），
+  违反我们自己的 UI 约定 ✓；现在是：卡片只有一张规则表 + 一个「＋ 添加规则」按钮 ✓，
+  点开**弹窗**（实例 / 目标 / 语法提示 ✓）→ 点「添加」才提交 ✓，成功自动关闭 ✓；
+- 卡片说明里的过时文案也改了 ✓：「每个实例的策略在那一行的**配置**里选」✓（原来写"表格的「出网」列"✗）；
+- 顺带删掉卡片里多余的"备注"输入 ✗（它从来没被保存过 ✓）。
+
+## 0.20.5（出网只能在「配置」里改；配置里不再增删特殊规则）
+
+- 实例表格**去掉「出网」列** ✓ —— 策略只在「配置」弹窗里选 ✓（页面上只有一个入口 ✓）；
+- 「配置」里的出网段**只留下策略下拉** ✓：去掉了"例外目标"输入框与「添加」按钮 ✓，
+  也去掉了每条规则的「删除」✓ —— 现在只显示一行提示：
+  `当前放行：…（在下面「出网特殊规则」里增减 ✓）` ✓；
+- 特殊规则**统一在实例页下方的「出网特殊规则」卡片里维护** ✓（含「全部实例」✓），
+  一处新增、一处删除 ✓，不再两处都能改 ✓；
+- 顺带清掉因此不再使用的 `egressCell()` / `setInstanceEgress()` / `addConfigRule()` ✓。
+
+## 0.20.4（实例操作列重做：图标 + 一个「配置」）
+
+- **删掉 `provider`** ✓：它写了 `inst["provider"]` ✓，但 `sync_instance_plans()` 会用套餐**整份重写** patch ✓ →
+  除了网关里一个只用来展示的字段 ✓，它**不影响实例实际用哪个模型** ✗（上一轮删掉那张表时漏了这个入口 ✓）。
+  `POST /api/instances/<n>/provider` 端点与 `editProvider()` 一并移除 ✓（宿主机仍留 `dsh-muctl instance provider` 做排障 ✓）；
+- **操作列改为图标 + 少量文字** ✓：
+
+  | 按钮 | 含义 |
+  |---|---|
+  | `▶` | 启动（仅在未运行时出现） |
+  | `🛑` | 停止（仅在运行时出现） |
+  | `⟳` | 重启（按钮上显示进度秒数） |
+  | `🔑` | 重建登录态（原 refresh-cookie，页面打不开时用） |
+  | `日志` | 跳到「实例日志」页并载入该实例 |
+  | `配置` | 弹窗：限额 + 出网策略 + 本实例例外 + 清个人默认 |
+  | `删除` | 不变 |
+
+  图标都带 `title` 与 `aria-label` ✓（悬停即见中文说明 ✓）；
+- **「配置」把这些合成一个弹窗** ✓：CPU/内存/进程数/端口 ✓、出网策略三选一 ✓、
+  本实例例外目标（可增删 ✓）、以及「清除该用户的个人默认」✓ —— 原来分散的「限额」「出网」「清默认」入口都收进来了 ✓。
+
+## 0.20.3（重启后 refresh-cookie 取不到 token）
+
+- `wait_for_banner()` 只读当前日志 ✓，而 logrotate 是 `copytruncate` + 留 4 份 ✓ ——
+  实例重启后 banner 常常落在 `.log.1` 里 ✗ → 报 "no live launch token found" ✗；
+- 现在依次读 `.log`、`.log.1..4`、`.log.gz` ✓（实测这条老毛病会让人以为实例挂了 ✓）。
+
+## 0.20.2（"全部实例"规则没存住）
+
+- 后端把共享规则写进了 `st["config"]` ✗ —— 那是内存里的快照 ✓，配置真正的落点是
+  `/etc/dsh-mu/dsh-mu.conf` ✓ → 没调 `save_config()` ✗ → 返回 200 但读回来是空 ✗；
+- 已补 `mu.save_config(st_e["config"])` ✓；`egress allow-*` 缺参数时的提示也改清楚 ✓。
+
+## 0.20.1（特殊规则：支持"全部实例"与地址/端口区间）
+
+- **全部实例** ✓：目标可以挂到一个共享清单上 ✓（存在 `INSTANCE_EGRESS_ALLOW` ✓），
+  渲染时**并入每个实例**的链 ✓ —— 有自己规则的实例也照样继承它 ✓（不再互相覆盖 ✗）；
+  UI 的实例下拉第一项就是「全部实例」✓，规则表里显示为「全部实例 / 所有实例」✓；
+  CLI：`dsh-muctl egress allow 10.0.0.0-10.0.0.9:10000-11000` ✓（`allow`/`allow-add`/`allow-rm` ✓），
+  `egress instance all --allow …` 也可 ✓；
+- **区间** ✓：目标支持 `ip` / `ip/24` / `ip1-ip2` ✓，每种都能带 `:443` 或 `:10000-11000` ✓，
+  例：`192.168.5.0-192.168.5.100:10000-11000` ✓（IPv4/IPv6 都行 ✓，IPv6 带端口写
+  `[2001:db8::1]:443` ✓）；
+- 解析改用标准库 `ipaddress` ✓（之前的正则会把 `abc` 当 IPv6 ✗、把 `2001:db8::1` 的
+  末段当端口 ✗），现在会校验地址/网段/区间方向/端口范围 ✓，反向区间与 `0.0.0.0/0` 都会被拒 ✓。
+
+## 0.20.0（出网策略改成"实例属性 + 特殊规则清单"）
+
+按讨论重做交互 ✓ —— 之前是"一张大卡片里全局策略 + 每实例覆盖 + 白名单输入框" ✗，
+把两种不同的东西混在一起了 ✓。
+
+- **策略归到实例**：实例表格新增「出网」列 ✓，每行一个下拉 ✓：
+  **全限制 / 禁内网 / 不限制** ✓（`allowlist` / `no-intranet` / `open` ✓），改完立即生效 ✓；
+- **特殊规则单独成一张清单** ✓：一行 = 一个实例 + 一个放行目标 + 备注 ✓，可增可删 ✓；
+  语义随策略变化 ✓：
+  - 实例选**全限制** → 清单就是"**只允许这些**" ✓（外加自身端口 / relay / DNS ✓）；
+  - 实例选**禁内网** → 公网自由 ✓、内网默认拒 ✓，清单里的目标**例外放行** ✓；
+  - 实例选**不限制** → 清单不生效 ✓；
+- 新实例的默认值仍然来自 `INSTANCE_EGRESS`（页面上标出"新实例默认：禁内网"）✓；
+- API：`GET /api/egress` 多返回 `labels` ✓；`POST` 只改策略时**不会清空**该实例已有的特殊规则 ✓；
+- CLI 不变（`egress set` 改默认 ✓、`egress instance <n> <policy> --allow …` 改单个 ✓）。
+
+## 0.19.4（受保护：路径拼接再修 + 不再越权安装）
+
+- `protected_paths()` 拼宿主路径时漏了 `node_modules` ✗ →
+  `<home>/.dsh/profiles/web/<pkg>` ✗ → 永远判为"不存在" ✗ → `RO_PATHS` 恒为空 ✗ →
+  只读挂载**根本没生效** ✓（`pnpm remove` 照样能删 ✓，实测 ✓）；
+  现在用 `instance_home + (jail路径去掉 /home/dsh 前缀)` ✓；
+- 0.19.3 让 `protected` 也"缺了就重装" ✗ —— 结果**给每个实例都装上了** ✗（bob 也中招 ✗）；
+  已收回：只有 **`mandatory`** 会安装 ✓，`protected` 只保护已存在的 ✓，
+  若发现"受保护但文件不在了"则打 WARNING 提示改用强制安装 ✓。
+
+## 0.19.3（受保护插件若已被删，要能重装回来）
+
+- 追查发现真正的原因不是路径 ✗：**DSH 启动时会按 `package.json` 裁剪 `node_modules`** ✓ ——
+  用户"卸载"后清单里没有它 ✓，下次启动这些文件就被 pnpm 删掉了 ✗；
+- 所以只"补清单"不够 ✓：现在 `protected` 和 `mandatory` 一样，**缺了就重装** ✓
+  （`install_mandatory_plugins()` 同时覆盖两者 ✓），顺序仍是"先补齐 → 再对账清单" ✓；
+- 完整闭环因此变成：用户卸载 → 只读挂载让 pnpm 删不掉 ✓ → `sync` 补清单 ✓ →
+  重启后插件照常加载 ✓；万一文件真被删了（比如保护还没挂上时）→ `sync` 重装 ✓。
+
+## 0.19.2（受保护插件：路径前缀用错，自愈与只读挂载其实都没生效）
+
+- `installed_package_dirs()` 和 `protected_paths()` 都拼成
+  `instances/<n>/rootfs/home/dsh/.dsh/profiles/…` ✗ —— 但实例的 profile 在
+  `instances/<n>/home/.dsh/profiles/…` ✓（`rootfs` 只是模板 ✓，`home` 是运行时绑进去的 ✓）；
+- 后果：自愈一次都没跑过 ✗（"看起来没有已装包"→ 直接跳过 ✓），只读挂载也只在
+  `RO_PATHS` 恰好非空的那一版偶然生效过 ✓；
+- 现在两者都用 `instance_home()` ✓。jail 侧不用改 ✓（那边 `$ROOTFS/home/dsh` 已经是绑定后的目录 ✓）。
+
+## 0.19.1（插件策略三处修正）
+
+- **自愈失效** ✗：`reconcile_protected_plugins` 用 `instance_plugins()`（= 读 package.json 依赖）
+  判断"这个包装了没有"✓ —— 而卸载恰恰就是改这个文件 ✗ → 判定为"没装" → 直接跳过 ✗，
+  自愈形同虚设 ✗。改为**看 `node_modules` 里的真实目录** ✓（`installed_package_dirs()` ✓），
+  `mandatory` 的安装判断也一起换掉 ✓；
+- `dsh-muctl plugin policy`（不带子命令）会报 "needs a package name" ✗ —— `policy` 没被当成"列出" ✓，已修 ✓；
+- `RO_PATHS` 原来给**所有**实例都导出受保护包路径 ✓，没装它的实例会在 jail 日志里刷
+  `protected path missing` ✗；现在只导出**实际存在**的目录 ✓。
+
+## 0.19.0（jail 加固产品化：出网策略 + 去掉 sys_admin + 插件策略；抽屉/后台的插件管理下线）
+
+### 1. 出网策略（nftables，按 cgroup 匹配）
+- 新配置：`INSTANCE_EGRESS`（`open` / **`no-intranet`（默认）** / `allowlist`）+
+  `INSTANCE_EGRESS_ALLOW`（`10.1.2.3:443, 192.168.5.0/24`，可带端口）；
+- `dsh-muctl sync` 渲染 `/etc/dsh-mu/egress.nft` 并用**一条 nft 事务**装载（原子 ✓，无半张表 ✓）；
+- 每条链固定包含 **`ct state established,related accept`** ✓ —— 少了它连实例自己的回包都会被挡 ✗
+  （实测踩过：端口在听但连不上 ✗）；
+- 放行：自身端口 + relay ✓、配置的 DNS ✓、白名单 ✓、公网（`no-intranet` 模式）✓；
+  拒绝：其它 loopback 端口 ✓（别的实例 / 管理 API ✓）、RFC1918 + link-local + CGNAT ✓、
+  IPv6 ULA/link-local ✓；`allowlist` 模式连公网也拒 ✓；
+- 单实例覆盖：`state.instances[<n>].egress` / `.egress_allow`（后台卡片里可设 ✓，改完**立即生效** ✓
+  不用重启实例 ✓）；
+- CLI：`dsh-muctl egress show | set <policy> | allow <list> | allow-add | allow-rm |
+  instance <name> <policy> [--allow …] [--reset]` ✓
+- `doctor` 新增两项：`egress nft`（没装 nftables 就 WARN ✓）、`egress rules`（表在不在、每个实例有没有链 ✓）。
+
+### 2. 实例不再保留 `CAP_SYS_ADMIN`
+- `INSTANCE_KEEP_CAPS` 默认改为空 ✓；`install` 会把旧默认 `sys_admin,setuid,setgid` 自动迁移成空 ✓；
+- 依据：实测去掉后 DSH 完全正常 ✓（cookie 刷新 ✓、模型链路 ✓、bash ✓、插件安装 ✓），
+  而 `umount` 变成 `must be superuser to unmount` ✓、`mount -t tmpfs` 变成 `permission denied` ✓
+  —— **只读挂载保护从此不可绕过** ✓。
+
+### 3. 插件策略：受保护 / 强制安装（两个独立开关）
+- 新增 `state.plugin_policy = {pkg: {protected, mandatory}}` ✓；
+- **受保护**：jail 启动时把该包的 `node_modules/<pkg>` 做**同路径只读绑定** ✓（`RO_PATHS` ✓，
+  内核 EROFS ✓）；`sync` 还会把 `package.json` 的依赖与 `dsh.profile.bundles` 补回 ✓、
+  并清掉 `cordis.patch.yml` 里针对它的 `disabled: true` ✓（否则"文件还在但不加载" ✗）；
+- **强制安装**：`sync` / 新实例创建时对每个 `mandatory` 包best-effort 安装 ✓，
+  失败只 WARN 不阻塞 ✓；
+- CLI：`dsh-muctl plugin policy | protect | unprotect | require | unrequire <pkg>` ✓
+- API：`GET/POST /api/plugin-policy` ✓（GET 同时返回各实例已装清单 ✓）。
+
+### 4. 插件管理从平台下线（按讨论结论）
+- **删除抽屉里的插件卡** ✓（`me.lua` 不再下发插件数据 ✓，`/api/me/plugins` 端点删除 ✓）；
+  用户直接用实例内 DSH 自带的插件管理器 ✓；
+- **删除后台的"可装清单（catalog）"** ✓：`POST /api/plugins`、`plugin_catalog` handler、
+  抽屉的 install/uninstall 密码门槛全部移除 ✓（实测那门槛本来就被原生 UI 绕过 ✗）；
+- 「插件」标签页改为**只读清单 + 策略编辑** ✓：每个包一行（受保护 / 强制安装两个勾 ✓），
+  下面列出每个实例装了什么、来源（平台/自装）✓。
+
+## 0.18.7（「启动」显示横线：又是一个白名单漏字段）
+
+- `instance_payload()`（抽屉的实例数据）也是**手写白名单** ✓，没带 `started_at` ✗ →
+  抽屉拿到 `undefined` ✓ → 渲染成 `—` ✗。现在带上 ✓（先取 `state.json` 里的 ✓，
+  后端视图有更新值时以后端为准 ✓），并从后端视图 `full.instance` 里取最新值 ✓；
+- 这已经是同一类问题的第三次 ✗（`resources` 漏 ✓、`my_default` 漏 ✓、`started_at` 漏 ✓），
+  所以加了一条**闸门**（ui-lint 现 12 项）✓：`panel.js` 里读的 `i.started_at` / `i.resources` /
+  `data.my_default`，**必须在 `me.lua` 的返回表里出现** ✓ —— 已反向验证
+  （删掉 `started_at = started_at` 那行立刻 FAIL ✓）。
+
+## 0.18.6（修：设了默认却显示"未设置"；重启带进度；实例显示启动时间）
+
+- **真正的原因** ✗：抽屉保存其实**成功了** ✓（`state.users[<name>].default_override` 有值 ✓），
+  但 GET `/me` 的返回是 `me.lua` 里**手写白名单** ✓，没有 `my_default` 这一项 ✗ →
+  抽屉读不到 ✓ → 永远渲染"未设置" ✗。已把 `my_default = {plan, model}` 加进返回 ✓；
+- **重启有进度了** ✓：点「重启」后按钮上显示 `重启中… 12s` ✓，每 2 秒轮询 `/me` 直到实例重新应答 ✓，
+  完成后提示 `已重启完成（38 秒）` ✓；超过 3 分钟未恢复会提示去看实例日志 ✓
+  （抽屉里的「立即重启」横幅也走同一条路径 ✓，不再只静默等 6/20 秒 ✓）；
+- **实例卡片新增「启动」** ✓：`启动于 2026/10/23 07:41:12（12 分钟前）` ✓
+  （后端 `instance_view` 增加 `started_at` ✓，由 `start_instance()` 写入 ✓）；
+- 「已保存」的提示改成**指明下一步** ✓：`已保存 ✓ 点上面「我的实例」里的「重启」让它生效（约十几秒到一分钟）` ✓。
+
+## 0.18.4（抽屉「我的默认模型」改成先按钮后弹窗；修网关 stale Lua）
+
+- **「我的默认模型」重做** ✓：卡片上只显示**当前状态**
+  （`已设置：myog · glm-5.3` 或 `未设置（新会话按平台默认：Kilo Free）`✓），
+  右边一个「设置 / 修改」按钮 ✓ → 点开**弹窗**选套餐 + 模型 ✓ → 保存 ✓。
+  已设置时状态行里才出现「清除」✓ —— 之前表单平铺 ✓ 且**预填了 Kilo Free** ✗，
+  用户根本看不出自己到底设没设 ✓；
+- **修 `失败：unknown action`** ✗：`me.lua` 已经加了 `plan-default` 转发 ✓，但**网关没 reload** ✗ ——
+  openresty 的 `lua_code_cache on` 会把旧 Lua 留在内存里 ✓，`apk` 升级只换文件 ✓，
+  于是抽屉打到的还是旧逻辑 ✓。现在：
+  - `dsh-muctl sync` 会检测"Lua 文件比网关进程新" ✓ 并**自动 reload**
+    （jail 模式重启 gateway 服务 ✓，host 模式 `rc-service openresty reload` ✓）；
+  - `doctor` 新增一项 **gateway lua** ✓：stale 时 WARN 并给出修复命令 ✓；
+  - jail 模式的 pid 文件叫 `/run/dsh-mu-__gateway.pid` ✓（不是 `openresty.pid` ✗）——
+    一开始只查了 openresty/nginx 的固定路径 ✓ → 永远拿不到启动时间 → **恒为 PASS** ✗（假阴性 ✗）；
+    现在用 `glob('/run/*gateway*.pid')` + openresty/nginx 一起兜 ✓。
+- 「UI 约定：先按钮、后表单」写进 `docs/06-运维手册.md` ✓
+  （新增/修改类操作一律按钮 + 弹窗 + 当前状态 ✓）。
+
+## 0.18.1（用户级默认模型：个人一条，优先于 admin 的链）
+
+- **用户抽屉新增「我的默认模型」** ✓：套餐 + 模型两个下拉 ✓，**只能设一条** ✓
+  （不是优先级链 ✓），「保存」/「清除」✓ —— 存在 `state.users[<name>].default_override` ✓；
+- **优先级**：用户自己的选择 **高于** admin 的「默认模型（按优先级）」✓：
+  `sync_instance_plans` 先按用户那条解析 ✓，不可用（套餐没了/模型不在可用集合）才顺延到 admin 链 ✓，
+  再不行回落到"第一个可见套餐" ✓；
+- **admin 实例表每行新增「清默认」** ✓（`POST /api/users/<name>/default-clear` ✓），
+  只清那个用户的个人默认 ✓，不动 admin 链 ✓；
+- **admin「默认模型」区新增覆盖列表 + 一键清除** ✓：
+  列出"哪些用户设了自己的默认"✓（用户 / 套餐 / 模型 / 清除 ✓），
+  并有 **「一键清除全部用户默认」** ✓（`POST /api/user-defaults/clear-all` ✓）；
+- CLI：`dsh-muctl default user-set <user> <plan> [--model <m>]` ✓、
+  `default user-clear <user>` ✓、`default user-clear --all` ✓，`default list` 会先列个人默认 ✓；
+- 网关 `me.lua` 转发两个新动作 `plan-default` / `plan-default-clear` ✓（走 `/me`，与其它抽屉操作一致 ✓；
+  直连后端时动作名是 `default` / `default-clear` ✓ —— 测试时容易搞混 ✓，两者都可用 ✓）；
+- **模型校验补严** ✓：个人默认的模型原来只跟"套餐已选子集"比 ✓ ——
+  而"全部模型"的套餐子集是空的 ✓ → **任意字符串都能存进去** ✗（`model: "nope"` 返回 200 ✗）。
+  现在先按 **provider 目录**校验 ✓，再按套餐子集校验 ✓，两处都 400 ✓；
+- **链会自动忽略失效条目** ✓：`default_chain()` 里跳过 `load_plan()` 取不到的 plan id ✓ ——
+  0.18.0 把 `plan_kilo_free` 改名成 `plan_default` 后 ✓，旧链里那一档就变成"指向不存在的套餐"✗，
+  以前会让"第一档"静默失效 ✓；现在直接跳过 ✓，把下一档顶上 ✓。
+
+## 0.18.0（plan_default 占位默认套餐；删掉实例页的 provider/key；优先级用高/低）
+
+- **内置默认套餐改名为 `plan_default`** ✓：id 固定 ✓，由 `install` **每次升级按新版本的内置定义覆盖内容** ✓
+  （将来内置默认换成别的套餐 ✓，还是占同一个 id ✓，不会留下旧 id 的残留 ✓）；
+  `enabled` 在升级时**保留** ✓ —— 你停用过它，升级不会悄悄打开 ✓；
+- **不可删除** ✓：`plan delete plan_default` 与 `DELETE /api/plans/plan_default` 都返回 400 ✓
+  （提示改用"停用" ✓），后台那一行把「删除」换成「内置，随版本更新」✓；
+- **保底可用** ✓：某个用户**一个可用套餐都没有**时，`plan_default` 即使被停用也仍然可见可用 ✓
+  （`plan_visible_to_user` 里特判 ✓，用 `other_plans_for_user()` 判断是否真的没有别的 ✓）；
+- 旧的 `plan_kilo_free` 会在升级时**自动迁移**成 `plan_default` ✓（沿用它的 `enabled` ✓）；
+- **删掉「实例的 provider / key」整块** ✓（`#provAssign` + 相关 JS ✓ 约 60 行 ✓）：
+  有套餐时它本来就不参与 ✓，留着只会让人以为要在这里配 ✓；
+  顺带把「资源限额」「查看 patch」「连通性测试」这些结果从已删除的容器搬进**共用弹窗** ✓；
+- 「默认模型（按优先级）」的第一列不再写 1/2/3 ✓，改成 **高 / 中 / 低** ✓（两行就是 高/低 ✓）。
+
+## 0.17.6（套餐重名：个人套餐天生不冲突，团队套餐加保护）
+
+- 结论先说：**不同用户建同名个人套餐没问题** ✓ ——
+  抽屉创建时 id 是 `hash(owner + "/" + 名字)` ✓（`plan_id_for(actor_user + "/" + name_)`），
+  `alice/我的 deepseek` → `plan_62c079fe`、`bob/我的 deepseek` → `plan_d95e0fd2` ✓ 互不影响 ✓；
+- **但团队套餐是 `hash(名字)`** ✓ —— 后台/CLI 用同名再建一次会**静默覆盖**前一个 ✗
+  （同 id → 同一个 `plans/<id>.json` ✓，`save_plan` 直接写 ✓）。三处都加了保护 ✓：
+  - 后台 API：返回 **409** `a plan with this name already exists` ✓，带 `replace: true` 才覆盖 ✓；
+  - 后台页面：409 时弹**确认框** ✓「已经有同名套餐…用新配置覆盖它吗？」✓；
+  - CLI：`plan add` 同名直接拒绝 ✓，提示换个名字或加 **`--replace`** ✓；
+  - 抽屉：同一个用户重复建同名套餐也拒绝 ✓（`you already have a plan with this name` ✓）。
+
+## 0.17.5（真正的根因：全局 min-width:110px 也套到了 checkbox 上）
+
+- 前面几轮我一直在挪列宽 ✗，**真正的毛病在这里** ✓：
+
+  ```css
+  input,select{ …; min-width:110px }   /* 也匹配了 checkbox ✗ */
+  ```
+
+  → **每个复选框都被撑成 110px 宽** ✗：这正是"勾离说明文字老远"✗（实例日志的「实时刷新」✓、
+  用户面板的「设为默认」✓）和"勾那一列特别宽"✗ 的共同原因 ✓；
+- 修法：给复选框/单选框**豁免** ✓
+
+  ```css
+  input[type=checkbox],input[type=radio]{min-width:0;width:auto;padding:0;margin:0;
+    border-radius:0;background:none;vertical-align:middle}
+  input[type=checkbox]{accent-color:var(--acc)}
+  ```
+- 勾选框**恢复成独立一列**（36px ✓ 居中 ✓），不再和模型 id 挤一格 ✓（上一版把两列合并是治标 ✗）；
+- `ui-lint` 新增闸门（现 11 项）：**存在全局 `input,select{min-width:…}` 时，必须有
+  `input[type=checkbox]{min-width:0}` 豁免** ✓ —— 已反向验证（删掉豁免立刻 FAIL ✓）。
+
+## 0.17.4（模型表勾选框修好；撤掉「改范围」）
+
+- **勾选框压住模型 id** ✗：0.17.3 把勾选做成独立的 44px 列 ✓，太窄 ✓，id 文字跑到框下面 ✗。
+  现在**合并成一列**（`label.pickrow`：勾选 + id 同行 ✓，flex 布局 ✓，id 过长自动省略 ✓），
+  列数 6 → 5 ✓，id 列 42% ✓；
+- **撤掉「改范围」** ✗ —— 我上一轮理解错了 ✓：这个操作实际是把套餐在**团队/个人**之间**换类型** ✗，
+  而不是"团队套餐限定某几个人"✓；换类型会把别人的套餐变成私人套餐 ✓，即使是 admin 也不该这么做 ✓。
+  按钮、`POST /api/plans/<id>/scope` 端点、前端函数**全部移除** ✓（不留死接口 ✓）；
+- **范围列的显示改成一行** ✓：原来 `团队` / `*`、`个人:alice` / `alice` 两行 ✓，看起来像"实例范围 + 用户范围"✓。
+  现在只有三种明确说法：
+  - `团队 所有用户` ✓
+  - `团队 限 alice、bob` ✓（创建时在「可见用户」里填人名即可 ✓ —— 这就是"团队套餐限定某些人" ✓）
+  - `个人 alice` ✓
+- 标题下的说明改写为：**范围由创建时决定、之后不能改** ✓，要换类型就删掉重建 ✓。
+
+## 0.17.3（模型弹窗：删掉「默认」列，修勾选列被拉宽）
+
+- 0.17.2 的列宽改动**没生效** ✗：表格还是 `table-layout:auto` ✗ —— 宽度只是"建议" ✓，
+  浏览器按内容重新分配 ✓ → 勾选列被撑得很宽 ✗。现在 `table-layout:fixed` ✓ + 逐列定宽 ✓
+  （勾选 44px / 模型 id 38% / 推理等级 110px / 可用 58px / 状态 88px）✓；
+- **删掉「默认」单选列** ✗ —— 默认模型现在由「默认模型（按优先级）」那条链决定 ✓，
+  这个单选只在保存时写一个 `plan.default_model` ✓，与链重复 ✓；保存时也不再提交它 ✓；
+- 套餐表里那句 `新会话默认 xxx` 改成 **`套餐默认 xxx`** ✓ —— 链可能给某个用户钉了别的模型 ✓，
+  叫他"新会话默认"会误导 ✓；
+- 模型 id 用 `text-overflow:ellipsis` ✓ 不再折行 ✓，状态徽章 `nowrap` ✓。
+
+## 0.17.2（套餐表：去掉没用的「设默认」，补上「改 key」「改范围」，模型表列宽重排）
+
+- **删掉「设默认」** ✗ —— 默认模型现在由「默认模型（按优先级）」那条链决定 ✓，
+  这个按钮只会写 `default_plan` ✓（链的第一档 ✓），留着只会让人以为有两套默认 ✗；
+- **标题改名**：`团队套餐（provider + key + 名字）` → **`套餐（provider + key + 名字）`** ✓ ——
+  表里本来就同时有团队套餐（`范围=团队`）和个人套餐（`范围=个人:alice`）✓；
+  下方补一句「范围是团队或个人的说明」✓，创建表单的"可见用户"也加了提示 ✓
+  （留空=团队；填用户名=个人 ✓）；
+- **新增「改 key」** ✓：以前只有 CLI 能换（`dsh-muctl plan key <id>` ✓），后台没入口 ✗ ——
+  现在每行一个按钮 ✓，`POST /api/plans/<id>/key` ✓，写回 0600 文件 ✓ 并立即 `sync_all` ✓；
+- **新增「改范围」** ✓：团队套餐的 `visible_to` 以前建完改不了 ✗ ——
+  现在 `POST /api/plans/<id>/scope` ✓，留空/`*`=团队 ✓，填用户名=只有这些人 ✓（会校验用户存在 ✓）；
+- **模型选择表的列宽重排**：`模型 id` 34% 且**不换行** ✓、推理等级改成**小徽章**（原来
+  `off / low / high` 挤成一行 ✓）、勾选/单选列收窄 ✓、弹窗在打表时加宽到 **940px** ✓，关闭后还原 ✓。
+
+## 0.17.1（修：默认模型链保存后丢档）
+
+- 0.17.0 的链设置**写得进去、读不回来** ✗：`default_model_chain` 没进配置字段白名单 ✗ →
+  `save_config()` 只序列化声明过的字段 ✓ → 这一项被静默丢弃 ✗（`default list` 说"没设置"✓，API 返回 `[]` ✗）；
+- 已把 `DEFAULT_MODEL_CHAIN` 登记为正式配置项 ✓（默认空 ✓，`dsh-muctl config` 里可见 ✓）。
+- 实测（0.17.1，两档链 `[myog/glm-5.3] → [kilo-free/默认]`）：
+  - `alice`（能看到 `plan_8f7c3b30`）→ `agent-default-model` = `plan-8f7c3b30-1` / `glm-5.3` ✓
+  - `bob`（看不到它）→ 顺延到 `plan-kilo-free` / `kilo-auto/free` ✓
+  - 链里填目录里不存在的模型 → 400 `plan … has no model …` ✓
+  - 恢复单档后两个实例都回到 `kilo-auto/free` ✓
+
+## 0.17.0（默认模型改成「按优先级链」，创建套餐表单去掉两个默认项）
+
+- **去掉**创建套餐表单里的「默认模型」输入和「设为平台默认套餐」勾选 ✓ ——
+  它们混在"创建"里确实说不清层级 ✓；
+- 新增独立栏目 **「默认模型（按优先级）」** ✓：一行一档 ✓，可增/删/上移/下移 ✓，
+  每档选**套餐 + 模型**（模型候选 = 该套餐实际生效的模型 ✓）；
+- **为什么是链**：每个人能看到的套餐不同 ✓ —— 新会话取**第一条该用户可见**的档 ✓；
+  一档用不上（套餐看不到 / 模型不在可用集合）就顺延 ✓；全都不行才回落到"第一个可见套餐" ✓；
+- `default_plan` 仍保留 ✓（抽屉的默认徽章 ✓），它恒等于链的第一档 ✓；
+- 新增 CLI：`dsh-muctl default list|add|set|rm` ✓；API：`GET/POST /api/default-chain` ✓；
+- **新增 CLI 闸门**（`tests/cli-contract.sh`）：遍历**全部 26 个子命令**做 `--help` ✓，
+  任何子命令的 parser 构建失败就 FAIL ✓ —— 专治"加了个重复参数导致整个子命令失效"✗
+  （0.16.6 的 `--model` 冲突就是这么炸的 ✗）。
+
+## 0.16.5（套餐的「默认模型」可以改了 + 把「设为默认」说清楚）
+
+- **补缺口**：套餐原来只能在创建时填 `default_model` ✗，建完就改不了 ✗ ——
+  而「默认套餐 + 默认模型」正是**新会话的起始模型** ✓（实例 patch 里的 `agent-default-model` ✓）。
+  现在：「编辑模型」弹窗里每行多一个**默认单选框** ✓，保存时一起提交 ✓；
+  命令行 `dsh-muctl plan default-model <plan-id> <model-id>` ✓；
+  API `POST /api/plans/<id>/models` 接受 `default_model` ✓（用户改自己的套餐同样支持 ✓）。
+- 套餐表的模型列会显示「…，新会话默认 `xxx`」✓，选错能一眼看出来。
+- 创建套餐里的勾选框改名为 **「设为平台默认套餐」** ✓，并注明"决定新会话的起始模型，
+  以及新用户首次进入时预选哪个套餐" ✓ —— 之前只写"设为默认"，看不出是哪个层级 ✓。
+- **渲染兜底**：套餐的 `default_model` 若不在该套餐实际提供的模型里（例如后来缩小了子集），
+  `agent-default-model` 会**回落到第一个可用模型** ✓ 而不是指向一个不在 patch 里的模型 ✓。
+- 修一个我自己引入的**严重回归**：给 `plan` 加了 `--model`，而**它本来就有** ✗ →
+  argparse 报 `conflicting option string: --model` ✗ → **整个 `plan` 命令全部失效** ✗。
+  已删除重复参数 ✓（`plan default-model <id> --model <m>` 用原有的那个 ✓）。
+- 文档补充三条语义（会话级记忆）：
+  1. **DSH 按会话记住最后用的模型** ✓（会话投影 `modelSelection.lastUsed`，实测
+     `{"provider":"plan-d523574a","model":"deepseek-flash"}` ✓）；
+  2. **新会话**没有 `lastUsed` ✓ → 回到 `agent-default-model` = 默认套餐 + 它的 `default_model` ✓；
+  3. 所以"记住最后选择"是**同一个会话内**的事 ✓，不是跨会话 ✓ —— 之前我表述含糊 ✓。
+
+## 0.16.4（模型接入页：模板库改成按需弹窗）
+
+- **「读取线上模板列表」不再常驻** ✗ → 和「＋ 导入 provider（JSON）」并排成一个按钮行 ✓；
+  点按钮才弹窗、才发请求 ✓ —— 打开页面/切标签页**不再自动拉模板** ✓（之前切过来就请求 ✗）；
+- 弹窗里有**加载动画**（转圈 + "正在从模板库读取…（首次可能要几秒）"）✓；
+  导入某个模板时把列表换成"正在导入 X…"✓，失败则恢复列表并报错 ✓ —— 不再是一个空框干等 ✗；
+- 「配置规范 / 给 AI 的提示词」那块提示**移到按钮行下面** ✓，模板说明也归到一行 ✓；
+- **团队套餐**改成和其它页一致：**标题单独一行** ✓，下面才是「＋ 创建套餐」按钮行 ✓（之前标题和按钮挤一行 ✗）；
+- `.spinner` 加入 ui-lint 的布局类检查（现 10 项）✓。
+
+## 0.16.3（修：`.row` 从未定义 —— 所有"工具条"都在竖着排）
+
+- 页面里 `class="row"` 用了 **8 处**，但样式表里**根本没有 `.row` 规则** ✗ ——
+  所以那些本该"一行"的工具条（实例日志的 实例/行数/实时刷新/读取、各页的创建按钮行…）
+  实际是**块级元素竖排** ✗，这就是截图上"表头一行一个控件"的原因 ✓；
+- 现在补上 `.row{display:flex;flex-wrap:wrap;align-items:center;gap:10px}` ✓ +
+  `.row > label{margin:0}` ✓ + `.inline{display:flex;flex-direction:row;align-items:center;gap:6px}` ✓
+  （带复选框的标签按一行排 ✓）；
+- 实例日志工具条重排：实例下拉 240px、行数 120px、复选框与「读取」同一行 ✓，
+  右侧 `#logMeta` 用 `margin-left:auto` 顶到最右 ✓；
+- `ui-lint` 新增一项闸门（现 10 项）：**布局类（row/inline/card/msg/muted/banner）必须各自有
+  独立的 `.cls{` 规则** ✓ —— 已做反向验证（删掉 `.row{` 立刻 FAIL ✓）。
+
+## 0.16.2（实例页重排：日志独立成页、挂载去卡片）
+
+- **实例日志**从「实例」页底部的卡片**独立成一个标签页** ✓（导航：概览/用户/实例/**实例日志**/模型接入/…）；
+- 实例列表里的 `logs` 按钮改成 **`gotoLogs(name)`** ✓：切到「实例日志」页 ✓、自动选中该实例 ✓、立即读取 ✓
+  （之前是往页面底部的 `#instLogs` 里塞一段 `<h3>+<pre>` ✗，位置和样式都很怪 ✗）；
+- 日志工具条重排成**一行**：实例 / 行数 / 实时刷新（2 秒） / 读取 / 说明 ✓；
+  右侧 `#logMeta` 显示 `实例 · 文件 · 来源(live|rotated|empty) · 时间 · 行数` ✓；
+  日志区 `max-height:60vh`、`word-break`、等宽行高 ✓，长 URL 不再把页面撑宽；
+- **宿主目录挂载去掉外层卡片** ✓ —— 之前是「卡片套在页面里」✓，现在只是一个标题 + 按钮 + 表格 ✓；
+- 顺带修回一处误删：`实例的 provider / key` 表格（`#provAssign`）在重构时被删掉 ✗，已恢复 ✓。
+
+## 0.16.0（系统账号保护 + 角色语义澄清）
+
+- **修危险缺陷**：后台用户表对 `root` 也显示了「停用 / 改密 / 删除」✗，而这三条**真的会执行** ✗：
+  - 改密对它**无效**（root 认证的是宿主机 `/etc/shadow` 口令 ✓）；
+  - 停用/删除会**把 root 锁在网页外** ✗（登录走"管理员记录缺失"的 503 ✗，只能回 shell 修 ✓）。
+  现在：CLI（`user passwd/toggle/del`）与后台 API 都**拒绝系统账号** ✓，
+  并给出替代做法（`passwd root` / 从 `ADMIN_SYSTEM_USERS` 移除 ✓）；页面上这三个按钮对系统账号**不再显示** ✓
+  （只保留「踢下线」✓，并在名字旁标「系统账号」✓）。
+- **澄清一个误导**：创建用户时的「角色」下拉原本可以选 `admin` ✗ ——
+  但网关在登录时**强制把平台账号的 role 改成 `user`** ✓（`login.lua` 注释明说"admin is locked to the
+  configured system accounts" ✓）。所以那个 `admin` 选项**从来不会带来管理员权限** ✗
+  → 下拉现在只有「普通用户」✓，并注明"管理员只能是宿主机账号（root 或 ADMIN_SYSTEM_USERS）"✓。
+- 结论（写进代码注释与文档）：**平台账号可以拥有实例** ✓（`--instance auto` 会建 ✓），
+  但**永远不是管理员** ✓；管理员身份只来自宿主机账号 ✓，登录后默认落到 `/admin/` ✓。
+
+## 0.15.11（让浏览器别再弹"生成/管理密码"）
+
+- 弄清了一件事：Firefox/Chrome 那个气泡**不是判定"这是登录表单"** ✗ ——
+  而是**只要字段是 `type="password"`** 就会提供「生成安全密码 / 管理密码」✓，网页侧关不掉 ✗；
+- 所以创建用户表单里的密码字段**改成 `type="text"`** ✓（`autocomplete="off"` + `data-lpignore`），
+  气泡彻底消失 ✓；旁边加了 **「随机生成」** 按钮 ✓（16 位、去掉易混字符）✓，
+  并注明"明文输入，可以直接看到并转交用户" ✓ —— 对管理员建号这个场景反而更实用 ✓；
+- 密码仍是"留空 = 服务端随机生成" ✓，行为不变 ✓；
+- **团队套餐的 key 仍然保持 `type="password"`** ✓ —— 那是凭据不是密码 ✓，
+  只补了 `autocomplete="new-password"` / `data-lpignore` 降低被误判的概率 ✓。
+
+## 0.15.10（给浏览器的密码气泡留位置）
+
+- 图1/图2 里那个「管理密码 / 使用生成的安全密码」是 **Firefox 自己的 UI** ✓（点开是 `about:logins`），
+  网页既不能关闭它、也不能定义它的位置 ✗ —— 但可以**避免它盖住别的字段** ✓；
+- 创建用户表单里把「密码」**挪到最后一行并占满整行**，下方留 84px 空白 ✓；
+  于是气泡向下展开时落在**空白区**里 ✓，不再压住「实例」下拉 ✓；
+- 该字段仍是 `autocomplete="new-password"` + `data-lpignore` ✓（降低被当成登录表单的概率）；
+- 其余排版不动（0.15.9 的两列栅格）。
+
+## 0.15.9（弹窗表单的排版与去重）
+
+- **去重**：表单自带的「创建 X」提交按钮在弹窗里隐藏 ✓ —— 底部只留一个按钮 ✓，
+  而且它会**沿用表单自己的动词**（"创建用户"/"创建套餐"/"导入"…）✓，不再是笼统的"确认创建"；
+- **排版**：弹窗表单改成**两列栅格**（长字段如 JSON textarea 自动占满一行）✓，
+  「设为默认」这类复选框改成**文字+方框同一行** ✓（之前它被挤到中间 ✗）；
+- 弹窗宽度 620 → **760px** ✓，高度上限 86vh ✓，打开时自动回到顶部 ✓；
+- **浏览器的"管理密码"气泡**：给创建表单加了 `autocomplete="off"` + `data-lpignore`/`data-1p-ignore`，
+  用户名/密码字段各自标了 `autocomplete` ✓ —— 这个气泡是 Chrome 的登录表单启发式弹的，
+  我们能做的是降低误判概率（无法 100% 关闭浏览器的 UI）；
+- 弹窗内的表单去掉卡片外观，标签统一 12px 次要色、输入框 100% 宽 ✓。
+
+## 0.15.8（修：创建按钮旁边还多出来一份表单）
+
+- `form{display:flex}` 这条元素选择器**盖过了** `[hidden]` 的 UA 规则 ✗，
+  于是六个"创建"表单虽然加了 `hidden` 却照旧显示 ✗ → 页面上看起来是"双份添加"；
+- 加了一条 `[hidden]{display:none!important}` ✓；顺带把弹窗里的表单**去掉卡片外观**
+  （`#admin-modal form`）✓ —— 否则弹窗里会套一层圆角边框 ✓；
+- `ui-lint` 新增一项闸门（现 9 项）：只要页面用了 `hidden` 属性，
+  就必须存在 `[hidden]{display:none!important}` 规则 ✓ —— 已做反向验证（改成 block 立刻 FAIL ✓）。
+
+## 0.15.7（后台：创建类操作统一成「按钮 → 弹窗 → 确认」）
+
+- 「用户 / 实例 / 宿主挂载 / provider 导入 / 团队套餐 / 插件清单」六处原本常驻的内联表单，
+  全部改成**一个创建按钮**；点开后表单出现在弹窗里，点「确认创建」才提交；
+- 实现方式是**移动表单节点**（不是复制），所以原有 submit 逻辑与校验一字未改；
+- 提交成功后自动关闭弹窗 ✓；取消 / 点遮罩 / 右上角 × 都会把表单**放回原位**并清理弹窗 ✓；
+- 顺手修掉实例表单里**重复的「端口」字段**（两个 `name="port"`，后一个会覆盖前一个）；
+- 弹窗复用了模型选择器那一个（`#admin-modal`）：打开创建表单时隐藏「全选可用/全不选」，
+  关闭时恢复它们与按钮文案 ✓。
+
+## 0.15.6（web_search：没有可用 provider 时把工具藏起来）
+
+- 0.15.5 只是把报错换成"registered but unavailable" ✗ —— 实测模型**照样会调**，
+  于是用户看到 `DeepSeek search has no API key for "DSHMU_WEB_SEARCH_UNCONFIGURED"` ✗ 红字；
+- 0.15.6 再补一刀：没有官方 DeepSeek 套餐时，额外渲染
+  `tool-web: { search: false }` ✓（`dsh-tool-web` 的 schema 是 `search` + `fetch` 两个独立开关），
+  于是 `web_search` **不出现在工具列表里** ✓，`web_fetch` 保留 ✓，用户不再看到任何搜索报错 ✓；
+- 附带两条实测结论：
+  - **`web_fetch` 的 `TypeError: fetch failed` 不是网络问题**：同一个 URL 用裸 node `fetch`
+    返回 200（baidu / ithome / chinanews 都 200，只有 BBC 是 `UND_ERR_CONNECT_TIMEOUT`）；
+    DSH 的 fetch provider 走 undici + 代理策略 + `redirect: manual`，失败点在插件侧，
+    绕过办法是在实例里用 `curl`（模型自己也这么做了）；
+  - 实例 jail 里**没有 `python3`**，只有 node —— 这是设计如此，不是缺依赖。
+
+## 0.15.5（web_search：注册但不可用，而不是禁用）
+
+- 0.15.4 把 `web-search-deepseek` **禁用**了 ✗ → 但 `dsh-web` 的 `searchProvider` 仍然指着它 ✓，
+  于是工具报 `configured web provider "deepseek-official" is not registered` ✗（比原来更难懂）；
+- 现在没有 DeepSeek 套餐时改成**注册但不可用**：`apiKeyEnv: DSHMU_WEB_SEARCH_UNCONFIGURED`
+  （没人设这个变量）→ DSH 报 `… is registered but unavailable` ✓ —— 最准确、可执行；
+- 有官方 `api.deepseek.com` 套餐时仍自动接 relay（真 key 由 relay 注入）；
+  `web_search_plan` 显式指定的兼容套餐优先；
+- 附带结论：`web_fetch` 在 jail 里是好的（node 直连 200 ✓），之前失败是个别站点；
+  jail 里没有 `python3`（只有 node）——这是设计如此，模型该用 node 或 curl。
+
+## 0.15.4（web_search：只自动认官方 DeepSeek，其它必须显式指定）
+
+- 0.15.3 会退而求其次挑一个 `anthropic-messages` 的套餐 —— 实测又错了：
+  opencode-go 的 anthropic 路由返回 **403 `error code: 1010`**（Cloudflare），
+  和 Kilo 的 401 `You need to sign in to use this model` 一样属于误导性报错；
+- 现在**自动只用 base_url 是 `api.deepseek.com` 的套餐**；其它供应商一律 `disabled: true`，
+  除非运维用 `web_search_plan` **显式指定**（且协议必须是 `anthropic-messages`，否则仍禁用）；
+- 四种组合已单测：只有 kilo+opencode-go → disabled；加官方 deepseek → 用它；
+  显式指定 opencode 的 anthropic 路由 → 用它；显式指定 kilo → disabled。
+
+## 0.15.3（修：web_search 选到了协议不兼容的套餐）
+
+- 0.15.2 的兜底是"挑不到 deepseek 套餐就用第一个套餐"，于是只有 Kilo 套餐的机器会把
+  `web-search-deepseek.baseURL` 指向 **Kilo**（OpenAI 协议）→ 必然失败；
+- 现在**按协议挑**：只考虑 `anthropic-messages` 的套餐（优先 `api.deepseek.com`），
+  一个都没有就 **`disabled: true`**（干净地"未配置"，不再产生 401/乱七八糟的错）；
+- 显式 `web_search_plan` 指向不兼容套餐时同样**禁用**，而不是硬指；
+- `docs/11` §9 改写选择规则，并给出"只有 Kilo 时如何补一个 DeepSeek 套餐"的命令。
+
+## 0.15.2（修：web_search 拿占位符直连 DeepSeek 导致 401）
+
+- **现象**：实例里调用 `web_search` 报 `WEB_PROVIDER_ERROR` /
+  `DeepSeek API error (HTTP 401): your api key: ****elay is invalid`；
+- **原因**：`web-search-deepseek` 插件有自己的 `baseURL` + `apiKeyEnv`（默认 `DEEPSEEK_API_KEY`），
+  它不走 relay、直连 `api.deepseek.com`，而实例里的 `DEEPSEEK_API_KEY` 是占位符 `mu-relay`；
+- **修法**：`plans_patch_yaml` 现在同时渲染 `web-search-deepseek`：
+  relay 模式下 `baseURL = http://127.0.0.1:<relay>/mu-llm/<token>/<route>/v1` + 占位符凭据
+  （真 key 由 relay 注入）；无 relay 时用真实端点 + 套餐凭据；没有可用套餐则显式 `disabled: true`；
+- 新增配置项 `web_search_plan`（留空=自动挑 deepseek 系套餐）；
+- 实测：直连 relay 的 `/v1/messages`（只带占位符）返回 200；
+- 文档 `docs/11` 新增第 9 节说明原因与两种模式的渲染结果。
+
 ## 0.15.1（修：apk 不能从 URL 安装）
 
 - **实测纠正**：`apk add --allow-untrusted <URL>` 在 Alpine 3.24 / apk-tools 3.0.6 上**不支持** ✗

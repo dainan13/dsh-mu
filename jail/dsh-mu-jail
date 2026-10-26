@@ -62,6 +62,7 @@ fi
 : "${DSH_EXTRA_ARGS:=}"
 : "${DSH_LAUNCH_ARGS:=}"
 : "${EXTRA_MOUNTS:=}"
+: "${RO_PATHS:=}"
 
 [ -d "$ROOTFS" ] || { echo "dsh-mu-jail: rootfs missing: $ROOTFS" >&2; exit 1; }
 
@@ -195,6 +196,28 @@ if [ -n "${EXTRA_MOUNTS:-}" ]; then
 	IFS=$OLDIFS
 fi
 
+# Plugins the platform protects: mount each package directory read-only onto itself
+# inside this mount namespace, so the instance can neither delete nor replace it.
+# Enforced by the kernel (EROFS), and CAP_SYS_ADMIN is dropped, so it cannot umount.
+if [ -n "${RO_PATHS:-}" ]; then
+	OLDIFS=$IFS; IFS=','
+	for rel in $RO_PATHS; do
+		IFS=$OLDIFS
+		[ -n "$rel" ] || { IFS=','; continue; }
+		case "$rel" in /*) abs="$ROOTFS$rel" ;; *) abs="$ROOTFS/$rel" ;; esac
+		if [ -d "$abs" ]; then
+			mount --bind "$abs" "$abs" 2>/dev/null \
+				&& mount -o remount,ro,bind "$abs" 2>/dev/null \
+				&& echo "[jail] protected (ro): $rel" >&2 \
+				|| echo "[jail] could not protect: $rel" >&2
+		else
+			echo "[jail] protected path missing: $rel" >&2
+		fi
+		IFS=','
+	done
+	IFS=$OLDIFS
+fi
+
 hostname "$NAME" 2>/dev/null || true
 
 # ---------------------------------------------------------------- enter jail
@@ -271,7 +294,7 @@ export JAIL_SETPRIV
 setup_cgroup
 export DSHMU_NAME="$NAME" DSHMU_MODE="$MODE" DSHMU_CMD="$CMD" \
 	ROOTFS INSTANCE_HOME INSTANCE_WORK PORT INST_UID INST_GID \
-	CGROUP_PATH DSH_HOST DSH_EXTRA_ARGS DSH_WORK_IN_JAIL EXTRA_MOUNTS \
+	CGROUP_PATH DSH_HOST DSH_EXTRA_ARGS DSH_WORK_IN_JAIL EXTRA_MOUNTS RO_PATHS \
 	DSH_RUNTIME_DIR DSH_RUNTIME_IN_JAIL DSH_HOME_IN_JAIL DSH_PERMISSION_MODE DSH_LAUNCH_ARGS KEEP_CAPS
 export HOME=/home/dsh
 export DSH_HOME="$DSH_HOME_IN_JAIL"

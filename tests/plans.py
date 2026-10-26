@@ -142,6 +142,27 @@ def main(argv=None) -> int:
         own in after and bad(f"ref {own} left behind after removal") \
             or ok("this plan's ref was removed from the credential store")
 
+    # The web_search tool has its own endpoint+credential. Left unconfigured it reads
+    # DEEPSEEK_API_KEY (the relay placeholder) and calls api.deepseek.com directly,
+    # which is the 401 "your api key ****elay is invalid" report. The patch must
+    # always carry an explicit web-search block (configured, or explicitly disabled).
+    with open(patch, encoding="utf-8") as fh:
+        patch_text = fh.read()
+    block = patch_text.split("- id: web-search-deepseek", 1)
+    if len(block) == 2:
+        tail = block[1].split("\n- id: ", 1)[0]
+        if "DSHMU_WEB_SEARCH_UNCONFIGURED" in tail:
+            ok("web search is registered but unavailable (no DeepSeek plan yet)")
+        elif "disabled: true" in tail:
+            ok("web search is explicitly disabled (no plan can serve it)")
+        elif "baseURL:" in tail and "apiKeyEnv:" in tail:
+            line = [l.strip() for l in tail.splitlines() if "baseURL:" in l][0]
+            ok("web search points at its own endpoint with its own credential")
+        else:
+            bad("the web-search block is neither configured nor disabled")
+    else:
+        bad("the patch has no web-search-deepseek block (searches would 401 on the relay placeholder)")
+
     print(f"\n=== PLANS: PASS={PASS} FAIL={FAIL} ===")
     return 0 if FAIL == 0 else 1
 
