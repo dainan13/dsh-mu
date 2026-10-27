@@ -66,6 +66,14 @@ label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--dim)
 .inline{display:flex;flex-direction:row;align-items:center;gap:6px}
 /* icon-only action buttons: keep them the same height as the text ones */
 button.act.icon{padding:4px 8px;font-size:14px;line-height:1;min-width:30px}
+/* plugin install matrix: one square per instance, click filters the list below */
+button.mx{padding:0 3px;border:0;background:none;font-size:15px;line-height:1;cursor:pointer}
+button.mx.on{color:var(--ok,#3fb950)}
+button.mx.off{color:var(--muted,#8b949e)}
+.mx{font-size:15px;line-height:1;cursor:default}
+button.mxcell{padding:2px 6px;border:1px solid transparent;border-radius:4px;background:none;cursor:pointer}
+button.mxcell:hover{border-color:var(--line,#30363d);background:rgba(255,255,255,.04)}
+button.mxcell.focus{border-color:var(--ok,#3fb950);background:rgba(63,185,80,.12)}
 #admin-modal .modal-card.wide{max-width:940px}
 label.inline > input[type=checkbox]{margin:0}
 input,select{background:#0f1218;border:1px solid #303643;color:var(--fg);border-radius:8px;padding:6px 9px;font-size:13px;min-width:110px}
@@ -297,14 +305,15 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
   </section>
 
   <section id="tab-plugins">
-    <h2>插件策略</h2>
+    <h2>插件</h2>
     <p class="muted" style="margin:0 0 12px">
-      插件由用户在自己的 DSH 界面里安装（<code>dsh-plugin-manager</code> 走 pnpm），平台不代管安装。
-      这里只做两件事：<b>受保护</b>（装了就删不掉，内核级只读挂载）和<b>强制安装</b>（新实例自动装上）。
-      两者独立勾选，只对<b>已装</b>该包的实例生效。
+      用户仍可在自己的 DSH 界面里装插件 ✓。这里列出的，是<b>平台已经下载好离线安装包</b>的插件 ✓ ——
+      只有它们能配策略 ✓：<b>受保护</b>（装了就删不掉，内核级只读挂载 ✓）、
+      <b>预装</b>（新建实例时自动装 ✓）、<b>推送</b>（推给已有实例，并在此后每次重启时补齐 ✓）。
+      点表里的 <b>■ / □</b> 可以只看某个实例已装了什么 ✓。
     </p>
     <div class="row" style="margin-bottom:10px">
-      <button class="primary" type="button" onclick="openPolicyAdd()">＋ 添加策略</button>
+      <button class="primary" type="button" onclick="openPolicyAdd()">＋ 添加插件</button>
       <span class="muted" style="font-size:12px">改完立即生效：受保护的包需要重启实例才能挂上只读。</span>
     </div>
     <div id="policyRows"><div class="muted">加载中…</div></div>
@@ -934,107 +943,163 @@ window.dropEgressRule = (instance, target) => {
 // 用户在自己的 DSH 界面里装插件。
 let POLICIES = {};
 
-async function loadPolicies() {
-  try {
-    const d = await api('plugin-policy');
-    POLICIES = d.policy || {};
-    const installed = d.installed || {};
-    const pkgs = new Set([...Object.keys(POLICIES), ...Object.keys(installed)]);
-    const box = $('#policyRows');
-    box.innerHTML = pkgs.size ? `<table><thead><tr>
-        <th>包</th><th style="width:90px">受保护</th><th style="width:100px">强制安装</th>
-        <th>已装实例</th><th style="width:120px">操作</th></tr></thead>
-      <tbody>${[...pkgs].sort().map(pkg => {
-        const row = POLICIES[pkg] || {};
-        const where = installed[pkg] || [];
-        return `<tr>
-          <td><code>${esc(pkg)}</code></td>
-          <td><input type="checkbox" ${row.protected ? 'checked' : ''}
-              onchange="setPolicy('${esc(pkg)}','protected',this.checked)"></td>
-          <td><input type="checkbox" ${row.mandatory ? 'checked' : ''}
-              onchange="setPolicy('${esc(pkg)}','mandatory',this.checked)"></td>
-          <td class="muted">${where.length ? esc(where.join(', ')) : '（未安装）'}</td>
-          <td><button class="act danger" onclick="dropPolicy('${esc(pkg)}')">清除策略</button></td>
-        </tr>`;
-      }).join('')}</tbody></table>`
-      : '<div class="muted">还没有策略。点「＋ 添加策略」指定某个包。</div>';
+let PLUGIN_STATE = { policy: {}, assets: {}, matrix: {}, instances: {} };
+let PLUGIN_FILTER = '';
 
-    const flat = [];
-    for (const [name, rows] of Object.entries(d.installed || {})) {
-      for (const pkg of rows || []) flat.push({ name, pkg });
-    }
-    const insts = d.instances || {};
-    const list = [];
-    for (const [name, rows] of Object.entries(insts)) {
-      for (const r of rows || []) list.push({ name, ...r });
-    }
-    $('#plugInstRows').innerHTML = list.length
-      ? `<table><thead><tr><th>实例</th><th>插件</th><th>版本</th><th>来源</th>
-           <th>受保护</th><th>强制</th></tr></thead>
-         <tbody>${list.map(r => {
-           const pol = POLICIES[r.pkg] || {};
-           return `<tr>
-             <td><b>${esc(r.name)}</b></td>
-             <td><code>${esc(r.pkg)}</code></td>
-             <td>${esc(r.version || '-')}</td>
-             <td>${r.source === 'curated'
-                  ? '<span class="pill ok">平台</span>'
-                  : '<span class="pill warn">自装</span>'}</td>
-             <td>${pol.protected ? '<span class="pill ok">是</span>' : '<span class="muted">—</span>'}</td>
-             <td>${pol.mandatory ? '<span class="pill ok">是</span>' : '<span class="muted">—</span>'}</td>
-           </tr>`;
-         }).join('')}</tbody></table>`
-      : '<div class="muted">还没有实例装过插件。</div>';
-  } catch (e) {
-    const box = $('#policyRows');
-    if (box) box.innerHTML = `<div class="msg err">读取失败：${esc(e.message)}</div>`;
+function pluginMatrixCell(pkg) {
+  const insts = Object.keys(PLUGIN_STATE.instances || {});
+  if (!insts.length) return '<span class="muted">—</span>';
+  const have = new Set(PLUGIN_STATE.matrix[pkg] || []);
+  const on = PLUGIN_FILTER === pkg ? ' focus' : '';
+  // Squares only; the instance name lives in the tooltip. Clicking the whole area
+  // filters the list below down to THIS PACKAGE (not to an instance).
+  const squares = insts.map(n =>
+    `<span class="mx ${have.has(n) ? 'on' : 'off'}" title="${esc(n)}：${have.has(n) ? '已安装' : '未安装'}">${have.has(n) ? '■' : '□'}</span>`).join('');
+  return `<button class="mxcell${on}" title="点一下只看这个插件在各实例的安装情况"
+      onclick="filterPlugins('${esc(pkg)}')">${squares}</button>`;
+}
+
+window.filterPlugins = (pkg) => {
+  PLUGIN_FILTER = PLUGIN_FILTER === pkg ? '' : pkg;
+  loadPolicies();
+};
+
+async function loadPolicies() {
+  const d = await api('plugin-policy');
+  PLUGIN_STATE = { policy: d.policy || {}, assets: d.assets || {},
+                   matrix: d.matrix || {}, instances: d.instances || {} };
+  const assets = PLUGIN_STATE.assets;
+  const policy = PLUGIN_STATE.policy;
+
+  // Rows = packages that were downloaded (they are the only ones a policy may target).
+  // One row per PACKAGE NAME (the assets map is already de-duplicated by name, this
+  // also folds in a policy row whose asset was deleted).
+  const byName = new Map();
+  for (const [spec, asset] of Object.entries(assets)) {
+    byName.set(asset.name || spec, { spec, asset, name: asset.name || spec });
   }
+  for (const [pkg, row] of Object.entries(policy)) {
+    if (!byName.has(pkg)) byName.set(pkg, { spec: row.spec || pkg, asset: {}, name: pkg });
+  }
+  const rows = [...byName.values()]
+    .map(({ spec, asset, name }) => ({ spec, asset, name, row: policy[name] || {} }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  $('#policyRows').innerHTML = rows.length ? `<table><thead><tr>
+      <th>插件</th><th>来源</th><th style="width:90px">版本</th>
+      <th style="width:76px">受保护</th><th style="width:70px">预装</th>
+      <th style="width:70px">推送</th><th style="width:120px">实例</th>
+      <th style="width:190px">操作</th></tr></thead>
+    <tbody>${rows.map(({ spec, asset, name, row }) => `<tr>
+      <td><b>${esc(name)}</b>${asset.name ? '' : ' <span class="pill bad">缺少离线包</span>'}</td>
+      <td class="muted" style="font-size:12px">${esc(spec)}</td>
+      <td>${esc(String(asset.version || '-'))}</td>
+      <td><input type="checkbox" ${row.protected ? 'checked' : ''}
+          ${asset.name ? '' : 'disabled'}
+          onchange="setPolicy('${esc(name)}','protected',this.checked)"></td>
+      <td><input type="checkbox" ${row.preinstall ? 'checked' : ''}
+          ${asset.name ? '' : 'disabled'}
+          title="新建实例时自动安装"
+          onchange="setPolicy('${esc(name)}','preinstall',this.checked)"></td>
+      <td><input type="checkbox" ${row.push ? 'checked' : ''}
+          ${asset.name ? '' : 'disabled'}
+          title="推送到已有实例；重启时也补齐"
+          onchange="setPolicy('${esc(name)}','push',this.checked)"></td>
+      <td>${pluginMatrixCell(name)}</td>
+      <td>
+        <button class="act" onclick="updatePlugin('${esc(spec)}')">更新</button>
+        <button class="act" onclick="removePlugin('${esc(name)}','${esc(spec)}',false)">移除策略</button>
+        <button class="act danger" onclick="removePlugin('${esc(name)}','${esc(spec)}',true)">移除并删包</button>
+      </td></tr>`).join('')}</tbody></table>`
+    : '<div class="muted">还没有插件。点「＋ 添加插件」填一个规格，系统会先下载再允许配置策略。</div>';
+
+  renderPlugInst();
+}
+
+function renderPlugInst() {
+  const rows = [];
+  for (const [name, list] of Object.entries(PLUGIN_STATE.instances || {})) {
+    for (const r of list || []) {
+      if (PLUGIN_FILTER && r.pkg !== PLUGIN_FILTER) continue;
+      rows.push({ name, ...r });
+    }
+  }
+  const where = PLUGIN_FILTER ? `（只看插件 ${esc(PLUGIN_FILTER)}）` : '';
+  $('#plugInstRows').innerHTML = rows.length
+    ? `<table><thead><tr><th>实例</th><th>插件</th><th>版本/来源</th><th>操作人</th></tr></thead>
+       <tbody>${rows.map(r => `<tr><td>${esc(r.name)}</td><td><code>${esc(r.pkg)}</code></td>
+         <td class="muted">${esc(r.version || '-')}</td><td class="muted">${esc(r.by || '-')}</td></tr>`)
+         .join('')}</tbody></table>`
+    : `<div class="muted">各实例都没有安装插件 ${where}</div>`;
 }
 
 window.openPolicyAdd = () => {
-  openPanel('添加插件策略', `
-    <label style="display:block;margin-bottom:10px">包名
-      <input id="polPkg" placeholder="@scope/dsh-plugin-x" style="width:100%"></label>
-    <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-      <input type="checkbox" id="polProt" checked> 受保护（装了就删不掉，只读挂载）</label>
-    <label style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
-      <input type="checkbox" id="polMand"> 强制安装（新实例自动装上）</label>
-    <div class="muted" style="font-size:12px">两者独立。只对已装该包的实例立即生效；
-      受保护还需要重启实例才挂上只读。</div>`, '添加并保存', async () => {
-    const pkg = ($('#polPkg').value || '').trim();
-    if (!pkg) return flash('先填包名', 'err');
+  const lastProxy = localStorage.getItem('dshmu.pluginProxy') || '';
+  openPanel('添加插件', `
+    <label style="display:block;margin-bottom:8px">规格
+      <input id="plSpec" style="width:100%"
+        placeholder="github:owner/repo[#ref] 或 npm 包名[@版本]"></label>
+    <label style="display:block;margin-bottom:6px">下载代理（可选）
+      <input id="plProxy" style="width:100%" value="${esc(lastProxy)}"
+        placeholder="http://127.0.0.1:7890"></label>
+    <div class="muted" style="font-size:12px">
+      支持 npm 包名（<code>@scope/name</code>）、<code>github:owner/repo</code>（可带 <code>#ref</code>）。
+      点「下载并添加」会先在宿主下载一次并解析出真实包名与版本；失败不会产生任何行 ✓。<br>
+      代理留空则直连（也可以用 <code>dsh-muctl config download_proxy</code> 设默认 ✓）。
+    </div>
+    <div class="msg" id="plMsg"></div>`, '下载并添加', async () => {
+    const spec = ($('#plSpec').value || '').trim();
+    const proxy = ($('#plProxy').value || '').trim();
+    if (!spec) return flash('先填一个规格', 'err');
+    if (proxy) localStorage.setItem('dshmu.pluginProxy', proxy);
+    const msg = $('#plMsg');
+    if (msg) { msg.className = 'msg'; msg.textContent = proxy ? `正在通过 ${proxy} 下载…` : '正在下载…'; }
     try {
-      await api('plugin-policy', { method: 'POST', body: JSON.stringify({
-        pkg, protected: $('#polProt').checked, mandatory: $('#polMand').checked }) });
+      const r = await api('plugin-policy', { method: 'POST',
+        body: JSON.stringify({ action: 'add', spec, proxy }) });
+      flash(r.replaced_version
+        ? `已更新 ${r.name}：${r.replaced_version} → ${r.version}` : `已添加 ${r.name} ${r.version}`);
       closeCreate();
-      flash('已保存策略：' + pkg);
       loadPolicies();
-    } catch (e) { flash('保存失败：' + e.message, 'err'); }
+    } catch (e) {
+      if (msg) { msg.className = 'msg err'; msg.textContent = '失败：' + e.message; }
+      else flash('失败：' + e.message, 'err');
+    }
   });
 };
 
-window.setPolicy = async (pkg, field, value) => {
-  const body = { pkg };
-  body[field] = !!value;
-  const row = POLICIES[pkg] || {};
-  body.protected = field === 'protected' ? !!value : !!row.protected;
-  body.mandatory = field === 'mandatory' ? !!value : !!row.mandatory;
+window.setPolicy = async (name, field, value) => {
   try {
-    await api('plugin-policy', { method: 'POST', body: JSON.stringify(body) });
-    flash(`${pkg}: ${field === 'protected' ? '受保护' : '强制安装'} = ${value ? '开' : '关'}`);
+    await api('plugin-policy', { method: 'POST',
+      body: JSON.stringify({ name, [field]: value }) });
+    flash(`${name}: ${field} = ${value ? '开' : '关'}`);
     loadPolicies();
-  } catch (e) { flash('保存失败：' + e.message, 'err'); loadPolicies(); }
+  } catch (e) { flash('保存失败：' + e.message, 'err'); }
 };
 
-window.dropPolicy = async (pkg) => {
-  if (!confirm(`清除 ${pkg} 的策略？（受保护/强制安装都取消，插件本身不动）`)) return;
+window.updatePlugin = async (spec) => {
+  const proxy = localStorage.getItem('dshmu.pluginProxy') || '';
+  flash(`正在重新下载 ${spec}${proxy ? '（经代理 ' + proxy + '）' : ''} …`);
   try {
-    await api('plugin-policy', { method: 'POST', body: JSON.stringify({
-      pkg, protected: false, mandatory: false }) });
-    flash('策略已清除：' + pkg);
+    const r = await api('plugin-policy', { method: 'POST',
+      body: JSON.stringify({ action: 'add', spec, proxy }) });
+    flash(`已更新 ${r.name} ${r.version}`);
     loadPolicies();
-  } catch (e) { flash('清除失败：' + e.message, 'err'); }
+  } catch (e) { flash('更新失败：' + e.message, 'err'); }
 };
+
+window.removePlugin = async (name, spec, deleteAsset) => {
+  if (!confirm(deleteAsset
+      ? `移除 ${name} 的策略，并删除已下载的离线包？\n已装到实例里的不会被动。`
+      : `移除 ${name} 的策略？\n下载的离线包会保留。`)) return;
+  try {
+    await api('plugin-policy', { method: 'POST',
+      body: JSON.stringify({ action: 'remove', name, delete_asset: deleteAsset }) });
+    flash(`已移除 ${name}`);
+    loadPolicies();
+  } catch (e) { flash('移除失败：' + e.message, 'err'); }
+};
+
 
 // ------------------------------------------- 默认模型（按优先级 / 可回退）
 let CHAIN = [];

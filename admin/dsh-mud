@@ -979,31 +979,76 @@ class Handler(BaseHTTPRequestHandler):
         if name in ("plugin_policy_get", "plugin_policy_set"):
             st_p = mu.load_state()
             if name == "plugin_policy_get":
-                installed = {}
+                assets = mu.plugin_assets(st_p)
                 rows_by_instance = {}
+                matrix = {}
                 for inst in sorted(st_p["instances"]):
                     rows = mu.instance_plugins(inst)
                     rows_by_instance[inst] = rows
                     for row in rows:
-                        installed.setdefault(row["pkg"], []).append(inst)
+                        matrix.setdefault(row["pkg"], []).append(inst)
                 return 200, {"policy": mu.plugin_policy(st_p),
-                             "installed": installed,
+                             "assets": assets,
                              "instances": rows_by_instance,
-                             "nft": mu.nft_available()}
-            pkg = str(body.get("pkg") or "").strip()
-            if not pkg:
-                return 400, {"error": "pkg is required"}
+                             "matrix": matrix,
+                             "offline": mu.plugin_store_enforced(st_p)}
+            action = str(body.get("action") or "").strip()
+            if action == "add":
+                spec = str(body.get("spec") or body.get("pkg") or "").strip()
+                if not spec:
+                    return 400, {"error": "spec is required"}
+                try:
+                    row = mu.add_plugin_asset(st_p, spec,
+                                              proxy=body.get("proxy"))
+                except ValueError as exc:
+                    return 400, {"error": str(exc)}
+                mu.save_state(st_p)
+                return 200, {"ok": True, "spec": spec, "name": row["name"],
+                             "version": row["version"],
+                             "replaced_version": row.get("replaced_version")}
+            if action == "remove":
+                name_p = str(body.get("name") or body.get("pkg") or "").strip()
+                if not name_p:
+                    return 400, {"error": "name is required"}
+                table = st_p.get(mu.PLUGIN_POLICY_KEY) or {}
+                row = table.get(name_p) or {}
+                spec = str(row.get("spec") or "")
+                table.pop(name_p, None)
+                st_p[mu.PLUGIN_POLICY_KEY] = table
+                if body.get("delete_asset"):
+                    assets = st_p.get(mu.PLUGIN_ASSET_KEY) or {}
+                    for key in [k for k, v in assets.items()
+                                if k == spec or (isinstance(v, dict)
+                                                 and v.get("name") == name_p)]:
+                        path = str((assets.get(key) or {}).get("file") or "")
+                        side = f"{mu.plugin_cache_dir()}/{mu.plugin_cache_slug(key)}.json"
+                        for victim in (path, side):
+                            if victim:
+                                try:
+                                    os.unlink(victim)
+                                except OSError:
+                                    pass
+                        assets.pop(key, None)
+                    st_p[mu.PLUGIN_ASSET_KEY] = assets
+                mu.save_state(st_p)
+                mu.sync_all(mu.load_state())
+                return 200, {"ok": True, "name": name_p,
+                             "deleted_asset": bool(body.get("delete_asset"))}
+            name_p = str(body.get("name") or body.get("pkg") or "").strip()
+            if not name_p:
+                return 400, {"error": "name is required"}
             try:
-                mu.set_plugin_policy(st_p, pkg,
+                mu.set_plugin_policy(st_p, name_p,
                                      protected=body.get("protected"),
-                                     mandatory=body.get("mandatory"),
+                                     preinstall=body.get("preinstall"),
+                                     push=body.get("push"),
                                      note=body.get("note"))
             except ValueError as exc:
                 return 400, {"error": str(exc)}
             mu.save_state(st_p)
             mu.sync_all(mu.load_state())
-            return 200, {"ok": True, "pkg": pkg,
-                         "policy": mu.plugin_policy(mu.load_state()).get(pkg, {})}
+            return 200, {"ok": True, "name": name_p,
+                         "policy": mu.plugin_policy(mu.load_state()).get(name_p, {})}
         if name in ("default_chain_get", "default_chain_set"):
             cfg = mu.load_config()
             if name == "default_chain_get":

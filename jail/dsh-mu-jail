@@ -182,6 +182,16 @@ mkdir -p "$INSTANCE_HOME" "$INSTANCE_WORK" 2>/dev/null || true
 bind_dir "$INSTANCE_HOME" "$ROOTFS/home/dsh" rw || true
 bind_dir "$INSTANCE_WORK" "$ROOTFS$DSH_WORK_IN_JAIL" rw || true
 
+# Optional shared pnpm store. pnpm records which store a profile's node_modules came
+# from and refuses to mix stores ("…currently linked from the store at …"), so this is
+# OFF unless the operator exports DSHMU_PNPM_STORE and has migrated the profile with
+# `pnpm install`. `dsh-muctl plugin fetch` fills the staging store on the host and the
+# tarball cache is what instances install from today.
+DSHMU_PNPM_STORE="${DSHMU_PNPM_STORE:-}"
+if [ -n "$DSHMU_PNPM_STORE" ] && [ -d "$DSHMU_PNPM_STORE" ]; then
+	bind_dir "$DSHMU_PNPM_STORE" "$ROOTFS/home/dsh/.pnpm-store" rw || true
+fi
+
 # Optional extra mounts from the instance conf: "host:jail[:ro],host:jail[:ro]"
 if [ -n "${EXTRA_MOUNTS:-}" ]; then
 	OLDIFS=$IFS; IFS=','

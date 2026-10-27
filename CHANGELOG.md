@@ -1,5 +1,334 @@
 # CHANGELOG
 
+## 0.28.1（文档同步：插件改成"先下载再配策略"）
+
+- `docs/13-插件.md` **整篇重写** ✓：添加=下载+解析 ✓、三个开关的**生效时机**表 ✓、
+  「一个包一行」与替换语义 ✓、实例列 ■/□ + 点击筛选 ✓、离线安装路径 ✓、
+  `plugin check` / `download_proxy` ✓、接口与状态字段 ✓、安全边界 ✓；
+- `docs/06-运维手册.md` 的插件小节整体替换 ✓（预装/推送 ✓、scoped 包名解析 ✓、
+  `plugin check` ✓、离线安装 ✓、`doctor` 四条相关检查 ✓）；
+- `docs/05-打包与安装.md` 新增 **3.1 升级** ✓：说明 `sync` 现在会 reload 网关 ✓、
+  restart 旧代码的 admin ✓、重建 nginx temp 目录 ✓，以及哪些情况要重启实例 ✓；
+- `README.md` 插件小节改成三开关 + 要点 ✓。
+
+## 0.28.0（一个包只占一行；实例方块只显示 ■□ 且点击筛选"这个插件"）
+
+- **同一个包出现两行** ✗：`@lemoncat7/dsh-ssh` 与 `@lemoncat7/dsh-ssh@1.11.1` 各成一行 ✓
+  —— 但策略是按**包名**存的 ✗，两行会抢同一个策略 ✗；
+  现在 ✓：添加同名包会**替换**旧资产（删旧 tarball 与元数据 ✓），并提示
+  `已更新 …：1.11.7 → 1.11.1` ✓；页面也按包名折叠 ✓（一行一个包 ✓）；
+- **实例方块**：只显示 ■ / □ ✓，实例名放进**悬浮提示** ✓（"alice：已安装"✓）；
+  整块区域是一个按钮 ✓，点击筛选下面「各实例已装插件」到**这个插件** ✓
+  （再点取消 ✓），选中时方块区高亮描边 ✓。
+
+## 0.27.3（带 scope 的包名：解析就错了，才会 404）
+
+- 上一版我以为只是"没编码" ✗，其实更早一步就错了 ✓：
+  `name, _, want = spec.partition("@")` 对 `@lemoncat7/dsh-ssh` 会在**开头的 `@`** 处切分 ✗ →
+  包名变成空串 ✗、版本变成 `lemoncat7/dsh-ssh` ✗ → 请求 `https://registry.npmmirror.com//lemoncat7/dsh-ssh` ✗
+  → 404 ✓（现场那条 `curl (22) 404` 就是这么来的 ✗）；
+- 现在用正则从**最后一个 `@`** 切版本 ✓：`@scope/name` / `@scope/name@^1.2.0` / `name@1.2.3` 都能正确解析 ✓
+  （实测同一 URL 在宿主上返回 200 ✓）；
+- 保留 0.27.2 的 `%2F` 编码 ✓（注册表两条路径都接受 ✓，编码更稳妥 ✓）与 curl 退出码人话提示 ✓。
+
+## 0.27.2（带 scope 的包名下载 404）
+
+- 现场：添加 `@lemoncat7/dsh-ssh` → `curl (22) 404` ✗；
+- 原因 ✓：npm 注册表的元数据路径要求**把 scope 里的斜杠编码** ✓ ——
+  我们请求 `/@lemoncat7/dsh-ssh/latest` ✗，正确是 `/@lemoncat7%2Fdsh-ssh/latest` ✓
+  （pnpm 自己会编码 ✓，所以"用户在实例里能装、我们从后台下不了"✗）；
+- 已修 ✓：`@scope/name` 统一编码为 `@scope%2Fname` ✓（tarball 地址来自注册表返回 ✓ 不用改 ✓）；
+- 同时把 curl 退出码翻译成人话 ✓（`6` DNS ✓ / `7` 连接被拒 ✓ / `22` HTTP 错误 ✓ /
+  `28` 超时 ✓ / `35`·`60` TLS ✓ / `5` 代理 ✓）—— 以前一律说"够不到" ✗，容易误导 ✓。
+
+## 0.27.1（admin 后端跑旧代码：检测并自动重启）
+
+- 现场现象：SSH 里 `curl` 通 ✓，但后台「添加插件」失败 ✗ ——
+  原因是 **admin 后端进程里还是升级前加载的 Python 模块** ✗（`apk` 换文件不会重启它 ✓）；
+  当时它报的又是笼统的"够不到 registry" ✗，看起来像网络问题 ✗；
+- 现在 ✓：
+  - `doctor` 新增 **`admin backend`** 检查 ✓：磁盘上的 `dshmuctl.py` 比进程启动时间新 → WARN ✓；
+  - `dsh-muctl sync` 会**自动重启** admin 后端 ✓（和"网关 Lua 过期自动 reload"同一思路 ✓）；
+  - PID 改为扫描 `/proc/*/cmdline` 并要求**某个参数完全等于** `/usr/local/sbin/dsh-mud` ✓
+    （`pgrep -f dsh-mud` 与 `pgrep -f '/usr/local/sbin/dsh-mud'` 都会匹配到自己的
+    shell 命令行 ✗ → 在开发机上返回了 pid 1 ✗）；
+  - 下载失败的报错带 `curl exit=N` ✓ + curl 原文 ✓ + 环境代理变量 ✓（0.27.0 ✓）。
+
+## 0.27.0（下载失败要说清原因；新增 `plugin check`）
+
+- 现场反馈：**没填代理**却报 `cannot reach https://registry.npmmirror.com` ✗ ——
+  那句话把 curl 的真实原因丢掉了 ✗（DNS？TLS？环境里的 `HTTPS_PROXY`？超时？）；
+- 现在失败信息带上 ✓：**curl 退出码** ✓、**curl 自己的 stderr** ✓（如 `(6) Could not
+  resolve host` ✓ / `(7) Failed to connect … Connection refused` ✓ / `(60) SSL
+  certificate problem` ✓ / `(28) timed out` ✓）、以及**环境里的代理变量** ✓
+  （`http_proxy`/`https_proxy`/`all_proxy` ✓ —— curl 默认会用它 ✓，我们之前没提 ✓）；
+- 新增 **`dsh-muctl plugin check`** ✓：分别探测 **registry 镜像** 与 **github codeload** ✓，
+  打印 HTTP 状态或失败原因 ✓，并提示怎么配 `download_proxy` ✓。
+
+## 0.26.1（代理相关的报错说清楚）
+
+- 下载失败时只说"cannot resolve … via registry" ✗，看不出是代理的问题 ✗；
+- 现在把代理写进错误里 ✓：`cannot reach <registry> (via proxy http://127.0.0.1:9):
+  check the registry mirror or the download proxy` ✓，tarball 下载失败同理 ✓。
+
+## 0.26.0（添加插件支持下载代理）
+
+- 「添加插件」弹窗确认**只有"规格"一项** ✓（保护 / 预装 / 推送都在行里勾 ✓，添加时不做任何策略决定 ✓）；
+- 新增 **下载代理** ✓：弹窗里可选填（如 `http://127.0.0.1:7890` ✓），
+  下载/更新时透传给 `curl --proxy` ✓ —— 内网里 GitHub 只走代理的场景 ✓；
+- 也可以设默认 ✓：`dsh-muctl config download_proxy http://127.0.0.1:7890` ✓
+  （显式填的优先 ✓）；页面会记住上次用的代理 ✓（localStorage ✓），更新时也用它 ✓；
+- API/CLI 同步 ✓：`POST /api/plugin-policy {action:"add", spec, proxy}` ✓、
+  `dsh-muctl plugin add <spec> --proxy URL` ✓。
+
+## 0.25.4（策略行记住来源规格）
+
+- 勾选策略时只写了包名 ✗，`spec` 落成了包名本身 ✗ → `doctor` 判成"策略缺离线包" ✗
+  （明明下载过 ✓，实测 H3 就报了这条 WARN ✗）；
+- 现在 `set_plugin_policy()` 会按包名回查下载记录 ✓，把**真实来源**（`github:owner/repo` /
+  npm 规格 ✓）写进策略行 ✓ —— 安装、更新、doctor、页面显示都用同一个来源 ✓。
+
+## 0.25.3（资产清单自动剔除已删除的包）
+
+- 「移除并删包」之后 `state.plugin_assets` 里还留着条目 ✗（文件已没了 ✓）→
+  `doctor` 仍显示"2 package(s) downloaded" ✗ 且旧条目可能被当成"可配策略" ✗；
+- 现在 `plugin_assets()` 只返回 **tarball 仍然存在** 的条目 ✓（读时过滤 ✓，无需迁移 ✓）。
+
+## 0.25.2（删除包时连元数据一起清）
+
+- 「移除并删包」只删了 `.tgz` ✗，缓存目录里还留着 `<slug>.json` 元数据 ✗ → 已一并删除 ✓
+  （CLI 与后台两条路径都改 ✓）。
+
+## 0.25.1（补回被误删的辅助函数）
+
+- 0.25.0 重构时我把 `plugin_cache_dir()` / `fetch_plugin_to_cache()` / `pnpm_store_index()` /
+  `plugin_spec_ok()` 等一整套辅助函数**连同旧策略代码一起删掉了** ✗ ——
+  于是"添加插件"直接 `NameError` ✗（实测 ✓），`doctor` 也报 `plugin_cache_dir` 未定义 ✗；
+- 已全部补回 ✓（缓存目录 / 规格校验 / 下载 / 索引 / store 统计 / 可选灌 store ✓），
+  单元自检通过 ✓（6 种规格校验、缓存与 store 路径、策略模型读写 ✓）。
+
+## 0.25.0（插件页重构：先下载再配策略；强制安装拆成预装 / 推送）
+
+按讨论定稿 ✓：
+
+- **列表只显示"已下载离线包"的插件** ✓ —— 只有它们能配策略 ✓，
+  因此不可能再出现"没批准却勾了强制安装"✗；
+- **添加插件 = 下载 + 解析 + 入库** ✓：弹窗只填规格 ✓（`github:owner/repo[#ref]` 或 npm 名 ✓），
+  点「下载并添加」→ 当场下载 ✓，从 tarball 的 `package/package.json` 读出**真实包名与版本** ✓，
+  失败则不产生任何行 ✓；
+- **策略从"按规格"改为"按包名"** ✓（页面显示人能看懂的名字 ✓，规格只作来源 ✓）——
+  这也修掉了一个真 bug ✗：`github:` 规格与已装包名不一致 ✗ → 判"装没装"永远不相等 ✗ →
+  每次 `sync` 重复安装 ✗；
+- **强制安装拆成两个独立开关** ✓：
+  - **预装**：**新建实例**时自动装 ✓（`create_instance` 里走 `create` 阶段 ✓）；
+  - **推送**：推给**已有实例** ✓，并且**此后每次重启都补齐** ✓（`start_instance` 里走 `push` 阶段 ✓）；
+  - 只勾"预装"不勾"推送" → 已有实例重启时**不会**补装 ✓（就是你要的语义 ✓）；
+- **「已装实例」列换成 ■/□ 矩阵** ✓：每个实例一个方块 ✓，实心=已装 ✓，点一下把下面
+  「各实例已装插件」筛到那个实例 ✓（再点取消 ✓）；
+- 操作列：**更新**（重新下载 ✓）/ **移除策略**（保留离线包 ✓）/ **移除并删包** ✓；
+- 旧的 `mandatory` 字段兼容读取 ✓（自动映射为 预装＋推送 ✓），下次写入即迁移 ✓；
+- CLI 同步 ✓：`plugin add <spec>` ✓、`plugin remove <name> [--delete-asset]` ✓、
+  `plugin protect|unprotect` ✓、`plugin preinstall|unpreinstall` ✓、`plugin push|unpush` ✓、
+  `plugin list` ✓；
+- `doctor` 改为两项 ✓：`plugin packages`（下载了几个离线包 ✓）与
+  `plugin policy`（策略缺离线包 → WARN ✓；推送未落地的实例 → WARN ✓）。
+
+## 0.24.0（后台「插件」页补上"批准"操作）
+
+- 之前 `plugin fetch` 只有 CLI ✓，后台只能勾"强制安装" ✗ —— 勾了但没批准 → 实例侧
+  只会 WARN"未批准"✗，从页面看不出该做什么 ✗；
+- 现在「插件」表多一列 **批准（可离线装）** ✓：未批准显示 `未批准 [批准]` ✓、
+  已批准显示 `已批准 [更新]` ✓；点一下就等价于 `dsh-muctl plugin fetch <pkg>` ✓
+  （宿主下载一次 ✓，然后自动 `sync` ✓）；
+- `GET /api/plugin-policy` 多返回 `approved`（已批准的包 + 版本/大小/时间）✓ 与
+  `offline`（是否开启强制离线）✓；`POST /api/plugin-policy` 支持 `{action:"fetch", pkg}` ✓；
+- 「添加策略」弹窗不变 ✓，但建议的顺序是：先填包 → 保存 → 在表里点「批准」→ 勾「强制安装」✓。
+
+## 0.23.8（`plugin fetch` 双产物：准入名单 + tarball；store 可选）
+
+- 0.23.4 之后 `plugin fetch` 只灌 store ✗，不再产出 tarball ✗ —— 而实例当前**能装**的正是
+  tarball 的 `file:` 路径 ✗ → 准入名单有了、却装不上 ✗；已修 ✓：
+  - `plugin fetch <spec>` ✓ = 下载 tarball ✓ + 写准入名单（`pnpm-store-index.json`）✓；
+  - `plugin fetch <spec> --store` ✓ = 额外再灌一次 pnpm store ✓（留给严格离线那一步 ✓）；
+- 强制安装的 WARN 文案改成"未被管理员批准"✓，并直接给
+  `dsh-muctl plugin fetch <spec>` 的修法 ✓；
+- 于是当前语义完整可用 ✓：**只有 admin fetch 过的包才会被强制安装** ✓
+  （未批准 → 跳过 + WARN ✓；已批准 → 从实例 home 里的 tarball 离线装 ✓）。
+
+## 0.23.7（找到硬限制：pnpm 不允许换 store；严格离线改为可选）
+
+实测把原因逼出来了 ✓：不是元数据 ✓，而是 pnpm 的一条硬规则 ✓：
+
+```
+The dependencies at "…/node_modules" are currently linked from the store at
+"/home/dsh/.local/share/pnpm/store/v11".
+pnpm now wants to use the store at "/home/dsh/.pnpm-store/v11" …
+If you want to use the new store location, reinstall your dependencies with
+"pnpm install".
+```
+
+→ **一个 profile 的 `node_modules` 只能配它当初安装时用的那个 store** ✗。
+所以"另起一个平台 store 再挂进去"必然失败 ✓，除非把每个 profile 都 `pnpm install` 迁一遍 ✗。
+
+因此本版把它分成两层 ✓：
+
+- **已生效（默认）** ✓：强制安装**只认 admin 显式 fetch 过的包** ✓（store 索引 = 准入名单 ✓），
+  安装走 **tarball 的 `file:` 路径** ✓ —— 实测可用 ✓（0.22.1 验过 ✓），插件本体不再联网 ✓；
+- **可选（`plugin_store_offline=true`）** ✓：在此之上再强制 pnpm 离线 ✓
+  （`pnpm_config_offline=true` + `pnpm_config_store_dir=…` ✓ —— 这两条实测有效 ✓，
+  缺包时报 `ERR_PNPM_NO_OFFLINE_TARBALL` ✓）；但要求 store 与 profile **同源** ✓，
+  否则就是上面那条报错 ✓ → 需要配合"每实例 `pnpm install` 迁移" ✓，暂不作为默认 ✓；
+- jail 里的共享 store 绑定改为**显式开启**（`DSHMU_PNPM_STORE`）✓，默认不挂 ✗，
+  避免踩到"store 不匹配" ✗。
+
+## 0.23.4（灌 store 改成脚本文件 + 记录精确版本）
+
+- 0.23.3 里"记录精确版本"没生效 ✗：`pnpm add` 的输出被重定向进日志 ✓，
+  我却在 stdout 里找版本 ✗ → 版本永远是 `latest` ✗ → 强制安装时仍然传 `is-odd`（范围 ✗）
+  → 离线解析失败 ✗（`pnpm add is-odd` exit 1 ✓，日志里就这一行 ✓）；
+- 现在把整段逻辑写成 `<实例 home>/.cache/dshmu-fill/fill.sh` 再执行 ✓（不再经 `sh -c` 传参 ✓，
+  避免引号被吃 ✓），装完用 `node -e` 把**解析出的依赖版本**写到 `resolved.json` ✓ 由宿主读回 ✓；
+- 于是强制安装可以按 `pkg@精确版本` 走离线 ✓；仍失败则退回 tarball 的 `file:` 安装 ✓。
+
+## 0.23.3（离线安装要钉版本；钉不住就退回 tarball）
+
+- 0.23.2 的 store 已经真的灌进去了 ✓（`plugin fetch is-odd` → 宿主
+  `/var/lib/dsh-mu/pnpm-store` 9 个文件 / 1.1 MB ✓），但**平台侧安装仍然失败** ✗：
+- 原因 ✓：`pnpm add <pkg>` 即使 `offline=true` 也要**先解析版本范围** ✗，
+  而离线状态下拿不到 registry 元数据 ✗ → `ERR_PNPM_NO_OFFLINE_META` 一类错误 ✓；
+- 修法 ✓：
+  1. `plugin fetch` 现在把 pnpm 解析出的**精确版本**记进 store 索引 ✓（`fetch is-odd` → `3.0.1` ✓）；
+  2. 强制安装时**按 `pkg@精确版本` 安装** ✓，离线也能解析 ✓；
+  3. 若仍然失败 ✓ → 退回 **tarball 缓存 + `file:`** ✓（`plugin cached` 里那份 ✓），
+     这条路径不需要任何元数据 ✓；
+- 用户自己装插件的行为完全不变 ✓（联网 ✓、用他自己的 store ✓、不进我们的索引 ✓）。
+
+## 0.23.2（`pnpm_config_*` 才是 pnpm 认的变量）
+
+- 0.23.1 用 `npm_config_store_dir` / `npm_config_offline` ✗ —— 在真机上实测：
+  pnpm **忽略** `store_dir`（回落到 `$PWD/.pnpm-store` ✓），于是"灌 store"灌进了实例自己家目录 ✓，
+  平台 store 一直是 0 个文件 ✗；
+- 实测有效的形式 ✓：**`pnpm_config_store_dir=…`** ✓（`pnpm store path` 立刻指向它 ✓）、
+  **`pnpm_config_offline=true`** ✓（缺包时报 `ERR_PNPM_NO_OFFLINE_TARBALL` ✓ —— 正是要的强制点 ✓）；
+- 已把 `plugin_exec(offline=True)` 与 `plugin fetch` 的填充命令都改成 `pnpm_config_*` ✓；
+- 绑定本身没问题 ✓：实例里 `/proc/self/mountinfo` 能看到
+  `/var/lib/dsh-mu/pnpm-store → /home/dsh/.pnpm-store`（rw ✓）。
+
+## 0.23.1（离线只约束平台发起的安装，不打扰用户自己装插件）
+
+按补充要求修正模型 ✓：
+
+- **不写进 `.npmrc`** ✗：0.23.0 把 `offline=true` 写进实例 `.npmrc` ✓，那会让**用户自己**在
+  DSH 界面里装插件也失败 ✗ —— 已撤回 ✓，`.npmrc` 现在只有 registry 镜像 ✓；
+- **改为按命令生效** ✓：`plugin_exec(offline=True)` 给平台自己的安装加
+  `npm_config_offline=true … npm_config_store_dir=/home/dsh/.pnpm-store` ✓ ——
+  只影响 `mandatory` 的安装 ✓；用户自己装插件时照常联网 ✓、且用的是**他自己**的默认 store ✓；
+- **平台 store 只由 admin 填充** ✓：唯一入口是 `dsh-muctl plugin fetch <spec>` ✓
+  （`--name <实例>` 指定用哪个实例的 jail 跑 pnpm ✓，默认第一个 ✓）；
+  **不会**去捡用户安装留下的 cache ✓ —— 用户装过什么，与"能不能强制安装"无关 ✓；
+- `plugin fetch` 用 `npm_config_offline=false` 显式允许联网 ✓，把**插件 + 整棵依赖树**灌进 store ✓；
+- 因此强制安装的语义最终是 ✓：**store 里有（= admin 显式灌过）→ 每个实例离线装 ✓；
+  没有 → 跳过并 WARN ✓ 提示 `plugin fetch`** ✓。
+
+## 0.23.0（强制安装改为"必须先进入共享 pnpm store"，安装过程强制离线）
+
+按"稳定性优先"的要求改了模型 ✓：
+
+- **一个平台级 pnpm store** ✓：`/var/lib/dsh-mu/pnpm-store` ✓，以读写方式挂进每个实例的
+  `/home/dsh/.pnpm-store` ✓（已经 content-addressed + 校验完整性 ✓）；
+- **实例的 `.npmrc` 被加上 `offline=true` / `prefer-offline=true` / `verify-store-integrity=true`** ✓
+  —— pnpm 从此**不允许联网** ✓：能不能装，只取决于 store 里有没有 ✓；
+- **`dsh-muctl plugin fetch <spec>` 现在是"往 store 里灌包"** ✓：在某个实例的 jail 里跑一次
+  真实 `pnpm add --store-dir /home/dsh/.pnpm-store <spec>` ✓（临时目录 ✓，不碰该实例的 profile ✓），
+  于是**插件本身和它的整棵依赖树**都进了 store ✓ —— 上一条里"传递依赖还要联网"的缺口就此关闭 ✓；
+- **强制安装的语义变成** ✓：`plugin require <spec>` **且** store 里有它 ✓ → 每个实例离线安装 ✓
+  （秒级 ✓、可重复 ✓、断网也能装 ✓）；store 里没有 → **跳过并 WARN** ✓，
+  提示 `dsh-muctl plugin fetch <spec>` ✓ —— 不再"看着设了其实装不上"✗；
+- `plugin cached` 变成 store 报表 ✓（路径 / 文件数 / 体积 / 每个包的灌入时间 ✓）；
+  `doctor` 新增 **`pnpm store`** 检查 ✓（空 store 会 WARN 并提示怎么填 ✓）；
+- 仍然保留 0.22.x 的 tarball 缓存 ✓（`file:` 离线安装 ✓）作为第二层保险 ✓；
+- 可用 `dsh-muctl config plugin_store_offline false` 关掉强制离线 ✓（默认开 ✓）。
+
+## 0.22.1（缓存改成"拷进实例 home"，不再依赖新挂载）
+
+- 0.22.0 用**只读绑定**把宿主缓存目录挂进 jail ✗ —— 实测在这个 LXC 上那层 bind 没生效 ✗
+  （`file:` 路径在实例里 ENOENT ✓，安装失败 ✓）；
+- 改成更朴素的做法 ✓：命中缓存时把 tgz **拷到实例自己的 home**
+  （`~/.cache/dsh-mu-plugins/<pkg>.tgz` ✓，属主跟实例 uid 对齐 ✓），
+  `file:` 就指向这里 ✓ —— home 本来就是可写绑定 ✓，不需要任何新的 jail 逻辑 ✓，
+  也不可能因为命名空间差异而失效 ✓；文件只有几十 KB ✓；
+- 同时撤掉 0.22.0 里新增的 `DSHMU_PLUGIN_CACHE*` 两行 conf 与 jail 里的 bind 块 ✓
+  （减少一处不必要的挂载面 ✓）。
+
+## 0.22.0（强制安装不再逐实例联网 + 重启时自动补齐）
+
+两个问题都来自实际部署 ✓：
+
+1. **强制安装每次都是网络安装** ✗：`mandatory` 的包在**每个新实例**创建/`sync` 时都走
+   实例内 `dsh plugin add` ✓ → pnpm 去 `registry.npmmirror.com` ✓ 或（`github:` 规格）
+   `codeload.github.com` ✓ 拉包 ✗ —— 国内网络下这就是每个实例多一次失败机会 ✗；
+2. **重启实例不会补装** ✗：只有 `sync` 和创建实例时会检查 ✓。
+
+改动 ✓：
+
+- **插件下载缓存** ✓：新增 `dsh-muctl plugin fetch <spec>` ✓ —— 在**宿主**上把包下一次 ✓
+  （npm 走 `plugin_registry`，默认 `registry.npmmirror.com` ✓；`github:owner/repo[#ref]`
+  走 `codeload` ✓），存到 `/var/lib/dsh-mu/plugin-cache/` ✓，并记录 sha256 ✓；
+  `plugin cached` 列出 ✓、`plugin forget` 删除 ✓；
+- **强制安装优先用缓存** ✓：命中缓存时改成 `file:/home/dsh/.dsh-mu-cache/<pkg>.tgz` ✓ ——
+  实例**完全不联网** ✓；缓存目录以**只读**方式绑定进 jail ✓（实例能装、不能改 ✓）；
+  没命中则退回原来的网络安装 ✓ 并打印 `hint: dsh-muctl plugin fetch <pkg>` ✓；
+- **重启即对账** ✓：`start_instance()` 现在先跑 `install_mandatory_plugins()` +
+  `reconcile_protected_plugins()` 再启动服务 ✓ —— 用户删掉的强制插件在**重启时**补回来 ✓，
+  受保护插件的清单也在重启时修复 ✓；
+- **策略支持非 npm 规格** ✓：`plugin protect|require github:owner/repo[#ref]` ✓、
+  `file:/abs/path.tgz` ✓（`plugin_spec_ok()` 校验 ✓）；
+- `doctor` 新增 **mandatory plugins** 检查 ✓：逐个实例核对是否都装了 ✓，未装则 WARN ✓
+  并提示"重启实例会在启动时补装" ✓；顺带显示有多少个已缓存（可离线装）✓。
+
+## 0.21.6（同一故障第二次出现：把 sync 改成"绝不删临时目录"）
+
+客户第二次报上传失败 ✓，日志还是同一句 ✓：
+
+```
+[crit] open() "/var/tmp/nginx/client_body/0000000005" failed (2: No such file or directory)
+```
+
+原因 ✓：0.21.5 只是"删掉后**再建回来**" ✓ —— 只要客户还在旧版本 ✓，或者 `sync` 与 nginx 重载/重启
+的时序错开 ✓，`client_body` 还是会缺 ✓。**从结构上修掉** ✓：
+
+- `sync` **不再 `rmtree`** 那棵临时目录树 ✗ —— 改成"确保存在 + 归零权限（`root:root 0700`）" ✓
+  （当初删树只是为了纠正属主 ✓，`chown` 就够了 ✓）；这样任何一次 `sync` 都不可能再把它删掉 ✓；
+- `doctor --fix` 也会检查并补建 ✓，缺了就 `dsh-muctl gateway restart` ✓；
+- 保留 0.21.5 的 `ensure_nginx_temp_dirs()` 与 `doctor` 的 `nginx temp dirs` 检查 ✓（缺了直接 FAIL ✓）。
+
+> 现场应急仍然是一条命令 ✓：
+> `mkdir -p /var/lib/dsh-mu/gateway/rootfs/var/tmp/nginx/{client_body,proxy,fastcgi,uwsgi,scgi} && dsh-muctl gateway restart`
+
+## 0.21.5（上传文件 500：网关临时目录被 sync 删掉了）
+
+真实故障 ✓：客户在对话输入框粘贴文件 → `POST /api/session/uploadFileBinary` → **500** ✓，
+而 GET 一切正常 ✓。网关日志一句话定位 ✓：
+
+```
+[crit] open() "/var/tmp/nginx/client_body/0000000001" failed (2: No such file or directory)
+```
+
+- **根因（我们的 bug）** ✗：`sync` 在 jail 模式下会把
+  `<gateway rootfs>/var/tmp/nginx` **整棵删掉**再 `makedirs` ✗ —— 只重建了**父目录** ✗，
+  五个子目录（`client_body` / `proxy` / `fastcgi` / `uwsgi` / `scgi`）没了 ✓；
+  nginx 只在**启动时**补建临时目录 ✓，于是"Sync 之后、重启之前"的所有**带请求体的请求**
+  （上传、大 JSON）都会 500 ✗，纯 GET 不受影响 ✓ —— 看起来像"应用 bug"✓；
+- **修**：新增 `NGINX_TEMP_SUBDIRS` / `NGINX_TEMP_ROOT` / `ensure_nginx_temp_dirs()` ✓，
+  sync 重建父目录时把子目录一起建回来 ✓；
+- **加检查**：`doctor` 在 jail 模式下新增 `nginx temp dirs` ✓ —— 缺了直接 **FAIL** 并给出
+  `dsh-muctl sync` 的修法 ✓（host 模式仍用原来的 `nginx runtime` 检查 ✓）；
+- 现场应急（不用升级也能立刻恢复）✓：
+  ```sh
+  mkdir -p /var/lib/dsh-mu/gateway/rootfs/var/tmp/nginx/{client_body,proxy,fastcgi,uwsgi,scgi}
+  dsh-muctl gateway restart
+  ```
+
 ## 0.21.4（`nftables` 其实改错了地方：无签名包读的是 make-apk.sh）
 
 - 0.21.3 我只改了 `packaging/APKBUILD` 的 `depends` ✗ —— 那份只在 `--signed`（abuild）路径生效 ✓；

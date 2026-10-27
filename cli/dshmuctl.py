@@ -107,6 +107,12 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
      "实例出网策略：open（不限制）/ no-intranet（禁内网，默认）/ allowlist（只允许白名单）"),
     ("INSTANCE_EGRESS_ALLOW", "instance_egress_allow", "str", "",
      "白名单/豁免：逗号分隔的 ip 或 cidr，可带 :端口（如 10.1.2.3:443,192.168.5.0/24:5432）"),
+    ("DOWNLOAD_PROXY", "download_proxy", "str", "",
+     "插件下载/更新时用的代理（curl --proxy），例如 http://127.0.0.1:7890；"
+     "留空则直连。添加插件时也可以临时指定"),
+    ("PLUGIN_STORE_OFFLINE", "plugin_store_offline", "bool", False,
+     "强制安装时强制 pnpm 离线（只用平台 store）。默认关：pnpm 把 node_modules 绑定到"
+     "安装它时用的那个 store，换 store 会让已有 profile 失配（需 pnpm install 迁移）"),
     ("INSTANCE_KEEP_CAPS", "instance_keep_caps", "optstr", "",
      "实例保留的 capability（逗号分隔，空=全部丢弃）。DSH 的命令工具用 bwrap 沙箱，"
      "在 jail 里需要 sys_admin（建命名空间/挂载）+ setuid/setgid（uid 映射）"),
@@ -797,13 +803,21 @@ def render_gateway(st: dict):
             write_gateway_jail_conf(st["config"])
         with contextlib.suppress(OSError):
             render_gateway_jail_conf_files(st["config"])
-        # nginx chowns its temp dirs at startup; with only CAP_NET_BIND_SERVICE the
-        # call fails if the dirs are owned by the worker user, so recreate them.
+        # nginx wants its temp dirs to be owned by root inside the jail; with only
+        # CAP_NET_BIND_SERVICE the startup chown would fail if they were not, so we
+        # normalise the ownership here.
+        #
+        # Do NOT delete the tree: 0.21.4 and earlier wiped <rootfs>/var/tmp/nginx and
+        # recreated only the parent, so `client_body` was gone until the *next nginx
+        # start* (a reload does not recreate temp paths). Every request with a body --
+        # file uploads, large JSON -- then failed with HTTP 500 while GETs kept working.
         with contextlib.suppress(OSError):
-            tmpdir = f"{gateway_paths()['rootfs']}/var/tmp/nginx"
-            if os.path.isdir(tmpdir):
-                shutil.rmtree(tmpdir, ignore_errors=True)
-            os.makedirs(tmpdir, exist_ok=True)
+            tmpdir = f"{gateway_paths()['rootfs']}{NGINX_TEMP_ROOT}"
+            ensure_nginx_temp_dirs(tmpdir)
+            for name in NGINX_TEMP_SUBDIRS:
+                path = f"{tmpdir}/{name}"
+                os.chmod(path, 0o700)
+                os.chown(path, 0, 0)
     try:
         if group:
             os.chown(GW_DIR, 0, grp.getgrnam(group).gr_gid)
@@ -909,6 +923,7 @@ def render_instance_conf(st: dict, name: str):
         f"EXTRA_MOUNTS=\"{inst.get('extra_mounts', '')}\"",
         # read-only, same-path binds for protected plugins (kernel-enforced EROFS)
         f"RO_PATHS=\"{','.join(protected_paths(name))}\"",
+
         "",
     ]
     atomic_write(f"{INST_CONF_DIR}/{name}.conf", "\n".join(lines), mode=0o644)
@@ -1036,8 +1051,26 @@ def render_cgroup_service(register: bool = True):
 
 
 NGINX_USER = "nginx"
-NGINX_TEMP_DIRS = ("/var/tmp/nginx/client_body", "/var/tmp/nginx/proxy",
-                   "/var/tmp/nginx/fastcgi", "/var/tmp/nginx/uwsgi", "/var/tmp/nginx/scgi")
+# openresty is compiled with --http-*-temp-path=/var/tmp/nginx/<name>, so every one of
+# these must exist. A POST with a body (file upload, JSON larger than the in-memory
+# buffer) is buffered to client_body; if the directory is missing nginx answers 500
+# ("open() .../client_body/0000000001 failed (2: No such file or directory)") while GET
+# requests keep working -- which makes it look like an application bug.
+NGINX_TEMP_SUBDIRS = ("client_body", "proxy", "fastcgi", "uwsgi", "scgi")
+NGINX_TEMP_ROOT = "/var/tmp/nginx"
+NGINX_TEMP_DIRS = tuple(f"{NGINX_TEMP_ROOT}/{n}" for n in NGINX_TEMP_SUBDIRS)
+
+
+def ensure_nginx_temp_dirs(root: str) -> list[str]:
+    """Create <root>/{client_body,proxy,...}; return the ones that were missing."""
+    made: list[str] = []
+    os.makedirs(root, exist_ok=True)
+    for name in NGINX_TEMP_SUBDIRS:
+        path = f"{root}/{name}"
+        if not os.path.isdir(path):
+            os.makedirs(path, exist_ok=True)
+            made.append(path)
+    return made
 
 
 def nginx_runtime_gaps() -> list[str]:
@@ -1499,7 +1532,9 @@ def sync_all(st: dict):
     ensure_cgroup_service()
     for name in st["instances"]:
         with contextlib.suppress(Exception):
-            install_mandatory_plugins(st, name)
+            # `push` = apply to instances that already exist; `preinstall` is only used
+            # when an instance is created.
+            install_phase(st, name, {"push"})
         with contextlib.suppress(Exception):
             for change in reconcile_protected_plugins(st, name):
                 info(f"{name}: {change}")
@@ -1508,6 +1543,8 @@ def sync_all(st: dict):
         # Model plans (provider + key per user) are rendered as launch patches.
         with contextlib.suppress(OSError):
             sync_instance_plans(st, name)
+    with contextlib.suppress(Exception):
+        restart_admin_if_stale()
     ensure_instance_autostart(st)
     apply_egress(st)
     render_gateway(st)
@@ -1975,6 +2012,10 @@ def seed_dsh_home(st: dict, inst: dict, home: str):
     # plugin installs run inside the jail).
     registry = st["config"].get("npm_registry")
     npmrc = f"{home}/.npmrc"
+    # Only the registry mirror here. The platform-wide store + offline mode are applied
+    # per command by plugin_exec(offline=True), so that a user installing a plugin from
+    # their own DSH UI keeps working online and keeps using their own store -- the
+    # platform store is filled exclusively by `dsh-muctl plugin fetch`.
     if registry:
         atomic_write(npmrc, f"registry={registry}\n", mode=0o644)
     elif os.path.exists(npmrc):
@@ -2315,6 +2356,14 @@ def start_instance(st: dict, name: str, timeout: float = 900.0):
     inst = st["instances"][name]
     ensure_owner(st, name)
     render_instance_conf(st, name)
+    # Reconcile plugin policy on every start (restart = stop + start). "推送" decides
+    # whether a restart re-installs: preinstall-only packages are left to the user once
+    # the instance exists, pushed ones are topped up here.
+    with contextlib.suppress(Exception):
+        install_phase(st, name, {"push"})
+    with contextlib.suppress(Exception):
+        for change in reconcile_protected_plugins(st, name):
+            info(f"{name}: {change}")
     service_action(name, "start")
     inst["state"] = "running"
     inst["started_at"] = int(time.time())
@@ -3435,6 +3484,11 @@ def create_instance(st: dict, name: str, user: str, cpu, mem, pids, port,
     uid = allocate_uid(st) if mode == "auto" else int(mode)
     iport = allocate_port(st, int(port) if port else None)
 
+    # A brand-new instance gets the `preinstall` set. Nothing exists yet, so this is the
+    # only place where preinstall (without push) has any effect.
+    with contextlib.suppress(Exception):
+        install_phase(st, name, {"create"})
+
     base = f"{INSTANCES_DIR}/{name}"
     os.makedirs(base, exist_ok=True)
     info(f"creating instance {name}: copying template -> {base}/rootfs ...")
@@ -3652,41 +3706,184 @@ def instance_plugins(name: str) -> list[dict]:
 
 
 PLUGIN_POLICY_KEY = "plugin_policy"
+PLUGIN_ASSET_KEY = "plugin_assets"
+
+
+def plugin_assets(st: dict) -> dict:
+    """Downloaded (offline-installable) packages: spec -> {name, version, file, sha256}.
+
+    A package only exists here after an administrator added it, which is what makes it
+    eligible for preinstall/push policy. Reading falls back to the legacy file on disk.
+    """
+    raw = st.get(PLUGIN_ASSET_KEY)
+    rows = {}
+    if isinstance(raw, dict) and raw:
+        rows = {str(k): dict(v) for k, v in raw.items() if isinstance(v, dict)}
+    else:
+        # legacy: the on-disk index written before assets moved into state.json
+        rows = {str(spec): {"name": str(row.get("name") or ""),
+                            "version": row.get("version"),
+                            "file": row.get("file"), "sha256": row.get("sha256"),
+                            "fetched_at": row.get("fetched_at")}
+                for spec, row in pnpm_store_index().items() if isinstance(row, dict)}
+    # An asset whose tarball was deleted is gone: never offer it for policy.
+    return {spec: row for spec, row in rows.items()
+            if row.get("file") and os.path.exists(str(row["file"]))}
+
+
+def asset_by_name(st: dict, pkg_name: str) -> tuple[str, dict] | tuple[None, None]:
+    for spec, row in plugin_assets(st).items():
+        if str(row.get("name") or "") == pkg_name:
+            return spec, row
+    return None, None
 
 
 def plugin_policy(st: dict) -> dict:
-    """Per-package policy: protected (cannot be removed) + mandatory (always present)."""
+    """Per-package policy, keyed by package NAME: protected / preinstall / push.
+
+    - protected: the files cannot be removed once installed
+    - preinstall: a newly created instance gets it
+    - push: existing instances get it (also re-applied when an instance restarts)
+    """
     raw = st.get(PLUGIN_POLICY_KEY)
     if not isinstance(raw, dict):
         return {}
     out = {}
-    for pkg, row in raw.items():
+    for key, row in raw.items():
         if not isinstance(row, dict):
             continue
-        entry = {"protected": bool(row.get("protected")),
-                 "mandatory": bool(row.get("mandatory"))}
+        legacy = bool(row.get("mandatory"))
+        name = str(row.get("name") or key)
+        entry = {"spec": str(row.get("spec") or ("" if name != key else key)),
+                 "protected": bool(row.get("protected")),
+                 "preinstall": bool(row.get("preinstall", legacy)),
+                 "push": bool(row.get("push", legacy))}
         if row.get("note"):
             entry["note"] = str(row["note"])
-        if entry["protected"] or entry["mandatory"] or entry.get("note"):
-            out[str(pkg)] = entry
+        if entry["protected"] or entry["preinstall"] or entry["push"] or entry.get("note"):
+            out[name] = entry
     return out
 
 
-def set_plugin_policy(st: dict, pkg: str, protected: bool | None = None,
-                      mandatory: bool | None = None, note: str | None = None) -> dict:
-    if not PLUGIN_PKG_RE.match(pkg):
-        raise ValueError(f"invalid package name: {pkg}")
+def set_plugin_policy(st: dict, name: str, spec: str | None = None,
+                      protected: bool | None = None, preinstall: bool | None = None,
+                      push: bool | None = None, note: str | None = None) -> dict:
+    """Create/update the policy row for one package NAME (not a spec)."""
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("package name is required")
     table = st.setdefault(PLUGIN_POLICY_KEY, {})
-    entry = table.setdefault(pkg, {})
+    # migrate a legacy key that was a spec (github:owner/repo) to the package name
+    entry = table.get(name)
+    if entry is None:
+        for key, row in list(table.items()):
+            if isinstance(row, dict) and (row.get("name") == name or key == name):
+                entry = table.pop(key)
+                break
+    entry = entry if isinstance(entry, dict) else {}
+    entry["name"] = name
+    if not spec:
+        # remember which downloaded asset this policy belongs to (the source URL/spec),
+        # otherwise doctor and the UI cannot tell whether an offline package exists
+        found_spec, _asset = asset_by_name(st, name)
+        spec = found_spec or entry.get("spec")
+    if spec:
+        entry["spec"] = str(spec)
     if protected is not None:
         entry["protected"] = bool(protected)
-    if mandatory is not None:
-        entry["mandatory"] = bool(mandatory)
+    if preinstall is not None:
+        entry["preinstall"] = bool(preinstall)
+    if push is not None:
+        entry["push"] = bool(push)
     if note is not None:
         entry["note"] = str(note)
-    if not entry.get("protected") and not entry.get("mandatory") and not entry.get("note"):
-        table.pop(pkg, None)
-    return plugin_policy(st).get(pkg, {})
+    entry.pop("mandatory", None)
+    if not entry.get("protected") and not entry.get("preinstall") and not entry.get("push") \
+            and not entry.get("note"):
+        table.pop(name, None)
+    else:
+        table[name] = entry
+    return plugin_policy(st).get(name, {})
+
+
+def package_from_tarball(path: str) -> dict:
+    """Read the real package name/version out of a downloaded .tgz."""
+    with tarfile.open(path, "r:gz") as tar:
+        for member in tar.getmembers():
+            parts = member.name.strip("./").split("/")
+            if len(parts) == 2 and parts[1] == "package.json":
+                data = json.loads(tar.extractfile(member).read().decode("utf-8"))
+                return {"name": str(data.get("name") or ""),
+                        "version": str(data.get("version") or "")}
+    raise ValueError(f"{path} does not look like an npm package tarball")
+
+
+def add_plugin_asset(st: dict, spec: str, proxy: str | None = None) -> dict:
+    """Download `spec` once, remember it, and return {spec, name, version, file}."""
+    meta = fetch_plugin_to_cache(spec, proxy=proxy)
+    info_doc = package_from_tarball(meta["file"])
+    if not info_doc["name"]:
+        raise ValueError(f"{spec}: the tarball has no package name")
+    row = {"name": info_doc["name"], "version": info_doc["version"] or meta.get("version"),
+           "file": meta["file"], "sha256": meta.get("sha256"),
+           "source": spec.split(":")[0] if ":" in spec else "npm",
+           "fetched_at": meta.get("fetched_at")}
+    assets = st.setdefault(PLUGIN_ASSET_KEY, {})
+    # One row per PACKAGE: `@scope/x` and `@scope/x@1.2.0` must not coexist (the policy
+    # is keyed by package name, so two assets would fight over the same row).
+    replaced = []
+    for other_spec, other in list(assets.items()):
+        if other_spec != spec and str((other or {}).get("name")) == row["name"]:
+            old_file = str((other or {}).get("file") or "")
+            if old_file and os.path.exists(old_file):
+                with contextlib.suppress(OSError):
+                    os.unlink(old_file)
+            with contextlib.suppress(OSError):
+                os.unlink(f"{plugin_cache_dir()}/{plugin_cache_slug(other_spec)}.json")
+            replaced.append(str((other or {}).get("version") or "?"))
+            assets.pop(other_spec, None)
+    assets[spec] = row
+    out = {"spec": spec, **row}
+    if replaced:
+        out["replaced_version"] = ", ".join(replaced)
+    return out
+
+
+def install_phase(st: dict, name: str, phases: set[str]) -> list[str]:
+    """Install policy plugins into one instance for the given phases.
+
+    phases: {"create"} for a new instance, {"push"} when pushing to existing ones.
+    """
+    done = []
+    have = installed_package_dirs(name) | {r["pkg"] for r in instance_plugins(name)}
+    for pkg, row in sorted(plugin_policy(st).items()):
+        wanted = ("create" in phases and row.get("preinstall")) or \
+                 ("push" in phases and row.get("push"))
+        if not wanted or pkg in have:
+            continue
+        spec, asset = asset_by_name(st, pkg)
+        info(f"{name}: installing {pkg} ({'from ' + str(spec) if spec else 'network'})")
+        try:
+            if asset and asset.get("file") and os.path.exists(str(asset["file"])):
+                stage = f"{instance_home(name)}/.cache/dsh-mu-plugins"
+                os.makedirs(stage, exist_ok=True)
+                dest = f"{stage}/{os.path.basename(str(asset['file']))}"
+                shutil.copyfile(str(asset["file"]), dest)
+                ok, out = plugin_exec(name, "add", f"file:/home/dsh/.cache/dsh-mu-plugins/"
+                                                   f"{os.path.basename(str(asset['file']))}")
+            else:
+                info(f"WARNING: {name}: {pkg} has no offline package; "
+                     f"add it again from the admin page")
+                continue
+        except Exception as exc:  # noqa: BLE001
+            ok, out = False, str(exc)
+        if ok:
+            done.append(pkg)
+            record_plugin(load_state(), name, pkg,
+                          str((asset or {}).get("version") or "*"), "policy", "platform")
+        else:
+            info(f"WARNING: {name}: {pkg} could not be installed: {out[-160:]}")
+    return done
 
 
 def protected_paths(name: str) -> list[str]:
@@ -3734,7 +3931,7 @@ def installed_package_dirs(name: str) -> set[str]:
 
 
 def reconcile_protected_plugins(st: dict, name: str) -> list[str]:
-    """Keep protected/mandatory plugins present and enabled in one instance.
+    """Keep policy plugins present and enabled in one instance.
 
     DSH's own manager removes the dependency + the bundle entry from package.json
     before running pnpm, so a read-only node_modules alone would still "uninstall" it.
@@ -3760,7 +3957,7 @@ def reconcile_protected_plugins(st: dict, name: str) -> list[str]:
     for pkg, row in sorted(policy.items()):
         if pkg not in installed:
             continue
-        if row.get("protected") or row.get("mandatory"):
+        if row.get("protected") or row.get("preinstall") or row.get("push"):
             if pkg not in deps:
                 deps[pkg] = deps.get(pkg, "*")
                 changed.append(f"{pkg}: dependency restored")
@@ -3799,39 +3996,266 @@ def reconcile_protected_plugins(st: dict, name: str) -> list[str]:
     return changed
 
 
-def install_mandatory_plugins(st: dict, name: str) -> list[str]:
-    """Best-effort install of every `mandatory` package into one instance."""
-    done = []
-    for pkg, row in sorted(plugin_policy(st).items()):
-        # only `mandatory` installs itself; `protected` protects what is already there
-        if not row.get("mandatory"):
-            continue
-        have = installed_package_dirs(name) | {r["pkg"] for r in instance_plugins(name)}
-        if pkg in have:
-            continue
-        try:
-            ok, out = plugin_exec(name, "add", pkg)
-        except Exception as exc:  # noqa: BLE001
-            ok, out = False, str(exc)
-        if ok:
-            record_plugin(load_state(), name, pkg, _installed_version(name, pkg) or "*",
-                          "mandatory", "platform")
-            done.append(pkg)
-        else:
-            info(f"WARNING: mandatory plugin {pkg} could not be installed into {name}: "
-                 f"{out[-160:]}")
-    return done
+def plugin_exec(name: str, verb: str, pkg: str, version: str | None = None,
+                offline: bool = False) -> tuple[bool, str]:
+    """Run `dsh plugin --profile <p> <verb> <pkg>[@ver]` inside the instance jail.
 
-
-def plugin_exec(name: str, verb: str, pkg: str, version: str | None = None) -> tuple[bool, str]:
-    """Run `dsh plugin --profile <p> <verb> <pkg>[@ver]` inside the instance jail."""
+    `offline=True` forces pnpm to use the platform store and to refuse the network, so
+    the install either works from the store or fails loudly (never a half-cached
+    install that differs per instance). Only platform actions pass it.
+    """
     profile = instance_profile(name)
     spec = pkg if not version else f"{pkg}@{version}"
-    cmd = f"dsh plugin --profile {profile} {verb} {spec}"
+    env = ""
+    if offline:
+        # pnpm reads PNPM_CONFIG_* (npm_config_* is ignored for these two keys --
+        # verified on the box: npm_config_store_dir fell back to $PWD/.pnpm-store, while
+        # pnpm_config_store_dir was honoured and pnpm_config_offline produced
+        # ERR_PNPM_NO_OFFLINE_TARBALL for a package missing from the store).
+        env = (f"env pnpm_config_offline=true pnpm_config_prefer_offline=true "
+               f"pnpm_config_store_dir={PNPM_STORE_IN_JAIL} ")
+    cmd = f"{env}dsh plugin --profile {profile} {verb} {spec}"
     info(f"running inside {name}: {cmd}")
     res = subprocess.run([JAIL, name, "--", cmd], capture_output=True, text=True, timeout=900)
     out = ((res.stdout or "") + (res.stderr or "")).strip()
     return res.returncode == 0, out[-2000:]
+
+
+PLUGIN_SPEC_RE = re.compile(r"^(?:github:[\w.-]+/[\w.-]+(?:#[\w./-]+)?"
+                            r"|file:/[^\s]+"
+                            r"|(@[\w.-]+/)?[\w.-]+)(?:@[\w.^~<>=+*-]+)?$")
+
+
+def plugin_spec_ok(spec: str) -> bool:
+    """npm name (`@scope/pkg`), `github:owner/repo[#ref]`, or `file:/abs/path.tgz`."""
+    return bool(PLUGIN_SPEC_RE.match(str(spec or "").strip()))
+
+
+PLUGIN_CACHE_IN_JAIL = ".cache/dsh-mu-plugins"   # relative to the instance home
+PNPM_STORE_IN_JAIL = "/home/dsh/.pnpm-store"
+
+
+def plugin_cache_dir() -> str:
+    return f"{VAR}/plugin-cache"
+
+
+def plugin_cache_slug(spec: str) -> str:
+    """Deterministic cache file name for a spec (`github:o/r` -> `github-o-r`)."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(spec).strip()).strip("-")
+    return slug[:80] or "pkg"
+
+
+def plugin_cache_entry(spec: str) -> dict | None:
+    base = f"{plugin_cache_dir()}/{plugin_cache_slug(spec)}"
+    meta_path = base + ".json"
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        meta = json.loads(read_text(meta_path) or "{}")
+    except ValueError:
+        return None
+    tarball = str(meta.get("file") or "")
+    if not tarball or not os.path.exists(tarball):
+        return None
+    return meta
+
+
+def plugin_network_report() -> list[tuple[str, bool, str]]:
+    """Reachability of the two download sources, with the reason when they fail."""
+    registry = str(load_config().get("plugin_registry")
+                   or "https://registry.npmmirror.com").rstrip("/")
+    rows = []
+    for label, url in (("registry mirror", f"{registry}/is-odd/latest"),
+                       ("github codeload", "https://codeload.github.com/")):
+        proxy = download_proxy(None)
+        cmd = ["curl", "-fsS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "20"]
+        if proxy:
+            cmd += ["--proxy", proxy]
+        res = run(cmd + [url], check=False, capture=True)
+        code = (res.stdout or "").strip() or "-"
+        ok = res.returncode == 0 and code.startswith(("2", "3"))
+        rows.append((label, ok, f"HTTP {code}" + ("" if ok else _curl_reason(res, proxy))))
+    return rows
+
+
+CURL_HINTS = {
+    6: "DNS lookup failed (check /etc/resolv.conf)",
+    7: "connection failed (blocked port / wrong proxy)",
+    22: "the server returned an HTTP error (see the code below)",
+    28: "timed out",
+    35: "TLS handshake failed",
+    60: "TLS certificate not trusted",
+    5: "proxy could not be resolved",
+}
+
+
+def _curl_reason(res, proxy: str = "") -> str:
+    """Explain a failed curl run: exit code, its stderr, and any proxy env in play."""
+    detail = " ".join(str(res.stderr or "").split())[:200]
+    bits = [f"curl exit={res.returncode}"]
+    hint = CURL_HINTS.get(int(res.returncode or 0))
+    if hint:
+        bits.append(hint)
+    if proxy:
+        bits.append(f"proxy={proxy}")
+    env_proxy = {k: os.environ.get(k) for k in
+                 ("http_proxy", "https_proxy", "all_proxy",
+                  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")}
+    env_proxy = {k: v for k, v in env_proxy.items() if v}
+    if env_proxy and not proxy:
+        bits.append("env proxy " + ", ".join(f"{k}={v}" for k, v in env_proxy.items()))
+    out = " (" + "; ".join(bits)
+    if detail:
+        out += f": {detail}"
+    return out + ")"
+
+
+def download_proxy(explicit: str | None = None) -> str:
+    """Proxy for plugin downloads: explicit > config `download_proxy` > none."""
+    if explicit is not None:
+        return str(explicit).strip()
+    return str(load_config().get("download_proxy") or "").strip()
+
+
+def fetch_plugin_to_cache(spec: str, proxy: str | None = None) -> dict:
+    """Download `spec` once on the host: `github:` via codeload, npm via the mirror.
+
+    `proxy` (or the `download_proxy` config key) is handed to curl, because GitHub and
+    the npm registry are often only reachable through one on private networks.
+    """
+    spec = str(spec).strip()
+    use_proxy = download_proxy(proxy)
+    curl = ["curl", "-fsSL"]
+    if use_proxy:
+        curl += ["--proxy", use_proxy, "--max-time", "300"]
+    if not plugin_spec_ok(spec) or spec.startswith("file:"):
+        raise ValueError(f"cannot download {spec!r} "
+                         f"(use an npm name or github:owner/repo[#ref])")
+    os.makedirs(plugin_cache_dir(), exist_ok=True)
+    base = f"{plugin_cache_dir()}/{plugin_cache_slug(spec)}"
+    m = re.match(r"^github:([\w.-]+)/([\w.-]+)(?:#(.+))?$", spec)
+    if m:
+        owner, repo, ref = m.group(1), m.group(2), m.group(3) or "HEAD"
+        url = f"https://codeload.github.com/{owner}/{repo}/tar.gz/{ref}"
+        kind, version = "github", ref
+    else:
+        # `partition("@")` splits a scoped spec at its LEADING `@`
+        # ("@lemoncat7/dsh-ssh" -> name "", version "lemoncat7/dsh-ssh"), which built a
+        # bogus URL and 404'd. Split the version off the last `@` instead.
+        m2 = re.match(r"^(@[^/@]+/[^@]+|[^@]+)(?:@(.+))?$", spec)
+        if not m2:
+            raise ValueError(f"cannot parse npm spec: {spec}")
+        name, want = m2.group(1), (m2.group(2) or "")
+        registry = str(load_config().get("plugin_registry")
+                       or "https://registry.npmmirror.com").rstrip("/")
+        # `@scope/name` must be sent as `@scope%2Fname`, otherwise the registry answers
+        # 404 (it treats the extra path segment as something else). pnpm encodes this
+        # itself, which is why a user install worked while our download did not.
+        encoded = name.replace("/", "%2F") if name.startswith("@") else name
+        res = run(curl + ["--max-time", "60", f"{registry}/{encoded}/{want or 'latest'}"],
+                  check=False, capture=True)
+        if res.returncode != 0:
+            raise ValueError(f"cannot reach {registry}{_curl_reason(res, use_proxy)}")
+        meta = json.loads(res.stdout or "{}")
+        tarball = str((meta.get("dist") or {}).get("tarball") or "")
+        if not tarball:
+            raise ValueError(f"{spec}: the registry returned no tarball")
+        url = re.sub(r"^https?://[^/]+", registry, tarball)
+        kind, version = "npm", str(meta.get("version") or want or "latest")
+    target = base + ".tgz"
+    res = run(curl + ["--max-time", "300", "-o", target, url],
+              check=False, capture=True)
+    if res.returncode != 0 or not os.path.exists(target) or os.path.getsize(target) == 0:
+        with contextlib.suppress(OSError):
+            os.unlink(target)
+        raise ValueError(f"download failed: {url}{_curl_reason(res, use_proxy)}")
+    doc = {"spec": spec, "kind": kind, "version": version, "url": url, "file": target,
+           "bytes": os.path.getsize(target),
+           "sha256": hashlib.sha256(open(target, "rb").read()).hexdigest(),
+           "fetched_at": int(time.time())}
+    atomic_write(base + ".json", json.dumps(doc, indent=2, sort_keys=True) + "\n")
+    return doc
+
+
+def cached_plugin_spec(spec: str, name: str = "") -> str | None:
+    """Copy the cached tarball into the instance home and return a `file:` spec."""
+    entry = plugin_cache_entry(spec)
+    if not entry or not name:
+        return None
+    pkg_file = os.path.basename(entry["file"])
+    stage = f"{instance_home(name)}/{PLUGIN_CACHE_IN_JAIL}"
+    os.makedirs(stage, exist_ok=True)
+    dest = f"{stage}/{pkg_file}"
+    shutil.copyfile(entry["file"], dest)
+    return f"file:/home/dsh/{PLUGIN_CACHE_IN_JAIL}/{pkg_file}"
+
+
+def pnpm_store_dir() -> str:
+    return f"{VAR}/pnpm-store"
+
+
+def pnpm_store_index() -> dict:
+    try:
+        return json.loads(read_text(f"{VAR}/pnpm-store-index.json") or "{}")
+    except ValueError:
+        return {}
+
+
+def pnpm_store_stats() -> tuple[int, int]:
+    total = count = 0
+    for base, _dirs, files in os.walk(pnpm_store_dir()):
+        for fname in files:
+            with contextlib.suppress(OSError):
+                total += os.path.getsize(f"{base}/{fname}")
+                count += 1
+    return total, count
+
+
+def plugin_store_enforced(st: dict) -> bool:
+    raw = st["config"].get("plugin_store_offline")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+def fill_pnpm_store(name: str, spec: str) -> dict:
+    """Add `spec` and its dependency tree to the shared pnpm store (optional extra)."""
+    os.makedirs(pnpm_store_dir(), exist_ok=True)
+    home = instance_home(name)
+    stage = f"{home}/.cache/dshmu-fill"
+    os.makedirs(stage, exist_ok=True)
+    script_host = f"{stage}/fill.sh"
+    result_host = f"{stage}/resolved.json"
+    with contextlib.suppress(OSError):
+        os.unlink(result_host)
+    node_line = ("node -e 'const p=require(process.argv[1]+\"/package.json\");"
+                 "console.log(JSON.stringify(p.dependencies||{}))' \"$T\" > "
+                 "/home/dsh/.cache/dshmu-fill/resolved.json")
+    body = "\n".join([
+        "#!/bin/sh",
+        "set -e",
+        "T=$(mktemp -d)",
+        'cd "$T"',
+        "printf '%s' '{\"name\":\"fill\",\"version\":\"0.0.0\"}' > package.json",
+        (f"pnpm_config_offline=false pnpm_config_store_dir={PNPM_STORE_IN_JAIL} "
+         f"pnpm add --no-lockfile {spec} >/tmp/dshmu-fill.log 2>&1"),
+        node_line,
+        "",
+    ])
+    atomic_write(script_host, body, mode=0o755)
+    before, _ = pnpm_store_stats()
+    res = subprocess.run([JAIL, name, "--", "sh", "/home/dsh/.cache/dshmu-fill/fill.sh"],
+                         capture_output=True, text=True, timeout=1800)
+    if res.returncode != 0:
+        tail = ((res.stdout or "") + (res.stderr or "")).strip()[-300:]
+        raise ValueError(f"pnpm could not fill the store for {spec}: {tail}")
+    after, _ = pnpm_store_stats()
+    resolved = {}
+    with contextlib.suppress(ValueError):
+        resolved = json.loads(read_text(result_host) or "{}")
+    key = spec.split("@")[0] if not spec.startswith("github:") else ""
+    version = str((resolved or {}).get(key) or "").lstrip("^~=v") if key else ""
+    return {"spec": spec, "version": version or "latest", "bytes": max(0, after - before)}
 
 
 def record_plugin(st: dict, name: str, pkg: str, version: str, source: str,
@@ -3861,96 +4285,190 @@ def replay_instance_plugins(name: str) -> list[str]:
 
 
 def cmd_plugin_policy(st: dict, args) -> int:
-    action = getattr(args, "policy_action", "")
-    if action in ("", "list", "policy", None):
-        rows = plugin_policy(st)
+    action = getattr(args, "policy_action", "") or "list"
+    rows = plugin_policy(st)
+    assets = plugin_assets(st)
+
+    if action in ("list", "policy"):
         if args.json:
-            print(json.dumps({"policy": rows}, indent=2, ensure_ascii=False))
+            print(json.dumps({"policy": rows,
+                              "assets": assets}, indent=2, ensure_ascii=False))
             return 0
         if not rows:
-            info("no plugin policy set")
+            info("no plugin policy set (add a package first: dsh-muctl plugin add <spec>)")
             return 0
+        print(f"{'PACKAGE':40} {'VERSION':10} {'SOURCE':38} FLAGS")
         for pkg, row in sorted(rows.items()):
-            flags = []
-            if row.get("protected"):
-                flags.append("受保护")
-            if row.get("mandatory"):
-                flags.append("强制安装")
-            info(f"  {pkg:40} {' + '.join(flags) or '-'}"
-                 + (f"   # {row['note']}" if row.get("note") else ""))
+            spec = row.get("spec") or ""
+            asset = assets.get(spec) or {}
+            flags = [f for f, ok in (("受保护", row.get("protected")),
+                                     ("预装", row.get("preinstall")),
+                                     ("推送", row.get("push"))) if ok]
+            print(f"{pkg:40} {str(asset.get('version') or '-'):10} "
+                  f"{(spec or '(no asset)'):38} {' + '.join(flags) or '-'}")
         return 0
-    if not args.pkg:
-        die("plugin <protect|require|unprotect|unrequire> needs a package name")
-    pkg = args.pkg
-    try:
-        if action == "protect":
-            set_plugin_policy(st, pkg, protected=True)
-        elif action == "unprotect":
-            set_plugin_policy(st, pkg, protected=False)
-        elif action == "require":
-            set_plugin_policy(st, pkg, mandatory=True)
-        elif action == "unrequire":
-            set_plugin_policy(st, pkg, mandatory=False)
-        else:
-            die(f"unknown policy action: {action}")
-    except ValueError as exc:
-        die(str(exc))
-    save_state(st)
-    row = plugin_policy(st).get(pkg, {})
-    sync_all(load_state())
-    info(f"{pkg}: protected={bool(row.get('protected'))} mandatory={bool(row.get('mandatory'))}")
-    info("restart the affected instances: dsh-muctl instance restart <name>")
-    return 0
+
+    if action == "add":
+        spec = str(getattr(args, "pkg", "") or "").strip()
+        if not spec:
+            die("usage: dsh-muctl plugin add <spec>   (npm name[@ver] or github:owner/repo[#ref])")
+        try:
+            row = add_plugin_asset(st, spec, proxy=getattr(args, "proxy", None))
+        except ValueError as exc:
+            die(str(exc))
+        save_state(st)
+        info(f"added {row['name']} {row['version']} (source: {spec})")
+        info("now enable 预装 (new instances) and/or 推送 (existing instances)")
+        return 0
+
+    if action in ("remove", "delete", "rm"):
+        name = str(getattr(args, "pkg", "") or "").strip()
+        if not name:
+            die("usage: dsh-muctl plugin remove <package-name> [--delete-asset]")
+        table = st.get(PLUGIN_POLICY_KEY) or {}
+        row = table.get(name) or {}
+        spec = str(row.get("spec") or "")
+        table.pop(name, None)
+        st[PLUGIN_POLICY_KEY] = table
+        if args.delete_asset:
+            assets = st.get(PLUGIN_ASSET_KEY) or {}
+            for key in [k for k, v in assets.items()
+                        if k == spec or (isinstance(v, dict) and v.get("name") == name)]:
+                path = str((assets.get(key) or {}).get("file") or "")
+                for victim in (path, f"{plugin_cache_dir()}/{plugin_cache_slug(key)}.json"):
+                    if victim and os.path.exists(victim):
+                        with contextlib.suppress(OSError):
+                            os.unlink(victim)
+                assets.pop(key, None)
+            st[PLUGIN_ASSET_KEY] = assets
+        save_state(st)
+        sync_all(load_state())
+        info(f"removed policy for {name}" + (" and its offline package" if args.delete_asset else ""))
+        return 0
+
+    if action in ("protect", "unprotect", "preinstall", "unpreinstall", "push", "unpush"):
+        name = str(getattr(args, "pkg", "") or "").strip()
+        if not name:
+            die(f"plugin {action} needs a package name (add it first: plugin add <spec>)")
+        field = {"protect": "protected", "unprotect": "protected",
+                 "preinstall": "preinstall", "unpreinstall": "preinstall",
+                 "push": "push", "unpush": "push"}[action]
+        value = not action.startswith("un")
+        try:
+            set_plugin_policy(st, name, **{field: value})
+        except ValueError as exc:
+            die(str(exc))
+        save_state(st)
+        sync_all(load_state())
+        row = plugin_policy(load_state()).get(name, {})
+        info(f"{name}: protected={bool(row.get('protected'))} "
+             f"preinstall={bool(row.get('preinstall'))} push={bool(row.get('push'))}")
+        if value and field == "push":
+            info("existing instances were updated; a restart re-applies it")
+        return 0
+
+    die(f"unknown plugin action: {action}")
 
 
 def cmd_plugin(args):
-    """Plugin policy (protected / mandatory) and the legacy curated catalog."""
+    """Plugin packages (downloaded once) and the protected / preinstall / push policy."""
     ensure_root()
-    if args.action in ("protect", "unprotect", "require", "unrequire", "policy"):
+    if args.action in ("list", "policy", "add", "remove", "rm",
+                       "protect", "unprotect", "preinstall", "unpreinstall",
+                       "push", "unpush"):
         args.policy_action = args.action
         return cmd_plugin_policy(load_state(), args)
-    st = load_state()
-    catalog = [dict(e) for e in (st.get("plugins_catalog") or [])]
-    if args.action == "list":
-        if getattr(args, "json", False):
-            print(json.dumps({"plugins": plugins_catalog(st)}, indent=2, ensure_ascii=False))
-            return 0
-        rows = sorted(catalog, key=lambda e: str(e.get("pkg")))
-        if not rows:
-            info("the curated plugin list is empty (users may still ask an administrator "
-                 "to install something, with the administrator password)")
-            return 0
-        print(f"{'PACKAGE':44} {'VERSION':12} NOTE")
-        for e in rows:
-            print(f"{str(e.get('pkg')):44} {str(e.get('version') or 'latest'):12} {e.get('note', '')}")
-        return 0
-    pkg = str(getattr(args, "pkg", "") or "").strip()
-    if not pkg:
-        die("plugin add/remove needs a package name")
-    if not PLUGIN_PKG_RE.match(pkg):
-        die(f"not a valid npm package name: {pkg}")
-    version = str(getattr(args, "version", "") or "").strip()
-    if version and not PLUGIN_VER_RE.match(version):
-        die(f"not a valid version: {version}")
-    with state_lock():
-        st = load_state()
-        catalog = [e for e in (st.get("plugins_catalog") or [])
-                   if str(e.get("pkg")) != pkg]
-        if args.action == "add":
-            catalog.append({"pkg": pkg, "version": version,
-                            "note": str(getattr(args, "note", "") or "").strip(),
-                            "added_at": int(time.time())})
-            st["plugins_catalog"] = catalog
-            save_state(st)
-            info(f"curated: {pkg}{'@' + version if version else ''}")
-        else:
-            if len(catalog) == len(st.get("plugins_catalog") or []):
-                die(f"not in the catalog: {pkg}")
-            st["plugins_catalog"] = catalog
-            save_state(st)
-            info(f"removed from the catalog: {pkg} (installed copies stay until removed)")
-    return 0
 
+    if args.action == "fetch":
+        spec = str(getattr(args, "pkg", "") or "").strip()
+        if not spec:
+            die("usage: dsh-muctl plugin fetch <spec>   "
+                "(npm name[@ver] or github:owner/repo[#ref])")
+        st = load_state()
+        if not st["instances"]:
+            die("no instances yet: create one first (the store is filled from inside a jail)")
+        name = args.name or sorted(st["instances"])[0]
+        if name not in st["instances"]:
+            die(f"no such instance: {name}")
+        # The tarball is what instances install from (file:), and it is what the
+        # "administrator-approved" list is keyed on. Filling the pnpm store is optional
+        # extra (only useful with plugin_store_offline=true).
+        try:
+            meta = fetch_plugin_to_cache(spec)
+        except ValueError as exc:
+            die(str(exc))
+        index = pnpm_store_index()
+        index[spec] = {"spec": spec, "version": meta["version"], "file": meta["file"],
+                       "bytes": meta["bytes"], "sha256": meta["sha256"],
+                       "store": pnpm_store_dir(), "fetched_at": meta["fetched_at"]}
+        atomic_write(f"{VAR}/pnpm-store-index.json",
+                     json.dumps(index, indent=2, sort_keys=True) + "\n")
+        info(f"approved {meta['spec']} ({meta['version']}, {meta['bytes'] // 1024} KB)")
+        if getattr(args, "store", False):
+            try:
+                filled = fill_pnpm_store(name, spec)
+            except ValueError as exc:
+                info(f"note: pnpm store was not filled: {exc}")
+            else:
+                info(f"pnpm store also holds it ({filled['bytes'] // 1024} KB)")
+        info("instances can install it now: dsh-muctl sync")
+        return 0
+
+    if args.action == "check":
+        registry = str(load_config().get("plugin_registry")
+                       or "https://registry.npmmirror.com")
+        info(f"download proxy : {download_proxy(None) or '(direct)'}")
+        info(f"registry mirror: {registry}")
+        for label, ok, detail in plugin_network_report():
+            info(f"  {'OK  ' if ok else 'FAIL'} {label:16} {detail}")
+        if not all(ok for _l, ok, _d in plugin_network_report()):
+            info("hint: 若是内网，给下载配一个代理：dsh-muctl config download_proxy "
+                 "http://host:port（或添加插件时临时填）")
+        return 0
+
+    if args.action == "cached":
+        index = pnpm_store_index()
+        total, files = pnpm_store_stats()
+        info(f"pnpm store: {pnpm_store_dir()}  "
+             f"({files} file(s), {total // (1024 * 1024)} MB)")
+        if index:
+            print(f"{'SPEC':52} {'VERSION':12} FILLED")
+            for spec, doc in sorted(index.items()):
+                info_stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(doc.get("fetched_at") or 0))
+                print(f"{spec:52} {str(doc.get('version') or '-'):12} {info_stamp}")
+        else:
+            info("store is empty (dsh-muctl plugin fetch <spec>)")
+        entries = sorted(glob.glob(f"{plugin_cache_dir()}/*.json"))
+        if entries:
+            info(f"also cached as tarballs: {len(entries)} package(s) (offline file: installs)")
+        return 0
+        print(f"{'SPEC':52} {'VERSION':12} {'SIZE':>9}  SHA256")
+        for path in entries:
+            try:
+                meta = json.loads(read_text(path) or "{}")
+            except ValueError:
+                continue
+            tarball = str(meta.get("file") or "")
+            size = (f"{os.path.getsize(tarball) // 1024} KB"
+                    if tarball and os.path.exists(tarball) else "-")
+            print(f"{str(meta.get('spec')):52} {str(meta.get('version') or '-'):12} "
+                  f"{size:>9}  {str(meta.get('sha256') or '')[:12]}")
+        return 0
+
+    if args.action == "forget":
+        spec = str(getattr(args, "pkg", "") or "").strip()
+        if not spec:
+            die("usage: dsh-muctl plugin forget <spec>")
+        base = f"{plugin_cache_dir()}/{plugin_cache_slug(spec)}"
+        removed = [os.path.basename(x) for x in (base + ".tgz", base + ".json")
+                   if os.path.exists(x)]
+        for path in (base + ".tgz", base + ".json"):
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+        info(f"removed {len(removed)} cache file(s) for {spec}" if removed
+             else f"{spec} is not cached")
+        return 0
+    die(f"unknown plugin action: {args.action}")
 
 def cmd_instance_plugin(args):
     """list | add | remove plugins inside one instance, recording who added what."""
@@ -4983,6 +5501,68 @@ def gateway_started_at() -> float:
             with contextlib.suppress(OSError):
                 return os.stat(pidfile).st_mtime
     return 0.0
+
+
+def admin_backend_pid() -> int:
+    """PID of the running admin backend (0 when it is not running)."""
+    # Scan /proc and require an *exact* argv element: pgrep -f matches its own shell
+    # command line, which produced a bogus pid on a dev box.
+    target = "/usr/local/sbin/dsh-mud"
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        args = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+        if target in args:
+            return int(entry)
+    return 0
+
+
+def admin_backend_started_at() -> float:
+    pid = admin_backend_pid()
+    if not pid:
+        return 0.0
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            fields = fh.read().split()
+        # starttime is in clock ticks since boot; combine with /proc/stat btime
+        start_ticks = int(fields[21])
+        with open("/proc/stat") as fh:
+            btime = next(int(line.split()[1]) for line in fh if line.startswith("btime"))
+        return btime + start_ticks / float(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, StopIteration, IndexError):
+        return 0.0
+
+
+def stale_admin_code() -> bool:
+    """True when dshmuctl.py on disk is newer than the running admin backend.
+
+    The backend imports the module once at start, so an `apk` upgrade keeps the old
+    code in memory -- that is why a brand-new action (or a fixed downloader) can still
+    behave like the previous version until the service is restarted.
+    """
+    started = admin_backend_started_at()
+    if not started:
+        return False
+    try:
+        return os.stat(__file__).st_mtime > started + 1
+    except OSError:
+        return False
+
+
+def restart_admin_if_stale(quiet: bool = False) -> bool:
+    if not os.path.exists("/etc/init.d/dsh-mud"):
+        return False
+    if not stale_admin_code():
+        return False
+    if not quiet:
+        info("admin backend is running the previous build; restarting it")
+    run(["/sbin/rc-service", "dsh-mud", "restart"], check=False)
+    return True
 
 
 def stale_lua_files() -> list[str]:
@@ -8183,6 +8763,48 @@ def doctor_checks(st: dict) -> list[dict]:
                     f"recreate it, or drop the mount (dsh-muctl mount rm {row['host']} "
                     f"--instance {inst_name})")
 
+    # ------------------------------------------------------------- plugin packages
+    downloaded = glob.glob(f"{plugin_cache_dir()}/*.tgz")
+    total, files = pnpm_store_stats()
+    if downloaded:
+        add("plugin packages", DOCTOR_PASS,
+            f"{len(downloaded)} offline package(s) in {plugin_cache_dir()}"
+            + (f"; pnpm store {files} file(s)" if files else ""))
+    elif (st.get("plugin_policy") or {}):
+        add("plugin policy", DOCTOR_WARN, "policies exist but no offline package was "
+            "downloaded", "re-add each package from the admin page")
+
+    # --------------------------------------------------------------- plugin policy
+    rows = plugin_policy(st)
+    assets = plugin_assets(st)
+    if rows or assets:
+        missing = [n for n, row in rows.items()
+                   if not (row.get("spec") and assets.get(row.get("spec")))]
+        parts = [f"{len(assets)} package(s) downloaded"]
+        if rows:
+            pre = sum(1 for r in rows.values() if r.get("preinstall"))
+            push = sum(1 for r in rows.values() if r.get("push"))
+            prot = sum(1 for r in rows.values() if r.get("protected"))
+            parts.append(f"{len(rows)} polic(ies) (预装 {pre} / 推送 {push} / 受保护 {prot})")
+        if missing:
+            add("plugin policy", DOCTOR_WARN,
+                f"{len(missing)} policy row(s) have no offline package: "
+                f"{', '.join(missing[:3])}" + (" …" if len(missing) > 3 else ""),
+                "re-add them from the admin page (添加插件 downloads it)")
+        else:
+            gap = []
+            for name in sorted(st.get("instances") or {}):
+                have = installed_package_dirs(name) | {r["pkg"] for r in instance_plugins(name)}
+                gap += [f"{name}:{pkg}" for pkg, row in rows.items()
+                        if row.get("push") and pkg not in have]
+            if gap:
+                add("plugin policy", DOCTOR_WARN,
+                    "推送 not installed: " + ", ".join(gap[:4])
+                    + (f" (+{len(gap) - 4})" if len(gap) > 4 else ""),
+                    "dsh-muctl instance restart <name>   (push is re-applied on start)")
+            else:
+                add("plugin policy", DOCTOR_PASS, "; ".join(parts))
+
     # ------------------------------------------------------------- web search plan
     sp = search_plan(st)
     if sp is None:
@@ -8218,6 +8840,14 @@ def doctor_checks(st: dict) -> list[dict]:
                 add("egress rules", DOCTOR_PASS,
                     f"policy={policy}, {len(enforced)} instance(s) enforced")
 
+    # ------------------------------------------------------ admin backend freshness
+    if admin_backend_pid():
+        if stale_admin_code():
+            add("admin backend", DOCTOR_WARN,
+                "running the previous build (dshmuctl.py changed after it started)",
+                "dsh-muctl admin restart   (dsh-muctl sync also does it)")
+        else:
+            add("admin backend", DOCTOR_PASS, "running the installed code")
     # ------------------------------------------------------- gateway lua freshness
     stale = stale_lua_files()
     if not stale:
@@ -8753,6 +9383,19 @@ def doctor_checks(st: dict) -> list[dict]:
             add("nginx runtime", DOCTOR_WARN, "missing: " + ", ".join(gaps),
                 "dsh-muctl doctor --fix   # creates the nginx user/group and temp dirs "
                 "(normally done by the openresty package)")
+    else:
+        # In jail mode nginx runs inside the gateway rootfs, so its temp directories
+        # must exist there. Without client_body every upload fails with HTTP 500 and
+        # nothing else breaks, which is very hard to spot from the UI.
+        root = f"{gateway_paths()['rootfs']}{NGINX_TEMP_ROOT}"
+        missing = [n for n in NGINX_TEMP_SUBDIRS if not os.path.isdir(f"{root}/{n}")]
+        if missing:
+            add("nginx temp dirs", DOCTOR_FAIL,
+                f"gateway jail is missing {NGINX_TEMP_ROOT}/{{{','.join(missing)}}} "
+                f"-- file uploads will fail with HTTP 500",
+                "dsh-muctl sync   # recreates them (0.21.5+); then dsh-muctl gateway restart")
+        else:
+            add("nginx temp dirs", DOCTOR_PASS, f"{NGINX_TEMP_ROOT} inside the gateway jail")
 
     total_mb = sum(os.path.getsize(p) for p in platform_log_files() if os.path.exists(p)) // (1024 * 1024)
     add("log volume", DOCTOR_PASS if total_mb < 512 else DOCTOR_WARN,
@@ -8784,6 +9427,12 @@ def cmd_doctor(args):
         gaps = ensure_nginx_runtime(fix=True)
         if gaps:
             fixes.append("nginx runtime (" + ", ".join(gaps) + ")")
+        if str(st["config"].get("gateway_mode") or "jail") == "jail":
+            root = f"{gateway_paths()['rootfs']}{NGINX_TEMP_ROOT}"
+            made = ensure_nginx_temp_dirs(root)
+            if made:
+                fixes.append(f"gateway nginx temp dirs ({len(made)})")
+                run(["/sbin/rc-service", "dsh-mu-gateway", "restart"], check=False)
         started = reconcile_instances(load_state())
         if started:
             fixes.append("started: " + ", ".join(started))
@@ -8997,13 +9646,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="with `models --refresh`: probe each new model to learn its protocol")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_provider)
-    sp = sub.add_parser("plugin", help="plugin policy: protected (cannot be removed) / mandatory (always installed)")
-    sp.add_argument("action", choices=["policy", "protect", "unprotect", "require", "unrequire",
-                                       "list", "add", "remove"])
+    sp = sub.add_parser("plugin", help="plugin packages + policy: protected / preinstall / push")
+    sp.add_argument("action", choices=["list", "policy", "add", "remove", "rm",
+                                       "protect", "unprotect", "preinstall", "unpreinstall",
+                                       "push", "unpush", "fetch", "cached", "forget",
+                                       "check"])
+    sp.add_argument("--delete-asset", action="store_true",
+                    help="also delete the downloaded package (plugin remove)")
     sp.add_argument("--policy-action", dest="policy_action", default="",
                     help="internal")
     sp.add_argument("pkg", nargs="?", help="npm package name, e.g. @scope/dsh-plugin-x")
     sp.add_argument("--version", help="pin a version (default: latest)")
+    sp.add_argument("--name", help="instance used to run pnpm when filling the store")
+    sp.add_argument("--store", action="store_true",
+                    help="also fill the pnpm store (for plugin_store_offline=true)")
+    sp.add_argument("--proxy", help="proxy for this download, e.g. http://127.0.0.1:7890")
     sp.add_argument("--note", help="one line shown in the panel")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_plugin)
