@@ -1594,6 +1594,11 @@ def sync_all(st: dict):
             _lock = patch_models_client()
             if _lock != "already patched":
                 info(f"models lock: {_lock}")
+    if load_config().get("opencode_session", True):
+        with contextlib.suppress(Exception):
+            _oc = patch_opencode_session()
+            if _oc not in ("already patched",):
+                info(f"opencode session header: {_oc}")
     with contextlib.suppress(Exception):
         report = render_market_feed(st)
         if report.get("plugins"):
@@ -6049,6 +6054,58 @@ def provider_import_from_catalog(pid: str, params: dict | None = None) -> tuple[
                  mode=0o600)
     return True, pkg
 
+OPENCODE_SESSION_MARK = "dsh-mu:opencode-session"
+
+
+def patch_opencode_session() -> str:
+    """Teach the runtime to send OpenCode's session header for OpenCode routes.
+
+    pi-ai adds `x-opencode-session` from a wrapper it applies inside its own
+    `opencode` / `opencode-go` provider modules. A hand-declared route (ours, because a
+    plan owns the key) never touches those modules, so the header is missing and the
+    upstream answers 400 MissingSessionID.
+
+    The fix is one guarded, idempotent edit: in `buildProvider(spec)`, wrap the api
+    factory when the provider id starts with `opencode`. The wrapper (pi-ai's own
+    `withOpenCodeSessionHeader`) reads the conversation id the harness already passes,
+    so each conversation keeps its own value -- nothing is invented and no secret is
+    stored. Reverting is `dsh-muctl config set opencode_session false`.
+    """
+    rootfs = runtime_rootfs()
+    path = (f"{rootfs}/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/"
+            f"@deepseek-ai/dsh-llm-pi-ai/lib/index.js")
+    if not os.path.exists(path):
+        return "runtime not installed"
+    try:
+        text = read_text(path) or ""
+    except OSError:
+        return "unreadable"
+    if OPENCODE_SESSION_MARK in text:
+        return "already patched"
+    original = text
+    import_line = ('import { openAIResponsesApi } from '
+                   '"@earendil-works/pi-ai/api/openai-responses.lazy";')
+    if text.count(import_line) != 1:
+        return "skipped: import anchor not found"
+    wrapped = ("api: (typeof spec.provider === \"string\" && spec.provider.startsWith("
+               "\"opencode\") ? __dshmuOpenCodeSession(factory()) : factory())")
+    call = "api: factory()"
+    if text.count(call) != 1:
+        return "skipped: buildProvider anchor not found"
+    text = text.replace(
+        import_line,
+        import_line + "\n// " + OPENCODE_SESSION_MARK + ": pi-ai's own OpenCode wrapper"
+        "\nimport { withOpenCodeSessionHeader as __dshmuOpenCodeSession } from "
+        "\"@earendil-works/pi-ai/providers/opencode-headers\"; // " +
+        OPENCODE_SESSION_MARK + " end", 1)
+    text = text.replace(call, wrapped + " // " + OPENCODE_SESSION_MARK, 1)
+    if not os.path.exists(path + ".dshmu-opencode-orig"):
+        with contextlib.suppress(OSError):
+            atomic_write(path + ".dshmu-opencode-orig", original, mode=0o644)
+    atomic_write(path, text, mode=0o644)
+    return "applied"
+
+
 def models_lock_enabled() -> bool:
     return bool(load_config().get("models_lock", True))
 
@@ -8762,13 +8819,14 @@ SEARCH_KEY_ENV = "DSHMU_SEARCH"
 # (bwrap, then Landlock) cannot create a namespace there and fails closed, which
 # broke the bash tool *and* the ripgrep-backed file search. Full access is correct
 # here: the jail is the boundary.
-SANDBOX_PATCH = """- id: sandbox-policy
-  config:
-    defaultMode: danger-full-access
-- id: permission
-  config:
-    defaultPreset: danger-full-access
-"""
+# The jail already exports DSH_PERMISSION_MODE=danger-full-access, and the runtime's
+# own sandbox/permission plugins take their defaults from it. Emitting our own
+# `sandbox-policy` / `permission` entries used to work, but the config keys changed
+# upstream (0.2.1-rc.5 rejects `defaultMode`/`defaultPreset`), which made the whole
+# overlay invalid and the instance exit before binding its port. Nothing is needed
+# here any more -- but the constant stays so the empty patch is still a valid array
+# element source for callers that expect one.
+SANDBOX_PATCH = ""
 
 
 def relay_enabled(cfg: dict) -> bool:
@@ -9013,7 +9071,17 @@ def plan_routes(plan: dict, user: str) -> list[dict]:
     multi = len(by_base) > 1
     # Route ids must be lowercase hyphenated identifiers (DSH rejects others);
     # plan ids carry an underscore, so translate it.
-    route_base = str(plan["id"]).replace("_", "-")
+    # pi-ai injects OpenCode's per-conversation `x-opencode-session` header only for
+    # providers it recognises as OpenCode -- and it decides that from the provider id
+    # (see the runtime patch this platform applies). A plan that fronts an OpenCode
+    # package therefore keeps that name (plus a short plan suffix so several accounts
+    # stay distinct); every other plan keeps its stable plan-based name.
+    provider_id = str(pkg.get("id") or "")
+    if provider_id.startswith("opencode"):
+        _short = str(plan["id"]).split("_")[-1][:6]
+        route_base = f"{provider_id}-{_short}"
+    else:
+        route_base = str(plan["id"]).replace("_", "-")
     for idx, (base, rows) in enumerate(by_base.items()):
         route = route_base if not multi else f"{route_base}-{idx + 1}"
         label = plan.get("name") or plan["id"]
@@ -9522,6 +9590,15 @@ def ensure_bundled_plugins(st: dict, name: str) -> list[str]:
     with contextlib.suppress(ValueError):
         doc = json.loads(read_text(pkg_path) or "{}")
     bundles = ((doc.get("dsh") or {}).get("profile") or {}).get("bundles") or []
+    # A profile we create from scratch must carry the harness' own default bundles:
+    # without them the web app has nothing to serve and DSH exits 0 *silently* (the
+    # instance then looks "started" but never binds its port). These two names are
+    # what the runtime itself writes into a fresh profile; `dependencies` stays empty
+    # because the packages resolve out of the runtime's own node_modules.
+    for default_bundle in ("@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"):
+        if default_bundle not in bundles:
+            bundles.append(default_bundle)
+            changed.append(f"{default_bundle}: default bundle restored")
     inst = st["instances"].get(name) or {}
     uid = int(inst.get("uid", 0))
 

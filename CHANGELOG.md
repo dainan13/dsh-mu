@@ -1,3 +1,29 @@
+## 0.80.0（opencode / opencode-go 可用：会话头 + 路由命名）
+
+- 根因：`x-opencode-session` 由 pi-ai 自己的 `withOpenCodeSessionHeader` 注入 ✓，
+  只在它认作 opencode 的 provider 上生效 ✓，判据是 **provider id** ✗ 我们一直用
+  `plan-<hash>` ✗ → 头缺失 → 上游 400 `MissingSessionID` ✓。
+- 修法一：opencode 类套餐的 route 名改为 `<provider>-<短哈希>` ✓（前缀保留 ✓ 多账号不撞 ✓）。
+- 修法二：给 `dsh-llm-pi-ai` 的 `buildProvider` 打一个**幂等、带标记、可逆**的补丁 ✓：
+  provider id 以 `opencode` 开头时用 pi-ai 自己的包装函数包一层 ✓
+  （`dsh-muctl config set opencode_session false` 可关 ✓）。
+- 实测：`oc1111111111111 · chat` → `DeepSeek V4.1 Flash` 正常回复 ✓（16 秒 / 18.1K tok ✓）。
+
+## 0.79.2（干净安装修复：默认 bundles + 旧 patch 键名 + 重装手册）
+
+清空一台机器、从 apk 装起，暴露了两个"只在干净机上出现"的真 bug：
+
+- **实例 profile 缺默认 bundles** ✗：我们只把自家插件写进 `dsh.profile.bundles` ✗，
+  而 DSH 新建 profile 时会写 `["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"]` ✓。
+  缺了它们 web 无内容可服务 → `dsh` **exit 0 静默退出** ✗ → 实例"started"但永不监听端口 ✓。
+  `ensure_bundled_plugins` 现在会补回这两个默认项并记录变更（幂等 ✓）。
+- **`--patch` 里旧 config 键名** ✗：`sandbox-policy.defaultMode` / `permission.defaultPreset`
+  在 0.2.1-rc.5 已被改 ✗ → 整个 overlay 非法 ✗ → 实例启动即崩 ✓。
+  不再生成这两条 ✓（jail 已导出 `DSH_PERMISSION_MODE=danger-full-access` ✓）。
+- 新增 `docs/06-干净重装手册.md`：从 `apk add` 到"发消息有回复"的完整步骤 + 四个坑
+  （`init`≠`install` / 默认 bundles / 旧键名 / 真相在 `err.log`）✓。
+- 顺带清掉 `gateway/lua/relay.lua` 里诊断用的 `__probe` 代码 ✗（打包卫生 ✓）。
+
 # CHANGELOG
 
 ## 0.60.1（模型页作为"用户自填"入口 + 停用语义收口）
