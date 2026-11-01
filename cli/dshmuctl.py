@@ -111,11 +111,13 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
     ("HIDE_BUILTIN_DEEPSEEK", "hide_builtin_deepseek", "bool", True,
      "隐藏内置 DeepSeek 通道（它直连 api.deepseek.com，实例里只有占位 key，选中会 401）。"
      "平台自己的 provider 不受影响"),
-    ("MODELS_NATIVE", "models_native", "bool", True,
-     "DSH 自带「设置 → 模型」页：用户在这里填自己的 key（平台托管的行没有编辑/删除按钮）。"
-     "按实例可关闭（instances[].models_native=false）"),
-    ("MODELS_LOCK", "models_lock", "bool", True,
-     "给平台托管的 provider 隐藏「编辑 / 删除」按钮（改写 DSH 客户端一处判断；补丁打不上自动跳过）"),
+    ("MODELS_NATIVE", "models_native", "bool", False,
+     "DSH 自带「设置 → 模型」页。默认关闭：现在由客户端插件「模型（mu）」负责"
+     "（用户在那里填自己的 key），原生页里能配的 copilot/codex 都不是静态 key 型。"
+     "按实例可打开（instances[].models_native=true）。"),
+    ("MODELS_LOCK", "models_lock", "bool", False,
+     "历史补丁：给平台托管的 provider 隐藏原生「编辑 / 删除」按钮。"
+     "原生模型页默认已关闭，所以默认不再打这个补丁；关掉时会**恢复**被改过的运行时文件。"),
     ("MARKET_ENABLED", "market_enabled", "bool", False,
      "在每个实例的 DSH 里启用「插件市场」（Discover tab），列表来自平台的插件资产"),
     ("DOWNLOAD_PROXY", "download_proxy", "str", "",
@@ -1594,6 +1596,11 @@ def sync_all(st: dict):
             _lock = patch_models_client()
             if _lock != "already patched":
                 info(f"models lock: {_lock}")
+    else:
+        with contextlib.suppress(Exception):
+            _undo = restore_models_client()
+            if _undo not in ("nothing to restore", "already original"):
+                info(f"models lock: {_undo} (the native models page is closed by config)")
     if load_config().get("opencode_session", True):
         with contextlib.suppress(Exception):
             _oc = patch_opencode_session()
@@ -5800,7 +5807,10 @@ PROVIDER_PROTOCOL_BASES = {
 }
 
 # Only these truly cannot be proxied: their credential is an OAuth session, not a key.
-PROVIDER_NEEDS_USER = {"github-copilot", "openai-codex"}
+# Codex has no static credential path at all. Copilot does: its marketplace token is
+# minted from a GitHub credential, which the relay can hold and refresh (see
+# copilot_token()), so it is importable now.
+PROVIDER_NEEDS_USER = {"openai-codex"}
 
 PROVIDERS_DUMP_SCRIPT = """\
 const mod = await import('@earendil-works/pi-ai/providers/all');
@@ -5996,6 +6006,10 @@ def provider_import_from_catalog(pid: str, params: dict | None = None) -> tuple[
     if not models:
         return False, f"{pid} has no model catalog"
     params = {str(k): str(v) for k, v in (params or {}).items() if str(v).strip()}
+    if pid == "github-copilot":
+        # Copilot authenticates with a short-lived token minted from a GitHub credential,
+        # which the platform keeps per plan; the package only records that fact.
+        params = {}
     template, needs = PROVIDER_URL_TEMPLATES.get(pid, ("", []))
     base_url = (dsh_provider_base_urls().get(pid) or template
                 or PROVIDER_KNOWN_ENDPOINTS.get(pid, ""))
@@ -6047,6 +6061,13 @@ def provider_import_from_catalog(pid: str, params: dict | None = None) -> tuple[
             pkg["disabled"] = False
     if missing:
         pkg["needs_params"] = missing
+    if pid == "github-copilot":
+        # No apiKeyEnv: the credential is the short-lived token the relay mints from the
+        # plan's GitHub credential (plan-level `.gh`), so the package only records that.
+        pkg.pop("api_key_env", None)
+        pkg["base_url"] = "https://api.individual.githubcopilot.com"
+        for _m in pkg["models"]:
+            _m["base_url"] = pkg["base_url"]
     pkg["default_model"] = str(pkg["models"][0]["id"])
     path = f"{PROVIDERS_DIR}/{pid}.json"
     os.makedirs(PROVIDERS_DIR, exist_ok=True)
@@ -6106,8 +6127,33 @@ def patch_opencode_session() -> str:
     return "applied"
 
 
+def restore_models_client() -> str:
+    """Undo the historical models-lock text patch, if it was ever applied.
+
+    The native models page is closed by configuration now, so the string patch that hid
+    its edit/delete buttons is no longer needed. `patch_models_client()` keeps a
+    `.dshmu-orig` copy before touching anything; restoring it is the clean way back.
+    """
+    rootfs = runtime_rootfs()
+    path = f"{rootfs}{MODELS_CLIENT_REL}"
+    backup = path + ".dshmu-orig"
+    if not os.path.exists(backup):
+        return "nothing to restore"
+    try:
+        original = read_text(backup) or ""
+        current = read_text(path) or ""
+    except OSError:
+        return "unreadable"
+    if current == original:
+        return "already original"
+    atomic_write(path, original, mode=0o644)
+    with contextlib.suppress(OSError):
+        os.remove(backup)
+    return "restored"
+
+
 def models_lock_enabled() -> bool:
-    return bool(load_config().get("models_lock", True))
+    return bool(load_config().get("models_lock", False))
 
 
 def patch_models_client() -> str:
@@ -8853,8 +8899,76 @@ def ensure_relay_token(st: dict, name: str) -> str:
     return token
 
 
+COPILOT_TOKEN_URL = "https://api.github.com/copilot_internal/v2/token"
+
+
+def plan_github_path(pid: str) -> str:
+    return f"{PLANS_DIR}/{pid}.gh"
+
+
+def plan_github_token(plan: dict) -> str:
+    """The long-lived GitHub credential a Copilot plan mints its tokens from."""
+    return (read_text(plan_github_path(plan["id"])) or "").strip()
+
+
+def write_plan_github_token(pid: str, token: str) -> None:
+    os.makedirs(PLANS_DIR, exist_ok=True)
+    atomic_write(plan_github_path(pid), token.strip() + "\n", mode=0o600)
+
+
+def copilot_token(plan: dict, force: bool = False) -> str:
+    """A usable Copilot bearer token for this plan, refreshed when it is about to lapse.
+
+    GitHub Copilot does not take an API key: the marketplace token is minted from a
+    GitHub credential and expires in tens of minutes. The platform keeps that GitHub
+    credential (0600, `.gh` next to the plan key) and refreshes the short token here, so
+    the instance still only ever sees the relay placeholder.
+    """
+    gh = plan_github_token(plan)
+    if not gh:
+        return ""
+    cached = plan.get("copilot") or {}
+    token = str(cached.get("token") or "")
+    expires = int(cached.get("expires_at") or 0)
+    if token and not force and expires - 60 > int(time.time()):
+        return token
+    payload = None
+    for scheme in ("token", "Bearer"):
+        request = urllib.request.Request(
+            COPILOT_TOKEN_URL,
+            headers={"Authorization": f"{scheme} {gh}", "Accept": "application/json",
+                     "User-Agent": "dsh-mu/relay", "X-GitHub-Api-Version": "2022-11-28"})
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            with contextlib.suppress(Exception):
+                detail = exc.read().decode("utf-8", "replace")[:200]
+            info(f"copilot: token exchange failed ({exc.code}) {detail}")
+        except OSError as exc:
+            info(f"copilot: token exchange failed: {exc}")
+    if not isinstance(payload, dict) or not payload.get("token"):
+        return token  # keep serving the stale token rather than cutting the user off
+    fresh = str(payload["token"])
+    plan = dict(plan)
+    plan["copilot"] = {"token": fresh,
+                       "expires_at": int(payload.get("expires_at") or 0) or int(time.time()) + 1500}
+    with contextlib.suppress(Exception):
+        save_plan(plan)
+    return fresh
+
+
+def plan_is_copilot(plan: dict) -> bool:
+    """Copilot plans mint their token instead of holding an API key."""
+    return str(plan.get("provider") or "") == "github-copilot"
+
+
 def relay_auth_type(route: dict) -> str:
     """How the provider wants its key: `bearer` or `x-api-key`."""
+    if str(route.get("auth") or "") == "copilot":
+        return "bearer"
     headers = {k.lower(): v for k, v in (route.get("headers") or {}).items()}
     for key in headers:
         if key in ("x-api-key", "api-key"):
@@ -8876,11 +8990,17 @@ def relay_document(st: dict) -> dict:
             key = plan_key(plan)
             for route in plan_routes(plan, user):
                 keyless = bool(route.get("keyless"))
+                if plan_is_copilot(plan):
+                    # Copilot: the route's credential is the short-lived token minted
+                    # from the plan's GitHub credential, refreshed on demand.
+                    key = copilot_token(plan)
                 if not key and not keyless:
                     continue
                 routes[route["route"]] = {
                     "plan": plan["id"],
                     "upstream": route["base_url"].rstrip("/"),
+                    "protocols": {seg: base.rstrip("/")
+                                  for seg, base in (route.get("protocols") or {}).items()},
                     # Keyless: no auth at all. relay.lua sets an empty header value,
                     # and nginx's `proxy_set_header X ""` omits the header entirely --
                     # which is what the Kilo free gateway needs (a bogus value is 401).
@@ -9064,68 +9184,63 @@ def plan_routes(plan: dict, user: str) -> list[dict]:
         models.append(m)
     if not models:
         return []
-    by_base: dict[str, list[dict]] = {}
+    # One route per plan. A plan's models may speak several wire protocols, and those
+    # protocols may live on different upstream bases (opencode-go publishes three), so
+    # the route carries a `protocols` map (protocol -> upstream base) and every model
+    # names the protocol whose base it must use. The relay picks the upstream from that
+    # path segment, which keeps one plan = one selector group -- the same shape the
+    # harness uses for a provider that spans several protocols.
+    groups: list[tuple[str, str]] = []
     for m in models:
-        by_base.setdefault(m["base_url"], []).append(m)
-    routes = []
-    multi = len(by_base) > 1
-    # Route ids must be lowercase hyphenated identifiers (DSH rejects others);
-    # plan ids carry an underscore, so translate it.
-    # pi-ai injects OpenCode's per-conversation `x-opencode-session` header only for
-    # providers it recognises as OpenCode -- and it decides that from the provider id
-    # (see the runtime patch this platform applies). A plan that fronts an OpenCode
-    # package therefore keeps that name (plus a short plan suffix so several accounts
-    # stay distinct); every other plan keeps its stable plan-based name.
+        pair = (str(m["api"]), str(m["base_url"]))
+        if pair not in groups:
+            groups.append(pair)
+    protocols: dict[str, str] = {}
+    protocol_of: dict[tuple[str, str], str] = {}
+    seen_api: dict[str, int] = {}
+    for api, base in groups:
+        n = seen_api.get(api, 0) + 1
+        seen_api[api] = n
+        segment = api if n == 1 else f"{api}-{n}"
+        protocol_of[(api, base)] = segment
+        protocols[segment] = base
+    # Route ids must be lowercase hyphenated identifiers (DSH rejects others); plan ids
+    # carry an underscore, so translate it. A plan fronting an OpenCode package keeps the
+    # provider's name: pi-ai decides whether to send OpenCode's session header from the
+    # provider id, and a short plan suffix keeps several OpenCode accounts distinct.
     provider_id = str(pkg.get("id") or "")
     if provider_id.startswith("opencode"):
         _short = str(plan["id"]).split("_")[-1][:6]
         route_base = f"{provider_id}-{_short}"
     else:
         route_base = str(plan["id"]).replace("_", "-")
-    for idx, (base, rows) in enumerate(by_base.items()):
-        route = route_base if not multi else f"{route_base}-{idx + 1}"
-        label = plan.get("name") or plan["id"]
-        if multi:
-            # A plan whose models live on several base URLs needs several routes
-            # (pi-ai fixes one baseURL per provider), so the group names must differ:
-            # suffix them with the protocol rather than the host (usually the same).
-            _api_label = {"openai-completions": "chat",
-                          "openai-responses": "responses",
-                          "anthropic-messages": "messages"}.get(rows[0]["api"], rows[0]["api"])
-            label = f"{label} · {_api_label}"
-        routes.append({
-            "route": route,
-            "display_name": label,
-            "base_url": base,
-            "api": rows[0]["api"],
-            # A keyless package (e.g. the Kilo free gateway) has no real credential.
-            # Through the relay the instance still needs *an* apiKeyEnv, otherwise DSH
-            # refuses with "No API key for provider: …"; the value it holds is the
-            # relay placeholder and the relay then sends no Authorization upstream.
-            # Without the relay a keyless route can only be declared literally keyless.
-            "api_key_env": (plan_key_env(plan["id"])
-                            if (not pkg.get("keyless") or relay_enabled(load_config()))
-                            else None),
-            "keyless": bool(pkg.get("keyless")),
-            "headers": dict(pkg.get("headers") or {}),
-            "models": [{"id": m["id"], "api": m["api"], "name": m.get("name"),
-                        "contextWindow": m.get("contextWindow"),
-                        "maxTokens": m.get("maxTokens"),
-                        "inputModalities": m.get("inputModalities"),
-                        # Reasoning levels must survive plan_routes, otherwise the
-                        # instance never learns the model can think (no 推理等级 in
-                        # the selector) even when the catalog declares it.
-                        "reasoningEfforts": m.get("reasoningEfforts")} for m in rows],
-            # A plan's default_model must be one of the models this plan actually
-            # offers, otherwise agent-default-model names a model that is not in the
-            # patch (the harness would then fall back to something arbitrary).
-            "default_model": next(
-                (m for m in (plan.get("default_model"),
-                             pkg.get("default_model"), rows[0]["id"])
-                 if m and any(r["id"] == m for r in rows)),
-                rows[0]["id"]),
-            "plan": plan,
-        })
+    default_segment = protocol_of[groups[0]] if groups else ""
+    routes = []
+    routes.append({
+        "route": route_base,
+        "display_name": plan.get("name") or plan["id"],
+        "base_url": protocols.get(default_segment, ""),
+        "protocols": protocols,
+        "api": groups[0][0] if groups else "",
+        "api_key_env": (plan_key_env(plan["id"])
+                        if (not pkg.get("keyless") or relay_enabled(load_config()))
+                        else None),
+        "keyless": bool(pkg.get("keyless")),
+        "auth": "copilot" if str(pkg.get("id") or "") == "github-copilot" else "",
+        "headers": dict(pkg.get("headers") or {}),
+        "models": [{"id": m["id"], "api": m["api"], "name": m.get("name"),
+                    "protocol": protocol_of[(str(m["api"]), str(m["base_url"]))],
+                    "contextWindow": m.get("contextWindow"),
+                    "maxTokens": m.get("maxTokens"),
+                    "inputModalities": m.get("inputModalities"),
+                    "reasoningEfforts": m.get("reasoningEfforts")} for m in models],
+        "default_model": next(
+            (m for m in (plan.get("default_model"),
+                         pkg.get("default_model"), models[0]["id"])
+             if m and any(r["id"] == m for r in models)),
+            models[0]["id"]),
+        "plan": plan,
+    })
     return routes
 
 
@@ -9193,6 +9308,12 @@ def plans_patch_yaml(user: str, instance: str,
         lines.append("        models:")
         for m in route["models"]:
             lines.append(f"          - id: {json.dumps(m['id'], ensure_ascii=False)}")
+            # A plan whose models speak different protocols needs a per-model base so the
+            # relay can pick the matching upstream. One protocol for everything (the
+            # common case) keeps the route-level baseURL only.
+            if m.get("protocol") and len(route.get("protocols") or {}) > 1:
+                lines.append("            baseURL: " + json.dumps(
+                    f"{route['base_url']}/{m['protocol']}", ensure_ascii=False))
             if m.get("api") and m["api"] != route["api"]:
                 lines.append(f"            api: {m['api']}")
             for key_name, field in (("name", "name"), ("contextWindow", "contextWindow"),

@@ -258,7 +258,22 @@ if key == "" and auth_kind ~= "" then
 	return deny(503, "relay route has no credential")
 end
 
-local upstream = tostring(target.upstream or ""):gsub("/+$", "")
+-- A route may publish one upstream base per wire protocol (opencode-go serves three, on
+-- different paths). The first path segment after the route names that protocol; without
+-- it the route's own `upstream` applies, which keeps instances rendered before this
+-- existed working unchanged.
+local function pick_protocol(rt, p)
+	local protocols = type(rt) == "table" and rt.protocols
+	if type(protocols) ~= "table" then return nil, nil end
+	local segment, rest = p:match("^/([^/]+)(/.*)$")
+	if not segment then return nil, nil end
+	local base = protocols[segment]
+	if type(base) ~= "string" or base == "" then return nil, nil end
+	return base, rest
+end
+
+local protocol_base, protocol_path = pick_protocol(target, path)
+local upstream = tostring(protocol_base or target.upstream or ""):gsub("/+$", "")
 local scheme, host, prefix = upstream:match("^(https?)://([^/]+)(/.*)$")
 if not scheme then
 	scheme, host = upstream:match("^(https?)://([^/]+)$")
@@ -268,8 +283,9 @@ if not scheme then
 	return deny(502, "relay route has an invalid upstream")
 end
 
--- Keep the provider's own path prefix, then the path the harness appended.
-local full_path = (prefix or "") .. path
+-- Keep the provider's own path prefix, then the path the harness appended (minus the
+-- protocol segment when one selected the upstream above).
+local full_path = (prefix or "") .. (protocol_path or path)
 local args = ngx.var.args
 local query = (args and args ~= "") and ("?" .. args) or ""
 ngx.var.relay_target = scheme .. "://" .. host .. full_path .. query

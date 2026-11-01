@@ -1,3 +1,16 @@
+## 0.83.2（copilot 机制就绪：第二凭据 + 换 token + 刷新；待权益验证）
+
+- github-copilot 没有静态 API key ✓ 它的可用凭据是"由长期 GitHub 凭据换来的短时 token" ✓。
+  平台现在按 plan 保存那份长期凭据（`plans/<id>.gh`，0600 ✓），并在 `copilot_token()` 里
+  调 `copilot_internal/v2/token` 换取 + 缓存 + 提前 60 秒刷新 ✓（换失败保留旧 token 并告警 ✓）。
+- relay.json 里 copilot 路由用换来的 token 做 bearer ✓ 实例仍只有占位符 ✓。
+- provider 包按 copilot 特判 ✓（base 指 copilot host ✓ 26 个模型 ✓ 三种协议 ✓ 复用 protocol 段 ✓）。
+- **状态记为"机制就绪、待权益验证"** ✗：真机用无订阅的 PAT 实测，交换接口返回 404 ✓
+  （GitHub 对没有 Copilot 权益的账号不解释原因 ✓）。有权益时写好 `.gh` + sync 即可用 ✓ 无需改代码 ✓。
+- 该 provider 包默认 `disabled: true` ✓ 避免用户选到必然失败的组 ✓。
+- 顺带修两个 bug：`auth` 标记改为按 provider id 判定 ✓（包 schema 会把 auth 规范成 dict ✗）、
+  `copilot_token()` 里误用未定义的 `warn` ✓。
+
 ## 0.80.0（opencode / opencode-go 可用：会话头 + 路由命名）
 
 - 根因：`x-opencode-session` 由 pi-ai 自己的 `withOpenCodeSessionHeader` 注入 ✓，
