@@ -1,5 +1,431 @@
 # CHANGELOG
 
+## 0.60.1（模型页作为"用户自填"入口 + 停用语义收口）
+
+- **`models_native` 默认恢复为 true** ✓（0.60.0 曾默认关闭）：DSH「设置 → 模型」是**用户填自己 key** 的唯一
+  安全入口（它自己写 `.credentials.yaml`，我们不去碰那个格式）；平台托管的行仍由补丁隐藏按钮 ✓。
+  按实例/整体可以关：`instances[].models_native=false` / `dsh-muctl config models_native false` ✓。
+- 澄清语义 ✓：**"停用"只影响平台侧**（不能再建套餐、后台下拉里不可选），不影响用户在 DSH 里自填该 provider
+  —— DSH 的下拉是它自己从 provider 目录生成的，我们改不到也不该改 ✓。
+
+## 0.60.0（DSH 模型页开关 + 按实例白名单）
+
+- 新增 `models_native`（全局默认）与 `instances[].models_native`（按实例覆盖）✓：
+  关闭时在 profile patch 里注入 `- id: ui-settings-models` + `disabled: true` ✓
+  （**必须写在 profile 的 `cordis.patch.yml` 里**，不能走 `--patch`：命令行覆盖会让设置页只读 ✗）。
+- doctor 新增 `models page` ✓：显示当前是否开放、哪些实例开放了 ✓。
+
+## 0.59.1（provider 来源/保护/停用/模板 + 撞车规则）
+
+- **provider 包新增字段** ✓：`origin`（`dsh` / `custom`）、`disabled`、`params`、`needs_params`；
+  `validate_provider_package` 全量保留 ✓。
+- **DSH 目录导入** ✓：`POST /api/provider-import {ids:[...]}` 或后台「＋ 从 DSH 目录添加」；
+  `origin=dsh` ✓ **不可删除**（`DELETE` → 409，提示改用停用）✓。
+- **base_url 继承** ✓：从运行时 `dsh-llm-pi-ai/lib/index.js` 的 `PROVIDER_DATA` 字面量解析，
+  实测拿到 **34 个**默认端点 ✓（它不走任何公开 API，只能解析）；解析失败则拒绝导入并提示改用 JSON ✓。
+- **地址模板** ✓：`amazon-bedrock` / `azure` / `cloudflare-workers-ai` / `cloudflare-ai-gateway` /
+  `google-vertex` 用 `{region}`、`{resource}`、`{account_id}`、`{gateway_id}`、`{location}` 占位 ✓；
+  导入后 `disabled: true` + `needs_params` ✓，填参（`toggle` 带 `params`）才启用 ✓。
+- **撞车规则** ✓：自建 provider 不许用 DSH 目录里的 id（409，提示 `mu-<id>`）✓；`label` 不许重复 ✓；
+  `sync` 做幂等迁移（自建 `deepseek` → `mu-deepseek`，并更新引用它的套餐）✓。
+- **套餐守卫** ✓：`save_plan` 拒绝不存在或已停用的 provider ✓（CLI 与后台同一条规则）。
+- **后台界面** ✓：provider 表显示 `DSH` 徽标 / `已停用` / `待填参数`；操作为「导出 / 下载 / 停用」，
+  DSH 来源**没有删除按钮** ✓；「套餐」的 provider 下拉改成**本地 provider 包**（停用的灰掉不可选）✓。
+
+## 0.58.2（provider 目录缓存形状校验）
+
+- `dsh_catalog()` 会校验缓存形状 ✓（旧格式 `provider -> [models]` 会被丢弃并重新生成），
+  避免把旧缓存当新格式用（表现为 `'list' object has no attribute 'get'`）✗。
+- `provider_import_from_catalog` 修 `auth.type`（`api-key` → `bearer`）✓，并校验 DSH 目录里是否存在 ✓。
+
+## 0.58.0（从 DSH 目录导入 provider）
+
+- 新增「＋ 从 DSH 目录添加」✓ + `POST /api/provider-import` ✓：把 DSH 自带的 provider（含模型目录）
+  一键落成 dsh-mu 的 provider 包 ✓，之后照常建套餐 ✓。
+- 新增 `GET /api/provider-catalog` ✓：供页面的导入列表使用（42 家 / 1599 模型）✓。
+
+## 0.57.1（补丁覆盖删除按钮）
+
+- `models lock` 补丁从 1 条扩到 2 条 ✓：**编辑**与**删除**按钮都按 `displayName` 前缀 `平台托管` 隐藏 ✓。
+- 每条补丁独立守卫 ✓（`patched in text` 幂等、`stock` 原文必须唯一命中），
+  部分命中时 doctor 报 `partial patch` ✓。
+
+## 0.57.0（模型配置改走 profile patch，解除设置页只读）
+
+- **根因** ✓：模型配置写在 `--patch`（命令行覆盖）里，DSH 判定命名空间被外部覆盖 ✗，
+  设置页保存时报 `Configuration for "llm-pi-ai" is overridden by a home patch or command-line overlay` ✗。
+- **改法** ✓：`split_plans_patch()` 把 patch 拆成两半 ✓ —— `sandbox-policy`/`permission` 留在 `--patch`，
+  `llm-deepseek`/`llm-pi-ai` 写进 `~/.dsh/profiles/<p>/cordis.patch.yml` 的
+  `# >>> dsh-mu:llm` 标记块 ✓；块外内容（用户自己加的 provider）**原样保留** ✓。
+
+## 0.50.0（插件市场 = 平台的 index + 本地 registry，走 relay，无扩展）
+
+方案 A ✓：DSH 自带的 **Discover tab** 直接吃我们的源 ✓，**不需要扩展 apk** ✓。
+
+- **relay 新增 `__market` 路由** ✓（`gateway/lua/relay.lua` ✓）：
+  - `/mu-llm/<token>/__market/index.json` ✓ → **format 1** 的 index ✓
+    （`versions[].source = {type:"npm", registry:"<base>/registry"}` ✓、
+    匿名安装数放进 `metadata.sortKeys.installs` ✓、排序默认 desc ✓）；
+  - `/mu-llm/<token>/__market/registry/<pkg>` ✓ → **npm packument** ✓
+    （`dist.tarball` 指向下面那个 tarball 地址 ✓，scoped 包名兼容 `%2F` ✓）；
+  - `/mu-llm/<token>/__market/t/<file>.tgz` ✓ → 直接吐离线包 ✓（读 `/var/lib/dsh-mu/market/` ✓）；
+  - 三者都不代理、不碰 provider ✓ —— relay 不会因此变成开放代理 ✓。
+- **平台侧** ✓：`render_market_feed()` ✓ 由 `sync` 生成 `market.json` ✓ 并把 tarball 复制到
+  `var/lib/dsh-mu/market/` ✓（gateway jail 以只读挂载 ✓、`market.json` 走 gateway etc ✓ 不进实例 ✓）。
+- **实例 patch 注入** ✓：`market_patch_yaml()` ✓ 在 `.dsh-mu-provider.yml` 末尾插入
+  `plugin-market`（`config.indexes = [<该实例的 __market index>]` ✓）+ `ui-plugin-market` ✓。
+- **开关** ✓：`market_enabled`（默认 **false** ✓）；单实例 `instances[].market=false` 可退出市场 ✓。
+- **doctor** ✓ 新增 `market feed`：包数 ✓、缺失 tarball WARN ✓、服务的实例数 ✓。
+
+## 0.49.0（DSH 运行时升级到 0.2.1-rc.5 + `runtime install`）
+
+- **默认运行时版本** ✓：`dsh_version` 从 `0.2.0-rc.2` → **`0.2.1-rc.5`**（GitHub 上最高的非 alpha ✓）。
+- 新增 **`dsh-muctl runtime install [version]`** ✓：只升级**共享运行时** ✓
+  （在 gateway rootfs 里 `npm i -g @deepseek-ai/dsh@<ver>` ✓），不动模板/网关构建 ✓；
+  升级后自动检查 **node-pty 是否又变回 glibc 预编译** ✗ → 是就自动 `fix-pty` ✓（musl 重编 ✓）。
+- `runtime status` / `fix-pty` 不变 ✓。
+
+## 0.48.0（`/ext-api`：扩展可以反向调用平台，但只拿到该拿的）
+
+给"插件市场"扩展准备的平台侧能力 ✓（docs/18 §3.2c ✓）：
+
+- **`GET/POST /ext-api/<name>/market/list`** ✓：
+  列表 = **平台已批准资产** ✓ ∪ **实例里已安装的包** ✓（同名合并 ✓ 取高版本 ✓）；
+  每项：`name ✓ version ✓ source ✓ managed ✓ installable ✓ installs`（**匿名计数** ✓）
+  `installed_here` ✓；**不返回**任何实例名 ✗（隐私 ✓）。
+- **`POST /ext-api/<name>/market/stage`** ✓：把**已批准离线包**复制到
+  `<该实例 home>/.cache/dsh-mu-market/` ✓，返回 jail 内路径 ✓ 与建议的
+  `dsh plugin add file:…` 命令 ✓ —— 由实例里的 dsh 自己装 ✓（**DSH 原生、热加载、不重启** ✓）；
+  目标目录**固定** ✓，请求不能指定路径 ✓；同文件幂等 ✓；chown 给实例 uid ✓。
+- **认证** ✓：`X-DSH-MU-Ext-Token`（= `/var/lib/ext/admin.token` ✓）——
+  **不涉及平台管理员令牌** ✗；manifest 未声明 `"caps": ["market"]` 的扩展直接 403 ✓。
+- 路由在 admin 后端的 `_dispatch` 里**先于** admin 鉴权分流 ✓（`/ext-api/` 前缀 ✓），
+  未命中 action 返回 404 ✓，异常统一 500 且不泄露堆栈 ✓。
+- **0.48.1**：新增**每实例开关** `instances[].market` ✓（关掉后 `stage` 403 ✓、`installable=false` ✓）。
+- **0.48.2**：`admin.token` 之前在"渲染网关代理块"时才生成 ✗ → 没有 admin 端点的扩展拿不到令牌 ✗ →
+  改为 **`ext reload` 时为每个已注册扩展生成** ✓。
+- 实测（0.48.2，本机）✓：`list` 返回 5 条 ✓（含 1 条"别人装过但平台无资产"✓，匿名计数 ✓ 无实例名 ✓）；
+  `stage` 把 32 KB 的离线包写进 `alice/home/.cache/dsh-mu-market/` ✓ 并返回
+  `dsh plugin add file:…` ✓；`missing asset → 404` ✓、`market off → 403` ✓、`错 token → 403` ✓、`无 caps → 403` ✓。
+
+## 0.47.1 / 0.47.2（升级命令的两个小毛病）
+
+- **版本号显示错** ✗：`dsh-muctl upgrade` 打印 `0.47.0 -> 0.47.0` ✗ ——
+  进程里的 `VERSION` 常量是启动时读的 ✓，`apk add` 之后没刷新 ✗ →
+  改成**从磁盘读两次**（`/usr/local/lib/dsh-mu/python/VERSION` ✓）。
+- **`gateway lua` 假 stale** ✗：`nginx -s reload` 只换 worker ✓ 不换 master ✗ →
+  用"文件 mtime > 进程启动时间"判断永远为真 ✗ → 每次升级后 doctor 都报 stale ✗。
+  现在 reload 成功后写 **`/run/dsh-mu/gateway-lua.stamp`** ✓，
+  判断基准取 `max(进程启动, 上次 reload)` ✓。
+- `upgrade` 在检查前会再补一次 `reload_gateway_if_stale()` ✓，避免把"刚该 reload"报成遗留问题 ✓。
+- docs/05 §3.1 改成一条命令的写法 ✓（老写法留作排障 ✓）。
+
+## 0.47.0（概览看"谁在用" + 升级收敛成一条命令）
+
+- **概览「正在使用」** ✓：实例表新增两列
+  - **正在使用** ✓：`会话开着`（该实例的 `session.lock` 被运行中的 dsh 持有 ✓）/
+    `刚活动过`（最近 2 分钟有会话写入 ✓）/ `空闲` ✓；
+  - **最近活动** ✓：`3 分钟前 / 2 小时前 / 2 天前`（`session.v4.jsonl.zstd` 的 mtime ✓）；
+  - 顶部一行提示 ✓："N 个实例最近有对话活动 —— 重启/升级前先看这一列" ✓；
+  - 概览卡片新增 **正在使用** 计数 ✓。
+  - **刻意不用**"到实例端口的连接数" ✗：nginx 会留着空闲 keepalive ✓ 实测没人用也有 1 条 ✗。
+- **`dsh-muctl upgrade [apk]`** ✓ —— 升级不再需要记命令：
+  ```
+  dsh-muctl upgrade                      # 自动找最新的 dsh-mu-*.apk
+  dsh-muctl upgrade /root/dsh-mu-x.apk
+  ```
+  它按顺序做 ✓：① `apk add --allow-untrusted --force-overwrite` ✓ ② `sync`
+  （gateway Lua ✓ / admin backend 重启 ✓ / egress ✓ / 实例配置）✓
+  ③ `doctor` 汇总剩余 WARN/FAIL ✓ ④ 打印新旧版本 ✓ + 哪些实例还在跑旧代码 ✓（怎么重启 ✓）。
+- **`--safe`** ✓（按你的意思倒过来）：默认**直接装** ✓；想要"有人在用就别装"才加 `--safe` ✓
+  （它会把 `会话开着/刚活动过` 的实例列出来并中止 ✓）。另加 `--no-restart` ✓（不提示重启 ✓）。
+
+## 0.46.0（终端 503 的真正根因：node-pty 是 glibc 版，跑在 musl 上段错误）
+
+- **根因** ✓：DSH 的 `node-pty` 只带 **glibc 预编译** ✓（`prebuilds/linux-x64/pty.node`，
+  含 `GLIBC_2.2.5 / 2.28` 符号 ✓），而我们的运行时是 **musl** ✗ →
+  模块能 `require` 成功 ✓，**一 spawn 就 SIGSEGV** ✗ → DSH 返回 503 ✓ → 会话里"新建终端"报错 ✓。
+  实测（实例 jail 内探针）：`node-pty load OK` ✓ 然后 `Segmentation fault` ✗；
+  重编后：`child output: "NODE-PTY-OK" exit 0` ✓（新 `pty.node` 里 GLIBC 符号 0 处 ✓）。
+- **新增 `dsh-muctl runtime status|fix-pty`** ✓：
+  - `status` ✓：打印 rootfs、node-pty 路径、是否 musl 构建、结论 ✓；
+  - `fix-pty` ✓：**只往运行时 rootfs 里**装 `python3 make g++ linux-headers` ✓（宿主不加依赖 ✓），
+    再 `npm rebuild node-pty --build-from-source` ✓；成功提示重启实例 ✓。
+- `doctor` 新增 `runtime pty` ✓：glibc 构建 → WARN 并给出 `runtime fix-pty` ✓；musl → PASS ✓。
+- 另：`free_instance_port()` 现在优先用 **cgroup** 收进程 ✓（见 0.45.0 ✓）。
+
+## 0.45.0（用 cgroup 收进程：cgroup.kill / freeze + pids.max）
+
+- 新增 `cgroup_kill(path)` ✓：
+  1. 内核支持 `cgroup.kill`（≥5.14 ✓，本机 7.0.x ✓）→ 一次写入**整棵子树原子性干掉** ✓；
+  2. 否则 **`cgroup.freeze=1` + `pids.max=1`** ✓（冻结后无法 fork ✓，pids 上限让 supervise 的重启也拿不到进程 ✓）
+     再逐个 SIGKILL ✓；收完把 `pids.max` 恢复 `max` ✓、解冻 ✓，保证下次能正常启动 ✓。
+- `free_instance_port()` 现在**优先走 cgroup** ✓（`/sys/fs/cgroup/dsh-mu/<instance>` ✓），
+  失败才回退到"按端口找 pid" ✓ —— 比 `pgrep` + `kill` 可靠 ✓，也堵住了"杀完又被拉起"的循环 ✓。
+
+## 0.44.1 / 0.44.2（撤销一个失败的改动 + 终端排查结论）
+
+- **撤销** ✗：0.44.0 试图让 `instance exec` 原样传 argv ✓，实测适得其反 ✗
+  （`exec` 只拿到一个拼好的字符串 → `not found` ✗，`exit 127` ✗）→ 已回滚到 0.43.1 的 jail ✓；
+  `instance exec` 对带引号的参数**仍然不可靠** ✗，这是待定的独立问题 ✓（不影响实例本身 ✓）。
+
+## 0.44.0（`instance exec` 原样传 argv；终端排查结论）
+
+- **修** ✓：`dsh-muctl instance exec <n> -- <cmd> '<args…>'` 之前会把参数**重新拼成 shell 字符串** ✗
+  （`$JAIL_BIN -c "cd … && $RUN_CMD"` ✗）→ 引号被吃掉 ✓，`python3 -c "…;…"` 直接
+  `syntax error: unexpected ";"` ✗。现在 exec 模式走
+  `sh -c 'cd "$1"; shift; exec "$@"'` ✓，**argv 原样进入** ✓。
+- **终端 503 的排查结论**（本机实测 ✓）：
+  - 已修掉的真 bug ✓：`stop` 之后 node 仍占着 3100 ✗ → 新进程 `EADDRINUSE` 启动失败 ✗ →
+    顶上来的是**半初始化**的旧进程 ✓ → `terminal/*` 503 ✓（0.43.1 已在 stop/start/restart 都回收端口 ✓，
+    `pids_on_port(3100)` 现在 stop 后为 `[]` ✓）；
+  - `terminal/create` 这条 RPC **是活的** ✓：用 DSH cookie 直连返回 **200 + 参数校验错误** ✓
+    （`args fields do not match … missing "agentId","request"` ✓ / `request` 需要具体结构 ✓），
+    说明不是 503 的"服务缺失"✓；
+  - `list / shells / environment / close` 全部 **200** ✓，只有 **create** 在**参数完整**时给 503 ✗
+    → 卡在**真正 spawn 终端**这一步 ✓（与 `node-pty` 在 jail 里能否 `posix_spawn` 有关 ✓，待继续 ✓）。
+
+## 0.43.0（真因：残留 dsh 占端口 → 启动失败 → terminal/* 一律 503）
+
+- 现场证据 ✓：`~/.dsh/logs/startup-*.log` 里
+  `StartupError: dsh: startup failed: 2 required plugins did not activate` ✓
+  `webserver (required) … listen EADDRINUSE: address already in use 127.0.0.1:3100` ✗
+  → 新进程起不来 ✓，**活下来的是半初始化的旧进程** ✗（`connection`/`webRuntime` 都在等 service ✗）
+  → `/api/terminal/*` 全部 503 ✓，会话里的「新建终端」自然报错 ✓。
+- 实测 ✓：`rc-service dsh-mu-alice stop` 之后 **node 仍在监听 3100** ✗（`pids_on_port` = [1915718] ✓）
+  → 每次 restart 都会留一个孤儿 ✓，新进程 `EADDRINUSE` 启动失败 ✓，旧进程半初始化 ✓ → 503 ✓。
+- 平台防护 ✓：`service_action()` 在 **stop / start / restart 三个动作**都做端口回收 ✓
+  （stop 后 0.7s 检查 ✓，若仍有进程占用就杀掉并打印 ✓；start/restart 前先 evict ✓）✓
+  原先只挂在 start/restart 上 ✗，覆盖不到"停不掉"的主路径 ✗。
+  （`pids_on_port()` 走 `/proc/net/tcp` + `/proc/<pid>/fd` ✓，打印
+  `instance <n>: evicted N orphan(s) holding port <p>` ✓）→ 每次 restart 都是干净启动 ✓。
+- 已排除 ✓（避免以后再误判）：PTY 在 jail 里正常（`script -q -c` → ok ✓）、
+  接口本身存在（无 cookie → 401 ✓）、网关代理正常 ✓、socket/权限无关 ✓。
+
+## 0.42.0（修：重复 supervise-daemon 导致会话里"新建终端"HTTP 503）
+
+- 现象 ✓：实例会话右面板点「新建终端」→ `terminal/create failed … HTTP 503` ✗，
+  网关错误日志是 `upstream prematurely closed connection … POST /api/terminal/create` ✗。
+- 根因 ✓：这台机器上 alice 有 **3 个 `supervise-daemon`** ✗（反复 `apk add` / `rc-service restart`
+  留下的 ✓），每个都拉起一个 jail ✓：一个抢到 3100 ✓、其余 `EADDRINUSE` 无限重启 ✗；
+  浏览器打到的是**旧进程** ✓ → 它的终端服务已经不健康 ✓ → 直接断开连接 ✗ → 网关映射成 503 ✗。
+  直连 `POST 127.0.0.1:3100/api/terminal/create` 返回 401 ✓（接口本身在 ✓），说明不是 DSH 缺能力 ✓。
+- 修法 ✓：
+  - `service_action()` 在 **start/restart 前**调用 `reap_stale_supervisors()` ✓：
+    找出 `supervise-daemon <unit>` 里**不是 pidfile 里那个**的进程 ✓，先 TERM 其子进程 ✓ 再 TERM/KILL 自己 ✓，
+    并打印 `cleaned up N stale supervisor(s)` ✓；
+  - `doctor` 新增 `supervisors` 一项 ✓：有重复就 WARN 并提示 `instance restart` ✓。
+- 实测（本机）✓：修前 `supervise-daemon dsh-mu-alice` = **3** 个 ✓、`node --port 3100` = **2** 个 ✗ →
+  `dsh-muctl instance restart alice` 后 = **1 / 1** ✓；
+  `POST 127.0.0.1:3100/api/terminal/create` 从 *连接被断开* ✗ 变成 **401** ✓（接口健康 ✓，带登录 cookie 即可建终端 ✓）；
+  `doctor`：`PASS supervisors` ✓ / `PASS instance alice` ✓。
+
+## 0.41.0（修：网关 jail 看不到扩展 socket，导致 /ext/<name>/ 一律 502）
+
+- 现象 ✓：扩展已改为 unix socket ✓、`admin.sock` 也存在 ✓、**host 上 root 直连 200** ✓，
+  但浏览器打开配置页仍是 **502** ✗，页面提示"扩展页面连不上"✓。
+- 根因 ✓：网关跑在**自己的 jail** 里 ✗，jail 内 `/run` 是**私有 tmpfs** ✗ →
+  `/run/dsh-mu/ext/<name>/admin/admin.sock` 在网关里**根本不存在** ✗ →
+  nginx `connect() ... No such file or directory` ✗ → 502 ✓。
+  （不是权限问题 ✗：网关 `user root;` ✓，host 上 root 连得上 ✓ 已实测排除 ✓）
+- 修法 ✓：生成网关 jail 配置时，若有扩展则把 `/run/dsh-mu/ext` **同路径 rw 绑进网关 jail** ✓
+  （`write_gateway_jail_conf` ✓）；`sync` 会重写 ✓ 并重载网关 ✓。
+- 诊断增强 ✓：
+  - `dsh-muctl ext status <name>` 的 `adm sock` 行现在带 **`connect: ok|missing|eacces|refused`** ✓；
+  - `doctor` 的 `ext <name>`：admin socket 连不上时直接 **FAIL** ✓ 并点明
+    "`/ext/<name>/` cannot work" ✓ + 给出 `ext restart` / `ext logs` ✓。
+
+## 0.40.0（插件升级真正生效 + 扩展 502 页说清楚是谁挂了）
+
+按 SSH 扩展报的 issues#4 修 ✓：
+
+- **`install_phase` 只看包名** ✗ → 现在比较**版本** ✓（`node_modules/<pkg>/package.json` 的
+  `version` 对比资产版本 ✓）；版本不同就重装 ✓，并打印 `upgrading 1.0.0 -> 1.1.0` ✓；
+- **升级不再走 `pnpm add file:`** ✓（实测会长时间卡住 ✗）：新增
+  `install_package_direct()` ✓ —— 直接解 tarball 到 `profiles/<p>/node_modules/<pkg>` ✓、
+  改 `package.json` 的 `file:` 依赖 ✓、chown 给实例 uid ✓（首次安装仍优先 pnpm ✓，
+  pnpm 报错时自动回退到直解 ✓）；
+- **bundle 换版时** ✓：同名包**只保留一行**资产 ✓（旧 spec 删掉 ✓ 并打印替换关系 ✓）、
+  **policy 自动指向新 spec** ✓、`ext reload` 导入后**立即对已装实例跑 push** ✓；
+- **扩展 502 页面** ✓：以前所有 `/ext/<name>/` 失败都显示平台的
+  "dsh-mud 没有响应" ✗（误导 ✗）→ 现在每个扩展一个 `@gw_ext_down_<name>` ✓，
+  写明**代理目标**（unix socket 或 TCP 端口 ✓）+ 三条排障命令 ✓
+  （`ext status` ✓ / `ext logs` ✓ / `ls -l <socket 目录>` ✓）+ "改过 manifest 要重启实例" ✓。
+
+## 0.39.0（扩展改用 unix socket：无端口可撞，配置 API 进不了实例）
+
+- manifest 新增 **`service.socket`** / **`admin.socket`** ✓（`port` 保留为回退 ✓，两者都有时 socket 优先 ✓）；
+- 平台 ✓：
+  - 建 `/run/dsh-mu/ext/<name>/{api,admin}` ✓（api 0711 ✓、admin 0700 ✓），并以 rw 挂进 appliance ✓
+    （`/run/dsh-mu-ext/api` ✓、`/run/dsh-mu-ext/admin` ✓）；
+  - **只把 api 目录 ro 绑进实例** ✓（实例内 `/run/dsh-mu-ext/<name>/api.sock` ✓）——
+    admin socket 不进实例 ✓，所以"配置 API 只有网关能进"**由文件系统保证** ✓，不再靠端口不同 ✓；
+  - 有 `socket` 时**不再**给实例放行 loopback 端口 ✓（`ext_ports()` 跳过 ✓）；
+  - 网关 `proxy_pass` 支持 `http://unix:<admin.sock>:/` ✓；
+  - `ext status` 打印两个 socket 路径 ✓；`doctor` 检查 api socket 是否真的出现 ✓（没出现 → WARN ✓）；
+- 修 ✓：`ext_admin_token()` 在 token 文件不存在时会 `AttributeError` ✗（`read_text` 返回 None ✗）→ 已处理 ✓。
+
+## 0.38.0（扩展端口：冲突检测 + 平台保留端口；unix socket 方案写进规范）
+
+- **端口是扩展自己选的** ✓（manifest 的 `service.port` / `admin.port` ✓），平台不分配 ✗ ——
+  所以会撞 ✗。现在补上检测 ✓：
+  - `ext reload` ✓ 与 `doctor` 的 `ext ports` ✓ 会报：扩展之间重复 ✓、以及占用平台端口 ✓
+    （gateway ✓ / admin 8787 ✓ / relay 8099 ✓ / 实例端口 ✓），一条一条说出来 ✓（只告警 ✓ 不阻断 ✓）；
+  - `ext list` 多一列 `ADMIN` ✓，端口一眼可见 ✓；
+- **规范新增 §3.2b** ✓：讲清"端口现状 + 为什么不够 + 目标方案" ✓ ——
+  下一版改成 **unix socket 优先** ✓（`/run/dsh-mu/ext/<name>/api.sock` 给实例 ✓、
+  `admin.sock` 给网关 ✓，目录 0700 且不进实例 ✓），`port` 只作回退 ✓。
+
+## 0.37.0（按 SSH 扩展的上游问题报告修三处）
+
+来源 ✓：`dsh-mu-ssh-ext/issues/dsh-mu-upstream-issues.md` ✓（0.34.0 首测、0.36.0 复测 ✓）。
+
+- **#1 `ext doctor` / `ext cli` 必然 `KeyError: '_dir'`** ✓
+  成因 ✓：注册副本会剥掉 `_` 开头的字段 ✓，而 `cmd_ext` 读的是注册版优先 ✗ →
+  改为**扫描版优先** ✓ 并给 `/etc` 里的副本补 `_dir` ✓；
+- **#2 停服务/换 apk 后旧进程仍占端口** ✓（**也影响所有实例** ✗，不只扩展）
+  成因 ✓：`jail/dsh-mu-jail` 用 `unshare --fork` ✓，服务管理器只杀包装进程 ✗ →
+  实测 `--kill-child` **不管用** ✗（子进程已被重挂 ✓ 信号不到 ✓）→ 改为**去掉 `--fork`** ✓：
+  内层进程直接替换包装进程 ✓，SIGTERM 直达 ✓，停/重启/升级不再留孤儿 ✓；
+- **#3 扩展配置页的管理员身份不可验证** ✓（安全设计缺口 ✓，不是小 bug ✓）
+  - 新增可选 `admin.port` ✓：`/ext/<name>/` 代理到它 ✓，而**实例 egress 只放行 `service.port`** ✓
+    → 实例连不进配置 API ✓（未写该字段时按 `admin.url` 里的端口 → `service.port` 兜底 ✓）；
+  - 代理**不再转发**平台管理员令牌 `X-DSH-MU-Admin` ✓（appliance 若被写坏就能调 admin API ✗），
+    改发**每扩展一把** `X-DSH-MU-Ext-Token` ✓（`/var/lib/dsh-mu/extensions/<name>/admin.token` ✓）；
+  - `admin.lua` 的 `wants_json()` ✓ 现在也认 `/ext/<name>/admin/api…` ✓
+    （否则未登录时 API 拿到 HTML 登录页 ✗，页面只能显示"请求失败"✗）；
+- docs/18 §3.2/§3.3 补上边界说明 ✓："扩展必须假定实例可直连 `service.port`" ✓。
+
+## 0.36.0（扩展配置页经网关代理：修"Firefox 无法连接 127.0.0.1:8791"）
+
+- 现象 ✓：后台「扩展」→「配置」→ iframe 指向 `http://127.0.0.1:<port>/` ✗ ——
+  那是**操作员电脑**的回环地址 ✗，不是服务器的 ✓，所以浏览器报"无法连接" ✗；
+- 现在 ✓：网关为每个扩展生成代理块 ✓：
+  - `location = /ext/<name>` → 302 到 `/ext/<name>/` ✓
+  - `location ^~ /ext/<name>/` → 走同一套 **admin 会话校验** ✓（`admin.lua` ✓），
+    `proxy_pass http://127.0.0.1:<port>/` ✓，剥掉平台 Cookie ✓，502 走 `@gw_admin_down` ✓；
+- 后台 ✓：`/api/ext` 多返回 `proxy_path` ✓，「配置」按钮的 iframe 改用 **`/ext/<name>/`** ✓
+  （面板里同时写出服务实际端口，便于排障 ✓）；
+- 规范 ✓：`admin.url` 明确是**服务器侧**地址 ✓，扩展页面**必须用相对 URL** ✓（docs/18 §3.2）；
+- 顺手修 ✗：示例扩展里的 `ADMIN_HTML` 之前只被引用、没有定义 ✗（`/admin` 会 500 ✗）
+  → 已补上 ✓，并改成相对 URL 取数据 ✓。
+
+## 0.35.0（工作区目录改名 + 需求书按"扩展"重写）
+
+- 工作区目录 `dsh-mu-ssh-plugin/` → **`dsh-mu-ssh-ext/`** ✓（与"扩展"术语一致 ✓）；
+- `REQUIREMENT.md` **按扩展重写** ✓：术语区分 ✓、角色图（实例 ↔ 扩展 jail ✓）、
+  **后台「扩展」页 + 配置页 iframe** ✓、12 条验收标准 ✓（含"自带运行时"✓、"插件受管"✓）、
+  apk 目录布局 ✓（`bundles/@dsh-mu-dsh-ssh-<ver>.tgz` ✓）、post-install/pre-deinstall 动作 ✓；
+- 新增 `README.md` ✓（工作目录说明 + 开工清单 ✓）；
+- docs/18 与 CHANGELOG 里的旧路径同步改成 `dsh-mu-ssh-ext/` ✓。
+
+## 0.34.0（术语统一：扩展 ≠ 插件；后台加「扩展」页；修版本号写死）
+
+- **术语** ✓：apk 包一律叫 **扩展（dsh-mu 扩展）** ✓；装进实例的 npm 包才叫 **插件** ✓。
+  docs/18 新增 §1.5 术语表 ✓，docs/13 与 README 各加一句提示 ✓，需求书标题改为"SSH 扩展" ✓；
+- **后台新增「扩展」页** ✓：列出 扩展名/版本/说明/服务状态/端口/出网白名单 ✓，
+  可 **刷新 / 重新扫描（reload）** ✓、**启动 / 停止 / 重启** ✓，
+  「配置」按钮把扩展自带的页面 **以 iframe 打开** ✓（平台不碰它的表单 ✓）；
+- **修 bug** ✓：`/admin/` 顶栏版本号被写死成 `v1.0.0` ✗ —— `admin/dsh-mud` 里
+  `VERSION = "1.0.0"` ✗ → 改为跟随 `dshmuctl.VERSION` ✓，现在显示真实版本 ✓；
+- 新增 API ✓：`GET /api/ext` ✓、`POST /api/ext {action: reload|start|stop|restart, name}` ✓。
+
+## 0.33.0（扩展自带的插件 = 受管插件：不能删、不能更新）
+
+- 扩展 `bundles/*.tgz` 导入的资产现在带 **`managed_by: "<扩展名>"`** ✓（原来只有 `source=apk` ✓）；
+- **平台强制** ✓：`plugin add` 想覆盖它 → 拒绝 ✓；`plugin remove` → 拒绝并提示"卸载扩展包"✓；
+  后台 API 的 `action:remove` 同样 403 ✓；
+- **后台 UI** ✓：这类包显示 `随扩展` 徽章 ✓，操作列不再有「更新 / 移除策略 / 移除并删包」✗，
+  只留一句"由扩展 X 管，升级/删除请换扩展包"✓；受保护 / 预装 / 推送 三个勾**照常可用** ✓；
+- **规范**（docs/18 §3.5）✓：包名建议 `@dsh-mu/dsh-<ext>` ✓、判定只看 `managed_by` ✓、
+  `bundles/` 只放自己的包 ✓、`package.json` 建议写 `dsh.ext` ✓、版本随扩展一起升 ✓。
+
+## 0.32.0（扩展机制：扩展 = 自带 rootfs 的受管 jail + 清单）
+
+按约定把"服务 P"从平台里**搬出去** ✓，平台只保留通用机制 ✓：
+
+- **平台不再包含 broker** ✗ → 骨架移到 `examples/extension-ssh/` ✓
+  （`p/broker.py` ✓、`manifest.json` ✓、`/health` ✓、`/admin` ✓、`build-rootfs.sh` ✓、`bundles/` ✓）；
+- **新增扩展机制** ✓（`docs/18` §3）：
+  1. 发现与注册 ✓：扫 `/usr/share/dsh-mu/extensions/*/manifest.json` ✓ → `dsh-muctl ext reload` ✓；
+  2. **跑成 jail** ✓：生成 `/etc/dsh-mu/extensions/<name>.conf` ✓ + unit `dsh-mu-ext-<name>` ✓，
+     cgroup `dsh-mu-ext/<name>` ✓，**无 capability** ✓，只 bind 自己的 data 与扩展目录 ✓；
+  3. 端口与出网 ✓：实例 egress 自动放行扩展端口 ✓；扩展自身按 `net.egress` 生成 `ext_<name>` 链 ✓
+     （**默认 deny-all** ✓）；
+  4. admin 注入 ✓：扩展声明 `admin.url` ✓ → 「插件」页多一栏 ✓（iframe ✓），预装/推送继续复用 ✓；
+  5. 插件资产导入 ✓：`bundles/*.tgz` → `source=apk` 的已批准资产 ✓（幂等 ✓ sha256 ✓）；
+  6. CLI 透传 ✓：`dsh-muctl ext cli <name> …` ✓ → 扩展自带 `cli` ✓；
+  7. doctor 汇总 ✓：每个扩展一项 ✓（service 状态 ✓ + 端口应答 ✓；`ext doctor <name>` 调扩展自己的检查 ✓）；
+  8. 卸载清理 ✓：清单消失 → 停 unit ✓、删 conf ✓、资产标 `orphaned` ✓（数据保留 ✓）；
+- **apk 依赖方向** ✓：扩展包**不需要**宿主装 python/asyncssh 之类的运行时 ✓
+  （都在它自己的 rootfs 里 ✓）；`openssh-client` 仍保留在平台依赖里 ✓（示例与排障方便 ✓）；
+- 版本闸门 ✓：manifest 的 `requires.dsh-mu` 不满足 → **跳过并 WARN** ✓，绝不半装 ✓；
+- 实测踩到一处 ✓：示例的入口脚本没有 `+x` ✗ → jail 里 `Permission denied` ✗（扩展目录是**只读挂载** ✓
+  进去也 chmod 不了 ✓）→ 现在 `ext reload` 会**提前 WARN** ✓（"在包里 chmod +x 它"✓）。
+
+## 0.31.1 / 0.31.2（broker 的两个实测修正）
+
+- **0.31.1**：`broker` 子命令的位置参数会互相抢占 ✗
+  （`broker resource add ssh/local …` 里 `ssh/local` 被当成子动作 ✗）→
+  改成**嵌套子命令** ✓；该子命令随后在 0.32.0 **迁出平台** ✓（见下）；
+
+- **0.31.2**：`DELETE /broker/v1/mounts/{id}` 传了空 capability ✗ → 命中"能力不足"分支 ✓
+  → 撤销返回 **403** ✗、于是撤销后还能继续执行 ✗（实测发现 ✓）；
+  现在空 capability 表示"只校验归属 ✓ 不校验能力" ✓ —— 撤销后立刻 404 ✓。
+
+## 0.31.0（服务 P 落地：dsh-mu-broker + catalog/mounts + ssh:exec）
+
+按 `docs/18` 的 P1 实现 ✓：
+
+- **新服务 `dsh-mu-broker`** ✓（`/usr/local/sbin/dsh-mu-broker`，Python 标准库 ✓，
+  只绑 `127.0.0.1:<broker_listen>`，默认 8790 ✓）；OpenRC 单元由 `dsh-muctl install`/`sync` 生成 ✓；
+- **认证两步** ✓：bootstrap 令牌（jail 启动前经 **FIFO** 交付 ✓，单次 ✓，5 分钟 ✓）
+  → `POST /broker/v1/session` 换会话令牌（12h ✓，只在内存/状态里存 hash ✓）；
+- **catalog + mounts** ✓：`broker resource add` 里存**地址/用户/私钥** ✓（宿主 ✓ 不进 jail ✓），
+  实例只拿到资源名与能力 ✓；`mount` 是**会话级** ✓（实例不对 ✓、过期/撤销即失效 ✓、上限 16 ✓）；
+- **`ssh:exec`** ✓：用宿主 `ssh`（`BatchMode`/`StrictHostKeyChecking=accept-new` ✓）执行一次命令 ✓，
+  返回 stdout/stderr/exit ✓；**不做流解析** ✗；
+- **审计** ✓：`/var/log/dsh-mu/broker-audit.jsonl` ✓（session/mount/resource/exit/耗时 ✓）；
+- **出网** ✓：启用 broker 时，实例的 loopback 放行端口里自动加入 8790 ✓（其余策略不变 ✓）；
+- **CLI** ✓：`broker status|enable|disable|resource {list,add,rm}|mount {list,revoke}|audit|token` ✓；
+- **doctor** ✓：`broker` 一项（禁用=PASS ✓、启用未监听=FAIL ✓、缺密钥=WARN ✓、正常=PASS 带资源/挂载数 ✓）；
+- 依赖新增 `openssh-client` ✓（宿主用 `ssh` 客户端执行命令，不需要 node ✓）。
+
+## 0.30.0（跨端插件规范 + SSH 插件需求）
+
+- 新增 **`docs/18-跨端插件与资源代理.md`** ✓：
+  - dsh-mu 侧改造清单 ✓（`dsh-mu-broker` 服务 ✓、一次性令牌交付（FIFO ✓）、
+    catalog/mounts 数据模型 ✓、egress 只放行 loopback 端口 ✓、P 自己的出网策略 ✓、
+    CLI/后台/doctor ✓）；
+  - **跨端插件规范** ✓：包结构 ✓、如何发现 P ✓、必须实现哪些工具与闸门写法 ✓、
+    会话语义（挂载/子会话继承/turn 租约 ✓）、API 与错误格式 ✓、面板 UX 约定 ✓、
+    测试与交付 ✓、"一页速查" ✓；
+- 工作区新建 **`dsh-mu-ssh-ext/REQUIREMENT.md`** ✓（原名 `dsh-mu-ssh-plugin` ✓，0.35.0 已改 ✓）：SSH 扩展需求书（面板样子 ✓、
+  工具表 ✓、验收标准 10 条 ✓、不做什么 ✓、依赖平台侧清单 ✓），首行指向规范文档 ✓；
+- README 文档索引补上 18 ✓。
+
+## 0.29.1（弹窗留白加大；圈选文字不再误关弹窗）
+
+- 边距 ✓：弹窗内容区左右 `16px → 24px` ✓、卡片 `760 → 820px` ✓、输入框内边距加大 ✓
+  —— 在输入框里圈选文字时不容易"贴边滑出去" ✓；
+- **真正的原因** ✗：遮罩的关闭逻辑是 `m.onclick = e => if (e.target === m) close()` ✓ ——
+  在输入框里按下鼠标、拖到遮罩上松开 ✓，浏览器会把 click 派发到遮罩 ✓ → 弹窗**直接关掉** ✗；
+- 现在要求**按下与松开都在遮罩上**才关闭 ✓（`mousedown` 记录起点 ✓）：
+  圈选文字、拖选、误拖都不会再关弹窗 ✓；点遮罩空白处关闭仍然可用 ✓。
+
+## 0.29.0（SOCKS5 下载：自动试 socks5h，镜像不通自动回退）
+
+- 现场：代理用 `socks5://…` 时 **github 能下** ✓、`@lemoncat7/dsh-ssh` 失败 ✗：
+  `curl exit=35 TLS connect error: unexpected eof while reading` ✗
+  —— 不是"不支持 SOCKS"✗，是这条出口上 **对端把 TLS 握手掐了** ✗；
+- 两处自动补救 ✓：
+  1. `socks5://` 失败后**自动换 `socks5h://`** ✓（远端解析 DNS ✓，很多 SOCKS 服务端
+     只有这种模式才不掐 ✓）；
+  2. npm 元数据/包体若在镜像上失败 ✓ → **自动回退到 `registry.npmjs.org`** ✓；
+- 报错改成把**每次尝试**都列出来 ✓（试过哪个 URL / 哪个代理 / curl 原文 ✓），
+  不再是单条笼统信息 ✓；
+- 后台弹窗的代理输入提示补一句：`socks5://` 不行会自动试 `socks5h://` ✓。
+
 ## 0.28.1（文档同步：插件改成"先下载再配策略"）
 
 - `docs/13-插件.md` **整篇重写** ✓：添加=下载+解析 ✓、三个开关的**生效时机**表 ✓、

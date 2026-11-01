@@ -34,7 +34,8 @@ sys.path.insert(0, "/usr/local/lib/dsh-mu/python")
 
 import dshmuctl as mu  # noqa: E402
 
-VERSION = "1.0.0"
+# The header shows this; hardcoding it made /admin/ claim v1.0.0 forever.
+VERSION = mu.VERSION
 STARTED = time.time()
 AUDIT_PATH = f"{mu.LOGS}/audit.log"
 WEB_DIR = f"{mu.LIB}/admin"
@@ -241,6 +242,8 @@ def instance_view(st: dict, name: str) -> dict:
         "port": port,
         "state": inst.get("state", "?"),
         "live": mu.port_in_use(port),
+        "activity": mu.instance_activity(name),
+        "activity_age": mu.human_age(mu.instance_activity(name)["age_s"]),
         "cookie": bool(inst.get("upstream", {}).get("cookie")),
         "uid": int(inst.get("uid", 0)),
         "limits": {k: inst.get(k) for k in ("cpu_max", "mem_max", "mem_high", "pids_max")},
@@ -298,6 +301,9 @@ def overview(st: dict, cfg: dict) -> dict:
                    "failing": [c["check"] for c in checks if c["status"] == mu.DOCTOR_FAIL],
                    "warning": [c["check"] for c in checks if c["status"] == mu.DOCTOR_WARN]},
         "instances": instances,
+        "activity": {i["name"]: mu.instance_activity(i["name"]) for i in instances},
+        "busy": sum(1 for i in instances
+                    if mu.instance_activity(i["name"])["state"] in ("active", "recent")),
     }
 
 
@@ -438,6 +444,10 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("GET", re.compile(r"^/api/instances/([\w-]+)$"), "instance"),
     ("GET", re.compile(r"^/api/doctor$"), "doctor"),
     ("GET", re.compile(r"^/api/config$"), "config_get"),
+    ("GET", re.compile(r"^/api/provider-catalog$"), "provider_catalog"),
+    ("POST", re.compile(r"^/api/provider-import$"), "provider_import"),
+    ("POST", re.compile(r"^/api/provider-import-all$"), "provider_import_all"),
+    ("POST", re.compile(r"^/api/packages/([\w.-]+)/toggle$"), "package_toggle"),
     ("GET", re.compile(r"^/api/providers$"), "providers"),
     ("POST", re.compile(r"^/api/providers$"), "provider_save"),
     ("POST", re.compile(r"^/api/provider-test$"), "provider_test"),
@@ -462,6 +472,8 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
      "plan_action"),
     ("GET", re.compile(r"^/api/egress$"), "egress_get"),
     ("POST", re.compile(r"^/api/egress$"), "egress_set"),
+    ("GET", re.compile(r"^/api/ext$"), "ext_get"),
+    ("POST", re.compile(r"^/api/ext$"), "ext_action"),
     ("GET", re.compile(r"^/api/plugin-policy$"), "plugin_policy_get"),
     ("POST", re.compile(r"^/api/plugin-policy$"), "plugin_policy_set"),
     ("GET", re.compile(r"^/api/default-chain$"), "default_chain_get"),
@@ -508,6 +520,8 @@ MUTATING = {"auth_verify", "instance_ensure", "provider_save", "provider_delete"
             "default_chain_get", "default_chain_set",
             "plan_key", "user_default_clear", "user_defaults_clear_all",
             "egress_get", "egress_set", "plugin_policy_get", "plugin_policy_set",
+            "provider_catalog", "provider_import", "provider_import_all", "package_toggle",
+            "ext_get", "ext_action",
             "me_plan_action", "me_restart",
             "me_password", "user_create", "user_password", "user_toggle", "user_delete",
             "instance_create", "instance_action", "instance_limits",
@@ -609,8 +623,58 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self._dispatch("DELETE")
 
+    def _ext_call(self, method: str) -> tuple[bool, dict]:
+        """Handle /ext-api/<name>/... -- an extension appliance asking the platform.
+
+        The caller proves itself with the per-extension token the platform handed it at
+        reload time (`X-DSH-MU-Ext-Token`, same value as /var/lib/ext/admin.token). The
+        platform admin token is never involved, so a compromised appliance cannot reach
+        the admin API through this door.
+        """
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        parts = path.split("/")
+        # ['', 'ext-api', '<name>', '<action>'] -- name may repeat path segments
+        if len(parts) < 4 or parts[1] != "ext-api":
+            self._send(404, {"error": "not found", "path": path})
+            return True, {}
+        name = parts[2]
+        action = "/".join(parts[3:])
+        presented = self.headers.get("X-DSH-MU-Ext-Token", "")
+        expected = (mu.ext_admin_token(name, {"name": name}) or "").strip() \
+            if name in mu.ext_registered() else ""
+        if not expected or presented != expected:
+            self._send(403, {"error": "wrong or missing X-DSH-MU-Ext-Token"})
+            return True, {}
+        manifest = mu.ext_registered().get(name) or {}
+        caps = [str(c) for c in (manifest.get("caps") or [])]
+        if not any(c == "market" or c.startswith("market:") for c in caps):
+            self._send(403, {"error": f"extension {name} does not declare the market capability"})
+            return True, {}
+        body = self._body() if method == "POST" else {}
+        try:
+            if action == "market/list":
+                self._send(200, mu.market_list(body.get("instance") or ""))
+                return True, {}
+            if action == "market/stage":
+                status, payload = mu.market_stage(str(body.get("instance") or ""),
+                                                  str(body.get("asset") or ""))
+                self._send(status, payload)
+                return True, {}
+            self._send(404, {"error": "unknown ext-api action", "action": action})
+            return True, {}
+        except mu.MarketError as exc:
+            self._send(exc.status, {"error": str(exc), "code": exc.code})
+            return True, {}
+        except Exception as exc:  # noqa: BLE001
+            self._send(500, {"error": "internal", "detail": str(exc)[:200]})
+            return True, {}
+
     def _dispatch(self, method: str):
         started = time.time()
+        if urlparse(self.path).path.startswith("/ext-api/"):
+            self._ext_call(method)
+            return
         ok, why = self._allowed()
         if not ok:
             return self._send(403, {"error": why})
@@ -672,6 +736,10 @@ class Handler(BaseHTTPRequestHandler):
             rows = []
             for pid, pkg in sorted(mu.list_provider_packages().items()):
                 rows.append({"id": pid, "label": pkg.get("label") or pid,
+                             "origin": pkg.get("origin") or "custom",
+                             "disabled": bool(pkg.get("disabled")),
+                             "needs_params": pkg.get("needs_params") or [],
+                             "params": pkg.get("params") or {},
                              "base_url": pkg.get("base_url"),
                              "models": len(pkg.get("models") or []),
                              "apis": sorted({m.get("api") for m in pkg.get("models") or []}),
@@ -696,6 +764,11 @@ class Handler(BaseHTTPRequestHandler):
             pkg, problems = mu.validate_provider_package(doc)
             if problems:
                 return 400, {"error": "the provider file has problems", "problems": problems}
+            for check in (mu.provider_id_problem(pkg["id"], pkg.get("origin") or "custom"),
+                          mu.provider_label_problem(pkg.get("label") or "", pkg["id"],
+                                                   pkg.get("origin") or "custom")):
+                if check:
+                    return 409, {"error": check, "problems": [check]}
             if body.get("dry_run"):
                 return 200, {"ok": True, "dry_run": True, "id": pkg["id"],
                              "models": len(pkg["models"]), "default_model": pkg["default_model"]}
@@ -748,11 +821,25 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"found": len(res["models"]), "added": len(merged) - len(known),
                          "detected": detected, "models": len(merged)}
         if name == "package_delete":
-            path = f"{mu.PROVIDERS_DIR}/{groups[0]}.json"
-            if not os.path.exists(path):
+            try:
+                mu.delete_provider_package(groups[0])
+            except mu.ProviderProtectedError as exc:
+                return 409, {"error": str(exc), "id": groups[0], "protected": True}
+            except FileNotFoundError:
                 return 404, {"error": "no such package", "id": groups[0]}
-            os.unlink(path)
             return 200, {"ok": True, "id": groups[0]}
+        if name == "package_toggle":
+            payload = body if isinstance(body, dict) else json.loads(body or "{}")
+            try:
+                pkg = mu.set_provider_disabled(groups[0], bool(payload.get("disabled")),
+                                               payload.get("params") or None)
+            except FileNotFoundError:
+                return 404, {"error": "no such package", "id": groups[0]}
+            except ValueError as exc:
+                return 400, {"error": str(exc), "id": groups[0]}
+            return 200, {"package": {"id": pkg["id"], "disabled": bool(pkg.get("disabled")),
+                                     "needs_params": pkg.get("needs_params") or [],
+                                     "base_url": pkg.get("base_url")}}
         if name == "me_restart":
             actor_user = str(actor or "").strip()
             if not actor_user:
@@ -806,16 +893,24 @@ class Handler(BaseHTTPRequestHandler):
                                  "default_model": plan.get("default_model") or ""})
                 providers = []
                 for pid, pkg in sorted(mu.list_provider_packages().items()):
+                    if pkg.get("disabled"):
+                        continue
                     pkg = mu.fill_from_preset(pkg)
                     providers.append({"id": pid, "label": pkg.get("label") or pid,
+                                      "origin": pkg.get("origin") or "custom",
                                       "models": [{"id": m["id"], "name": m.get("name") or "",
                                                   "reasoningEfforts": m.get("reasoningEfforts")}
                                                  for m in pkg.get("models") or []]})
+                # Providers that only work with an OAuth session: the user configures
+                # them through the harness itself, so they are not plans and the admin
+                # never sees them.
+                native_only = sorted(mu.PROVIDER_NEEDS_USER)
                 # Built-in presets are NOT offered here: an operator imports the
                 # packages they want, and the drawer only lists those (a preset the
                 # user never saw appear out of nowhere was confusing).
                 own_default = mu.user_default_override(st, actor_user)
                 return 200, {"plans": rows, "providers": providers,
+                             "native_only": native_only,
                              "default": own_default.get("plan") or default_id,
                              "my_default": own_default,
                              "team_plans_are_readonly": True}
@@ -832,6 +927,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not key:
                     return 400, {"error": "a credential is required"}
                 models = [str(m) for m in (body.get("models") or []) if str(m).strip()]
+                if not models:
+                    # A personal plan that names no models would reach the instance with an
+                    # empty catalog, and the composer would then say "no available model".
+                    # Default to everything the provider declares.
+                    models = [str(m["id"]) for m in (pkg.get("models") or []) if m.get("id")]
                 known = {m["id"] for m in pkg.get("models") or []}
                 bad = [m for m in models if m not in known]
                 if bad:
@@ -976,10 +1076,68 @@ class Handler(BaseHTTPRequestHandler):
                 return 500, {"error": "nft rejected the rules", "detail": res["error"][:400]}
             return 200, {"ok": True, "enforced": res.get("enforced"),
                          "loaded": res.get("loaded")}
+        if name == "provider_catalog":
+            return 200, {"providers": mu.dsh_provider_catalog()}
+        if name == "provider_import_all":
+            payload = body if isinstance(body, dict) else json.loads(body or "{}")
+            params = payload.get("params") if isinstance(payload.get("params"), dict) else None
+            catalog = mu.dsh_provider_catalog()
+            done, failed = [], []
+            for row in catalog:
+                pid = str(row.get("id") or "")
+                if not pid or pid in mu.PROVIDER_NEEDS_USER:
+                    continue
+                ok, res = mu.provider_import_from_catalog(pid, params)
+                (done if ok else failed).append(pid if ok else f"{pid}: {res}")
+            return 200, {"imported": done, "failed": failed}
+        if name == "provider_import":
+            payload = body if isinstance(body, dict) else json.loads(body or "{}")
+            ids = payload.get("ids") or ([payload["id"]] if payload.get("id") else [])
+            done, failed = [], []
+            params = payload.get("params") if isinstance(payload.get("params"), dict) else None
+            for pid in ids:
+                ok, res = mu.provider_import_from_catalog(str(pid), params)
+                (done if ok else failed).append(pid if ok else f"{pid}: {res}")
+            return 200, {"imported": done, "failed": failed}
+        if name in ("ext_get", "ext_action"):
+            if name == "ext_get":
+                registered = mu.ext_registered()
+                manifests = mu.ext_manifests()
+                rows = []
+                for ext_name in sorted(set(registered) | set(manifests)):
+                    manifest = registered.get(ext_name) or manifests.get(ext_name) or {}
+                    service = manifest.get("service") or {}
+                    rows.append({
+                        "name": ext_name,
+                        "version": manifest.get("version"),
+                        "summary": manifest.get("summary"),
+                        "port": service.get("port"),
+                        "admin_url": (manifest.get("admin") or {}).get("url"),
+                        "proxy_path": f"/ext/{ext_name}/",
+                        "egress": (manifest.get("net") or {}).get("egress") or [],
+                        "state": mu.ext_status(ext_name),
+                        "registered": ext_name in registered,
+                    })
+                return 200, {"extensions": rows}
+            action = str(body.get("action") or "").strip()
+            if action == "reload":
+                report = mu.ext_reload()
+                mu.sync_all(mu.load_state())
+                return 200, {"ok": True, **{k: report[k] for k in ("installed", "retired")},
+                             "skipped": report["skipped"]}
+            ext_name = str(body.get("name") or "").strip()
+            if action not in ("start", "stop", "restart") or not ext_name:
+                return 400, {"error": "action must be start|stop|restart|reload (with name)"}
+            if ext_name not in mu.ext_registered():
+                return 404, {"error": f"no such extension: {ext_name}"}
+            mu.run(["/sbin/rc-service", f"dsh-mu-ext-{ext_name}", action], check=False)
+            return 200, {"ok": True, "name": ext_name, "state": mu.ext_status(ext_name)}
         if name in ("plugin_policy_get", "plugin_policy_set"):
             st_p = mu.load_state()
             if name == "plugin_policy_get":
                 assets = mu.plugin_assets(st_p)
+                for _spec, _row in list(assets.items()):
+                    _row["managed_by"] = mu.asset_managed_by(st_p, str(_row.get("name") or ""))
                 rows_by_instance = {}
                 matrix = {}
                 for inst in sorted(st_p["instances"]):
@@ -1010,6 +1168,12 @@ class Handler(BaseHTTPRequestHandler):
                 name_p = str(body.get("name") or body.get("pkg") or "").strip()
                 if not name_p:
                     return 400, {"error": "name is required"}
+                managed = mu.asset_managed_by(st_p, name_p)
+                if managed:
+                    return 403, {"error": f"{name_p} 由扩展 {managed} 提供，不能在这里删除；"
+                                          f"请卸载该扩展包"}
+                if body.get("delete_asset") and mu.asset_managed_by(st_p, name_p):
+                    return 403, {"error": "extension-managed package" }
                 table = st_p.get(mu.PLUGIN_POLICY_KEY) or {}
                 row = table.get(name_p) or {}
                 spec = str(row.get("spec") or "")

@@ -14,7 +14,7 @@
 #
 # Maintainer: dsh-mu maintainers <maintainers@dsh-mu.invalid>
 pkgname=dsh-mu
-pkgver=0.28.1
+pkgver=0.77.0
 pkgrel=0
 pkgdesc="DeepSeek Harness multi-instance platform (gateway, jail runner, admin API)"
 url="https://github.com/deepseek-ai/dsh"
@@ -24,7 +24,8 @@ license="MIT"
 # itself needs no nginx/openresty.
 # nftables: the per-instance egress policy is on by default (INSTANCE_EGRESS=no-intranet),
 # so its enforcement tool has to come with the package instead of being a manual step.
-depends="python3 util-linux logrotate curl ca-certificates openssl nftables"
+# openssh-client: the broker runs `ssh` for ssh:exec (no node on the host)
+depends="python3 util-linux logrotate curl ca-certificates openssl nftables openssh-client"
 # Single line on purpose: a line continuation inside the quotes would become
 # part of the file names abuild looks for.
 install="$pkgname.pre-install $pkgname.post-install $pkgname.pre-upgrade $pkgname.post-upgrade $pkgname.pre-deinstall $pkgname.post-deinstall"
@@ -61,6 +62,16 @@ package() {
 		install -Dm644 "$f" "$d/usr/local/lib/dsh-mu/nginx/$(basename "$f")"
 	done
 	install -Dm644 "$s/admin/index.html" "$d/usr/local/lib/dsh-mu/admin/index.html"
+
+	# Bundled client plugins, preinstalled into every instance by `dsh-muctl sync`.
+	for plug in "$s"/plugins/*/; do
+		[ -d "$plug" ] || continue
+		name=$(basename "$plug")
+		find "$plug" -type f | while read -r f; do
+			rel=${f#"$plug"}
+			install -Dm644 "$f" "$d/usr/local/lib/dsh-mu/plugins/$name/$rel"
+		done
+	done
 
 	# in-page user panel assets (served by the gateway at /mu-static/)
 	for f in "$s"/gateway/static/*; do

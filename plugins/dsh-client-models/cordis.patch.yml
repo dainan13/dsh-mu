@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-mu-models
+      name: '@dsh-mu/dsh-client-models'

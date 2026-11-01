@@ -21,7 +21,12 @@ end
 
 local function wants_json()
 	local uri = ngx.var.uri or ""
-	return uri:sub(1, 10) == "/admin/api" or uri == "/admin/api"
+	if uri:sub(1, 10) == "/admin/api" or uri == "/admin/api" then
+		return true
+	end
+	-- Extension admin pages are proxied under /ext/<name>/; their API calls must get
+	-- JSON 401s, not the HTML login page (otherwise the page can only say "failed").
+	return uri:match("^/ext/[^/]+/admin/api") ~= nil
 end
 
 local function err_page(status, title, detail)

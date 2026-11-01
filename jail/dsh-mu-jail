@@ -318,4 +318,9 @@ export TERM="${TERM:-xterm}"
 export LANG="${LANG:-C.UTF-8}"
 
 log "starting mode=$MODE uid=$INST_UID port=$PORT rootfs=$ROOTFS cgroup=$CGROUP_PATH"
-exec unshare --mount --uts --propagation private --fork /bin/sh "$INNER"
+# No --fork: with it, `unshare` becomes a wrapper process, the service manager signals
+# only that wrapper, and the real workload (dsh / an appliance) survives `stop` -- it
+# keeps the port and the next start fails with "Address in use" (measured; --kill-child
+# did not help because the child was already re-parented). Exec'ing straight through
+# makes the workload *be* the supervised process, so SIGTERM reaches it directly.
+exec unshare --mount --uts --propagation private /bin/sh "$INNER"

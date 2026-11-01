@@ -25,6 +25,7 @@ import os
 import pwd
 import re
 import secrets
+import signal
 import shutil
 import socket
 import subprocess
@@ -107,6 +108,16 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
      "实例出网策略：open（不限制）/ no-intranet（禁内网，默认）/ allowlist（只允许白名单）"),
     ("INSTANCE_EGRESS_ALLOW", "instance_egress_allow", "str", "",
      "白名单/豁免：逗号分隔的 ip 或 cidr，可带 :端口（如 10.1.2.3:443,192.168.5.0/24:5432）"),
+    ("HIDE_BUILTIN_DEEPSEEK", "hide_builtin_deepseek", "bool", True,
+     "隐藏内置 DeepSeek 通道（它直连 api.deepseek.com，实例里只有占位 key，选中会 401）。"
+     "平台自己的 provider 不受影响"),
+    ("MODELS_NATIVE", "models_native", "bool", True,
+     "DSH 自带「设置 → 模型」页：用户在这里填自己的 key（平台托管的行没有编辑/删除按钮）。"
+     "按实例可关闭（instances[].models_native=false）"),
+    ("MODELS_LOCK", "models_lock", "bool", True,
+     "给平台托管的 provider 隐藏「编辑 / 删除」按钮（改写 DSH 客户端一处判断；补丁打不上自动跳过）"),
+    ("MARKET_ENABLED", "market_enabled", "bool", False,
+     "在每个实例的 DSH 里启用「插件市场」（Discover tab），列表来自平台的插件资产"),
     ("DOWNLOAD_PROXY", "download_proxy", "str", "",
      "插件下载/更新时用的代理（curl --proxy），例如 http://127.0.0.1:7890；"
      "留空则直连。添加插件时也可以临时指定"),
@@ -161,7 +172,7 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
      "新实例默认 provider preset（deepseek|opencode-go|opencode）"),
     ("DSH_EXTRA_ARGS", "dsh_extra_args", "str", "",
      "追加到 `dsh web` 的应用参数（原样拼接）"),
-    ("DSH_VERSION", "dsh_version", "str", "0.2.0-rc.2",
+    ("DSH_VERSION", "dsh_version", "str", "0.2.1-rc.5",
      "全局安装的 @deepseek-ai/dsh 版本（latest 表示跟随最新）"),
     ("ALPINE_MIRROR", "alpine_mirror", "str", "https://mirrors.tuna.tsinghua.edu.cn/alpine",
      "构建 jail 模板使用的 Alpine 镜像根地址"),
@@ -920,7 +931,7 @@ def render_instance_conf(st: dict, name: str):
         "DSH_LAUNCH_ARGS=\"--patch /home/dsh/.dsh-mu-provider.yml\"",
         f"KEEP_CAPS=\"{st['config'].get('instance_keep_caps') or ''}\"",
         f"DSH_PERMISSION_MODE=\"{st['config'].get('instance_permission_mode', 'danger-full-access')}\"",
-        f"EXTRA_MOUNTS=\"{inst.get('extra_mounts', '')}\"",
+        f"EXTRA_MOUNTS=\"{','.join(x for x in (str(inst.get('extra_mounts') or ''), ext_instance_mounts()) if x)}\"" ,
         # read-only, same-path binds for protected plugins (kernel-enforced EROFS)
         f"RO_PATHS=\"{','.join(protected_paths(name))}\"",
 
@@ -1428,18 +1439,41 @@ def _nft_chain(name: str) -> str:
     return "eg_" + re.sub(r"[^A-Za-z0-9_]", "_", name)
 
 
+def render_ext_egress(st: dict) -> list[str]:
+    """Chains for extension appliances: deny by default, allow only declared CIDRs."""
+    lines = []
+    for name, manifest in sorted(ext_registered().items()):
+        allow = [str(c).strip() for c in ((manifest.get("net") or {}).get("egress") or [])
+                 if str(c).strip()]
+        chain = f"ext_{name}"
+        lines.append(f"\tchain {chain} {{")
+        lines.append("\t\tct state established,related accept")
+        for cidr in allow:
+            proto = "ip6" if ":" in cidr else "ip"
+            lines.append(f"\t\t{proto} daddr {cidr} accept")
+        lines.append("\t\tmeta nfproto ipv4 reject with icmpx type admin-prohibited")
+        lines.append("\t\tmeta nfproto ipv6 reject with icmpx type admin-prohibited")
+        lines.append("\t}")
+    return lines
+
+
 def render_egress_rules(st: dict) -> str:
     """The whole nftables table, rendered from state (empty string = no table)."""
     relay_port = int(st["config"].get("relay_listen") or RELAY_PORT_FALLBACK)
     enforced = [(name, *instance_egress(st, name)) for name in sorted(st["instances"])]
     enforced = [row for row in enforced if row[1] != "open"]
-    if not enforced:
+    ext_chains = render_ext_egress(st)
+    if not enforced and not ext_chains:
         return ""
     lines = ["table inet dshmu {", "\tchain egress {",
              "\t\ttype filter hook output priority 0; policy accept;"]
+    for name, manifest in sorted(ext_registered().items()):
+        lines.append(f'\t\tsocket cgroupv2 level 2 "dsh-mu-ext/{name}" jump ext_{name}')
     for name, _policy, _allow in enforced:
         lines.append(f'\t\tsocket cgroupv2 level 2 "dsh-mu/{name}" jump {_nft_chain(name)}')
     lines += ["\t}", ""]
+    if ext_chains:
+        lines += ext_chains + [""]
     for name, policy, allow in enforced:
         inst = st["instances"].get(name) or {}
         port = int(inst.get("port") or 0)
@@ -1447,10 +1481,14 @@ def render_egress_rules(st: dict) -> str:
         lines.append(f"\tchain {_nft_chain(name)} {{")
         # replies must always pass: without this the instance itself becomes unreachable
         lines.append("\t\tct state established,related accept")
-        if port:
-            lines.append(f'\t\toifname "lo" tcp dport {{ {port}, {relay_port} }} accept')
+        # loopback ports the instance legitimately needs: its own port, the relay and
+        # every extension appliance's declared port.
+        loop_ports = sorted({p for p in (port, relay_port, *ext_ports()) if p})
+        if len(loop_ports) > 1:
+            lines.append('\t\toifname "lo" tcp dport { '
+                         + ", ".join(str(p) for p in loop_ports) + ' } accept')
         else:
-            lines.append(f'\t\toifname "lo" tcp dport {relay_port} accept')
+            lines.append(f'\t\toifname "lo" tcp dport {loop_ports[0]} accept')
         for addr in resolvers:
             lines.append(f"\t\tip daddr {addr} udp dport 53 accept")
             lines.append(f"\t\tip daddr {addr} tcp dport 53 accept")
@@ -1535,6 +1573,11 @@ def sync_all(st: dict):
             # `push` = apply to instances that already exist; `preinstall` is only used
             # when an instance is created.
             install_phase(st, name, {"push"})
+        # Bundled client plugins (the models page) ship with the apk; make sure this
+        # instance has them before its patch is rendered.
+        with contextlib.suppress(Exception):
+            for _c in ensure_bundled_plugins(st, name):
+                info(f"{name}: {_c}")
         with contextlib.suppress(Exception):
             for change in reconcile_protected_plugins(st, name):
                 info(f"{name}: {change}")
@@ -1543,6 +1586,26 @@ def sync_all(st: dict):
         # Model plans (provider + key per user) are rendered as launch patches.
         with contextlib.suppress(OSError):
             sync_instance_plans(st, name)
+    with contextlib.suppress(Exception):
+        for _msg in migrate_provider_ids(st):
+            info(_msg)
+    if models_lock_enabled():
+        with contextlib.suppress(Exception):
+            _lock = patch_models_client()
+            if _lock != "already patched":
+                info(f"models lock: {_lock}")
+    with contextlib.suppress(Exception):
+        report = render_market_feed(st)
+        if report.get("plugins"):
+            info(f"plugin market feed: {report['plugins']} package(s), "
+                 f"{report['files']} tarball(s)")
+    with contextlib.suppress(Exception):
+        names = [str(p.get("name")) for p in (json.loads(read_text(MARKET_ETC) or "{}")
+                                              .get("plugins") or [])]
+        if names:
+            market_cache_dependency_tree(names)
+    with contextlib.suppress(Exception):
+        ext_reload(quiet=True)
     with contextlib.suppress(Exception):
         restart_admin_if_stale()
     ensure_instance_autostart(st)
@@ -2072,13 +2135,223 @@ def _uid_exists(uid: int) -> bool:
         return False
 
 
+def stale_supervisors(unit: str) -> list[int]:
+    """`supervise-daemon` processes for `unit` that are not the one in the pidfile.
+
+    Repeated `apk add` / `rc-service restart` used to leave several supervisors behind
+    (each with its own jail and its own dsh): the second one loses the port to
+    EADDRINUSE and crash-loops while the first -- an *older* build -- keeps serving.
+    Symptom seen in the field: `POST /api/terminal/create` dies with "upstream
+    prematurely closed connection", because the surviving process is a stale one.
+    """
+    pidfile = f"/run/{unit}.pid"
+    current = 0
+    with contextlib.suppress(OSError, ValueError):
+        current = int((read_text(pidfile) or "0").strip() or 0)
+    out = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == current:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+        except OSError:
+            continue
+        text = b" ".join(argv).decode("utf-8", "replace")
+        if "supervise-daemon" in text and f" {unit} " in text:
+            out.append(pid)
+    return out
+
+
+def reap_stale_supervisors(unit: str) -> list[int]:
+    """Terminate stale supervisors (and their jailed children) before starting."""
+    stale = stale_supervisors(unit)
+    if not stale:
+        return []
+    for pid in stale:
+        for child in subprocess.run(["/bin/sh", "-c",
+                                     f"pgrep -P {pid} 2>/dev/null"],
+                                    capture_output=True, text=True).stdout.split():
+            with contextlib.suppress(ValueError, OSError):
+                os.kill(int(child), signal.SIGTERM)
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+    time.sleep(1.0)
+    for pid in stale:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    return stale
+
+
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def cgroup_members(path: str) -> list[int]:
+    try:
+        with open(os.path.join(path, "cgroup.procs"), encoding="utf-8") as fh:
+            return [int(x) for x in fh.read().split() if x.isdigit()]
+    except (OSError, ValueError):
+        return []
+
+
+def cgroup_kill(path: str, wait: float = 3.0) -> tuple[bool, list[int]]:
+    """Kill *everything* in a cgroup v2 subtree -- reliably, and without loop-guessing.
+
+    Two mechanism, in order of preference:
+      1. `cgroup.kill` (kernel >= 5.14): one write kills the whole subtree atomically.
+      2. freeze + `pids.max=1` + kill: the freeze stops forking, the pids cap makes any
+         respawn attempt fail with EAGAIN, then we kill what is left. This is what makes
+         a supervised service stay dead instead of respawning between our kills.
+    Returns (empty, remaining_pids).
+    """
+    if not os.path.isdir(path):
+        return True, []
+    killed = os.path.join(path, "cgroup.kill")
+    if os.path.exists(killed):
+        with contextlib.suppress(OSError):
+            with open(killed, "w", encoding="utf-8") as fh:
+                fh.write("1")
+    else:
+        with contextlib.suppress(OSError):
+            with open(os.path.join(path, "cgroup.freeze"), "w", encoding="utf-8") as fh:
+                fh.write("1")
+        with contextlib.suppress(OSError):
+            with open(os.path.join(path, "pids.max"), "w", encoding="utf-8") as fh:
+                fh.write("1")
+        for pid in cgroup_members(path):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if not cgroup_members(path):
+            break
+        time.sleep(0.1)
+    left = cgroup_members(path)
+    # leave the group usable for the next start
+    for name, value in (("pids.max", "max"), ("cgroup.freeze", "0")):
+        with contextlib.suppress(OSError):
+            with open(os.path.join(path, name), "w", encoding="utf-8") as fh:
+                fh.write(value)
+    return (not left), left
+
+
+def pids_on_port(port: int) -> list[int]:
+    """Every pid that owns a listening socket on 127.0.0.1:<port>."""
+    out: list[int] = []
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table, encoding="utf-8") as fh:
+                next(fh, "")
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) < 10 or parts[3] != "0A":  # 0A = LISTEN
+                        continue
+                    try:
+                        local_port = int(parts[1].rsplit(":", 1)[1], 16)
+                    except (IndexError, ValueError):
+                        continue
+                    if local_port != int(port):
+                        continue
+                    inode = parts[9]
+                    out.extend(_pids_for_inode(inode))
+        except OSError:
+            continue
+    return sorted(set(out))
+
+
+def _pids_for_inode(inode: str) -> list[int]:
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        fd_dir = f"/proc/{entry}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(f"{fd_dir}/{fd}")
+                except OSError:
+                    continue
+                if target == f"socket:[{inode}]":
+                    found.append(int(entry))
+                    break
+        except OSError:
+            continue
+    return found
+
+
+def free_instance_port(name: str) -> list[int]:
+    """Evict orphans holding the instance port before we start it.
+
+    A leftover dsh (from an earlier boot, or a supervisor we killed) keeps the port and
+    the *next* dsh fails with "listen EADDRINUSE". That process stays up with a half
+    initialised plugin graph, and features that need those services -- the terminal is
+    one -- answer 503 instead of working. Killing the squatter before start is the only
+    reliable cure; it also means a restart always yields a clean boot.
+    """
+    st = load_state()
+    inst = st["instances"].get(name) or {}
+    port = int(inst.get("port") or 0)
+    if not port:
+        return []
+    current = 0
+    with contextlib.suppress(OSError, ValueError):
+        current = int((read_text(f"/run/dsh-mu-{name}.pid") or "0").strip() or 0)
+    cg = f"{CGROUP_ROOT}/dsh-mu/{name}"
+    if os.path.isdir(cg) and cgroup_members(cg):
+        empty, left = cgroup_kill(cg)
+        if empty:
+            info(f"instance {name}: cgroup kill freed {port} (cgroup.dsh-mu/{name})")
+            return []
+        info(f"instance {name}: cgroup kill left {left} pid(s); falling back to port scan")
+    killers = []
+    for pid in pids_on_port(port):
+        if pid in (current, os.getpid()):
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "bin.js" not in argv and "node" not in argv:
+            continue
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+        killers.append(pid)
+    if killers:
+        time.sleep(1.0)
+        for pid in killers:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        info(f"instance {name}: evicted {len(killers)} orphan(s) holding port {port}")
+    return killers
+
+
 def service_action(name: str, action: str, check: bool = True):
     svc = f"dsh-mu-{name}"
     if not os.path.exists(f"/etc/init.d/{svc}"):
         if action in ("stop", "status"):
             return
         die(f"service {svc} not installed")
+    unit_name = svc[len("dsh-mu-"):]
+    is_instance = unit_name in load_state()["instances"]
+    if action in ("start", "restart"):
+        reaped = reap_stale_supervisors(svc)
+        if reaped:
+            info(f"{svc}: cleaned up {len(reaped)} stale supervisor(s) before {action}")
+        if is_instance:
+            with contextlib.suppress(Exception):
+                free_instance_port(unit_name)
     run(["/sbin/rc-service", svc, action], check=check)
+    if is_instance and action in ("stop", "restart"):
+        time.sleep(0.7)
+        with contextlib.suppress(Exception):
+            left = free_instance_port(unit_name)
+            if left:
+                info(f"{svc}: stopped, but {len(left)} process(es) still held port "
+                     f"{load_state()['instances'][unit_name].get('port')}; killed them")
 
 
 def mint_cookie(port: int, token: str, timeout: float = 30.0) -> str:
@@ -2599,7 +2872,7 @@ def sync_gateway_etc() -> str:
     paths = gateway_paths()
     etc = paths["etc"]
     os.makedirs(f"{etc}/gateway", exist_ok=True)
-    for name in ("users.json", "upstreams.json", "config.json", "relay.json"):
+    for name in ("users.json", "upstreams.json", "config.json", "relay.json", "market.json"):
         src = f"{GW_DIR}/{name}"
         if os.path.exists(src):
             shutil.copy2(src, f"{etc}/gateway/{name}")
@@ -2629,6 +2902,15 @@ def write_gateway_jail_conf(cfg: dict, port: int | None = None) -> str:
     ]
     ensure_tls_dir()
     mount_list.append(f"{TLS_DIR}:{GATEWAY_TLS_IN_JAIL}:ro")
+    # Extension admin sockets live on the host's /run, but the gateway has its own tmpfs
+    # /run -- so nginx could not even see the path ("connect() ... No such file or
+    # directory" -> 502 on /ext/<name>/). Bind the whole ext socket root in, same path.
+    if ext_registered():
+        os.makedirs("/run/dsh-mu/ext", exist_ok=True)
+        mount_list.append("/run/dsh-mu/ext:/run/dsh-mu/ext:rw")
+    if os.path.isdir(MARKET_DIR):
+        # tarballs for the local npm registry; read-only, gateway only
+        mount_list.append(f"{MARKET_DIR}:{MARKET_DIR}:ro")
     mounts = ",".join(mount_list)
     body = f"""# generated by dsh-muctl - platform (gateway) jail
 ROOTFS={paths['rootfs']}
@@ -2655,8 +2937,17 @@ def render_gateway_jail_conf_files(cfg: dict, port: int | None = None) -> dict:
                 "nginx_http_d_dir": f"{paths['conf']}/http.d"}
     # Our own main file owns the http{} block, so default_server is always free.
     rendered = render_gateway_fragments(jail_cfg, quiet=True)
+    changed = []
     for path, text in rendered.items():
+        if (read_text(path) or "") != text:
+            changed.append(os.path.basename(path))
         atomic_write(path, text, mode=0o644)
+    if changed and str(cfg.get("gateway_mode") or "jail") == "jail":
+        # nginx only picks up *new locations* on a reload/restart; lua-only edits ride
+        # the reload_if_stale path, but structural changes (e.g. the market proxy) need
+        # the workers to re-read the configuration.
+        info("gateway configuration changed (" + ", ".join(changed[:4]) + "); restarting it")
+        run(["/sbin/rc-service", "dsh-mu-gateway", "restart"], check=False)
     main = GATEWAY_NGINX_MAIN.replace("@CONF_DIR@", GATEWAY_CONF_IN_JAIL)
     atomic_write(f"{paths['conf']}/nginx.conf", main, mode=0o644)
 
@@ -2703,6 +2994,32 @@ server {{
         proxy_send_timeout 3600s;
         chunked_transfer_encoding on;
         gzip off;
+    }}
+
+    # Internal only: the market registry in relay.lua proxies packages we do not ship
+    # through here. The instance never reaches this location directly -- it asks for
+    # /__market/registry/<pkg>, and lua decides between the local tarball and npm.
+    location ^~ /__npm/ {{
+        internal;
+        proxy_pass https://registry.npmjs.org/;
+        proxy_http_version 1.1;
+        proxy_set_header Host registry.npmjs.org;
+        # pnpm sends Accept-Encoding: gzip; the subrequest would then carry gzip bytes
+        # that lua cannot decode (lua has no zlib here), and every packument broke with
+        # "non-JSON" -> 502. Ask upstream for identity encoding.
+        proxy_set_header Accept-Encoding "";
+        proxy_ssl_server_name on;
+        proxy_read_timeout 60s;
+    }}
+
+    location ^~ /__npmfile/ {{
+        internal;
+        proxy_pass https://registry.npmjs.org/;
+        proxy_http_version 1.1;
+        proxy_set_header Host registry.npmjs.org;
+        proxy_set_header Accept-Encoding "";
+        proxy_ssl_server_name on;
+        proxy_read_timeout 120s;
     }}
 }}
 """
@@ -2912,6 +3229,547 @@ def listen_directives(cfg: dict, port: int, listen_default: str) -> tuple[str, s
     return "".join(lines), redirect_server
 
 
+def ext_admin_port(manifest: dict) -> int:
+    """Port the gateway proxies for /ext/<name>/.
+
+    Preference: `admin.port` (a port that is *not* exposed to instances), then the
+    port inside `admin.url`, then `service.port`. Keeping the admin UI on its own
+    port is the only way an appliance can tell "the platform admin is asking" from
+    "an untrusted instance is poking the service port" -- instances may reach
+    `service.port` by design.
+    """
+    admin = manifest.get("admin") or {}
+    port = int(admin.get("port") or 0)
+    if port:
+        return port
+    m = re.search(r":(\d{2,5})(?:/|$)", str(admin.get("url") or ""))
+    if m:
+        return int(m.group(1))
+    return int(((manifest.get("service") or {}).get("port") or 0))
+
+
+def ext_admin_token(name: str, manifest: dict) -> str:
+    """Stable per-extension token the gateway presents as X-DSH-MU-Ext-Token."""
+    path = f"{EXT_DATA}/{name}/admin.token"
+    with contextlib.suppress(OSError):
+        token = (read_text(path) or "").strip()
+        if token:
+            return token
+    token = secrets.token_urlsafe(32)
+    with contextlib.suppress(OSError):
+        os.makedirs(f"{EXT_DATA}/{name}", exist_ok=True)
+        atomic_write(path, token + "\n", mode=0o600)
+    return token
+
+
+def ext_socket_root(name: str) -> str:
+    """Per-extension runtime dir on tmpfs (sockets only, never persisted)."""
+    return f"/run/dsh-mu/ext/{name}"
+
+
+def ext_api_socket_dir(name: str) -> str:
+    """Dir mounted into the instances' jails (read-only) -- the plugin API socket."""
+    return f"{ext_socket_root(name)}/api"
+
+
+def ext_admin_socket_dir(name: str) -> str:
+    """Dir the gateway proxies to. Never mounted into an instance: 0700 root only."""
+    return f"{ext_socket_root(name)}/admin"
+
+
+def ext_socket_path(name: str, kind: str) -> str:
+    """Host path of an extension socket ('' when it does not declare one)."""
+    manifest = ext_manifests().get(name) or ext_registered().get(name) or {}
+    section = manifest.get("admin") if kind == "admin" else manifest.get("service")
+    sock = str(((section or {}).get("socket") or "")).strip().lstrip("/")
+    if not sock:
+        return ""
+    base = ext_admin_socket_dir(name) if kind == "admin" else ext_api_socket_dir(name)
+    return f"{base}/{sock}"
+
+
+def ext_socket_paths(name: str) -> dict[str, str]:
+    return {"api": f"{ext_api_socket_dir(name)}/api.sock",
+            "admin": f"{ext_admin_socket_dir(name)}/admin.sock"}
+
+
+def ext_ensure_socket_dirs(name: str) -> None:
+    """Create the socket dirs before the jail starts; instances get only the api one."""
+    for path in (ext_api_socket_dir(name), ext_admin_socket_dir(name)):
+        os.makedirs(path, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o711 if path.endswith("/api") else 0o700)
+
+
+def ext_instance_mounts() -> str:
+    """Read-only binds that put each extension's API socket inside every instance.
+
+    Only the api dir is mounted -- the admin dir stays outside, which is why a config
+    API on admin.sock cannot be reached from an instance at all.
+    """
+    parts = []
+    for name, manifest in sorted(ext_registered().items()):
+        if not str(((manifest.get("service") or {}).get("socket") or "")).strip():
+            continue
+        ext_ensure_socket_dirs(name)
+        parts.append(f"{ext_api_socket_dir(name)}:/run/dsh-mu-ext/{name}:ro")
+    return ",".join(parts)
+
+
+class MarketError(Exception):
+    def __init__(self, status: int, code: str, message: str):
+        super().__init__(message)
+        self.status, self.code = status, code
+
+
+MARKET_STAGE_IN_JAIL = "/home/dsh/.cache/dsh-mu-market"
+
+
+MARKET_ETC = f"{GW_DIR}/market.json"
+MARKET_DIR = f"{VAR}/market"
+MARKET_ROUTE = "__market"
+MARKET_TITLE = {"en": "dsh-mu plugins", "zh": "dsh-mu 插件"}
+
+
+MARKET_CACHE = f"{MARKET_DIR}/cache"
+MARKET_CACHE_INDEX = f"{MARKET_DIR}/cache-index.json"
+
+
+def _semver_tuple(text: str) -> tuple:
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", str(text))
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (0, 0, 0)
+
+
+def semver_satisfies(version: str, rng: str) -> bool:
+    """Just enough semver: *, exact, ^, ~, >=, <= and hyphen-less ranges.
+
+    The point is a good hit rate for the local cache, not spec completeness -- whatever
+    this misses falls back to the proxy for a single request, which works fine.
+    """
+    rng = str(rng or "").strip()
+    if not rng or rng in ("*", "latest", "x"):
+        return True
+    ver = _semver_tuple(version)
+    for part in rng.split("||"):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith("^"):
+            base = _semver_tuple(part[1:])
+            if ver >= base and ver[0] == base[0]:
+                return True
+        elif part.startswith("~"):
+            base = _semver_tuple(part[1:])
+            if ver >= base and ver[:2] == base[:2]:
+                return True
+        elif part.startswith(">="):
+            if ver >= _semver_tuple(part[2:]):
+                return True
+        elif part.startswith("<="):
+            if ver <= _semver_tuple(part[2:]):
+                return True
+        elif part[0].isdigit() or part[0] == "v":
+            if ver == _semver_tuple(part):
+                return True
+    return False
+
+
+def _registry_packument(name: str, proxy: str | None) -> dict | None:
+    """Fetch one package's metadata from the npm registry (platform side; may proxy)."""
+    encoded = name.replace("/", "%2F")
+    configured = str(load_config().get("npm_registry") or "").rstrip("/")
+    urls = [f"{u}/{encoded}" for u in
+            [x for x in (configured, "https://registry.npmjs.org") if x]]
+    ok, body, _why = _curl_get(urls, proxy=proxy or "", max_time="45")
+    if not ok:
+        return None
+    try:
+        doc = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) and doc.get("versions") else None
+
+
+def _curl_get_binary(urls: list[str], proxy: str = "", max_time: str = "120") -> bytes:
+    """GET bytes (tarballs are gzip: decoding them as text raises)."""
+    for url in urls:
+        for attempt in (_proxy_variants(proxy) if proxy else [""]):
+            cmd = ["curl", "-fsSL", "--max-time", max_time]
+            if attempt:
+                cmd += ["--proxy", attempt]
+            res = subprocess.run(cmd + [url], capture_output=True)  # no text=True on purpose
+            if res.returncode == 0 and res.stdout:
+                return res.stdout
+    return b""
+
+
+def _registry_tarball_bytes(url: str, proxy: str | None) -> bytes:
+    return _curl_get_binary([url], proxy=proxy or "", max_time="120")
+
+
+def market_cache_dependency_tree(root_specs: list[str], proxy: str | None = None,
+                                 max_packages: int = 300) -> dict:
+    """Cache packuments and tarballs for a plugin's dependency tree.
+
+    DSH installs through pnpm, and pnpm resolves the whole tree before it writes
+    anything. With only the top-level tarballs on disk, every transitive name became a
+    proxied request at once -- and the gateway answered 502 under that burst (measured).
+    Caching metadata here makes the common install path local; anything unusual still
+    falls back to the proxy, one request at a time.
+    """
+    os.makedirs(MARKET_CACHE, exist_ok=True)
+    index = {}
+    with contextlib.suppress(ValueError):
+        index = json.loads(read_text(MARKET_CACHE_INDEX) or "{}")
+    seen: set[str] = set()
+    queue = [s for s in root_specs if s]
+    fetched = {"packuments": 0, "tarballs": 0}
+    while queue and len(seen) < max_packages:
+        name = queue.pop(0)
+        if name in seen or not name or "/" in name and not name.startswith("@"):
+            continue
+        if name.startswith("@") and name.count("/") != 1:
+            continue
+        seen.add(name)
+        doc = _registry_packument(name, proxy)
+        if not doc:
+            continue
+        cache_file = f"{MARKET_CACHE}/{name.replace('/', '__')}.json"
+        atomic_write(cache_file, json.dumps(doc) + "\n", mode=0o644)
+        fetched["packuments"] += 1
+        versions = doc.get("versions") or {}
+        names = sorted(versions, key=_semver_tuple)
+        rows = index.setdefault(name, {})
+        # cache the newest few versions' tarballs: pnpm picks per range, so a handful
+        # of candidates covers "^1.2", "~1.2.3" and exact pins at once
+        for version in names[-3:]:
+            vdoc = versions.get(version) or {}
+            dist = (vdoc.get("dist") or {})
+            tarball = str(dist.get("tarball") or "")
+            if not tarball:
+                continue
+            base = os.path.basename(tarball.split("?")[0])
+            if not base.endswith(".tgz"):
+                continue
+            dest = f"{MARKET_DIR}/{base}"
+            if not os.path.exists(dest):
+                body = _registry_tarball_bytes(tarball, proxy)
+                if not body:
+                    continue
+                with open(dest, "wb") as fh:
+                    fh.write(body)
+                os.chmod(dest, 0o644)
+                fetched["tarballs"] += 1
+            rows[version] = base
+        latest = str((doc.get("dist-tags") or {}).get("latest") or "")
+        vdoc = versions.get(latest) or (versions.get(names[-1]) if names else {})
+        if isinstance(vdoc, dict):
+            for dep in (vdoc.get("dependencies") or {}):
+                if dep not in seen:
+                    queue.append(str(dep))
+    atomic_write(MARKET_CACHE_INDEX, json.dumps(index, sort_keys=True) + "\n", mode=0o644)
+    return {"packages": len(seen), **fetched}
+
+
+def market_enabled() -> bool:
+    return bool(load_config().get("market_enabled"))
+
+
+def market_served_by(inst: dict) -> bool:
+    """Market UI is injected per instance; `market: false` opts that instance out."""
+    return market_enabled() and bool(inst.get("market", True))
+
+
+def market_base_url(name: str) -> str:
+    st = load_state()
+    token = ensure_relay_token(st, name)
+    save_state(st)
+    port = int(st["config"].get("relay_listen") or RELAY_PORT_FALLBACK)
+    return f"http://127.0.0.1:{port}/mu-llm/{token}/{MARKET_ROUTE}/index.json"
+
+
+def render_market_feed(st: dict) -> dict:
+    """Write the marketplace document plus the tarballs the registry serves.
+
+    The relay (lua) turns this into both the format-1 index and npm packuments; it
+    lives in the gateway etc dir, which is never mounted into an instance.
+    """
+    catalog = market_catalog()
+    counts, _owners = market_installed_counts()
+    files: dict[str, str] = {}
+    plugins = []
+    for name, row in sorted(catalog.items(), key=lambda kv: kv[0].lower()):
+        src = str(row.get("file") or "")
+        if not src or not os.path.exists(src):
+            continue
+        base = os.path.basename(src)
+        files[base] = src
+        policy_row = (plugin_policy(st) or {}).get(name) or {}
+        plugins.append({"name": name, "version": str(row.get("version") or ""),
+                        "file": base, "source": str(row.get("source") or "npm"),
+                        "description": str(row.get("note") or name),
+                        "installs": int(counts.get(name, 0)),
+                        "protected": bool(policy_row.get("protected")),
+                        "managed": bool(row.get("managed_by"))})
+    os.makedirs(MARKET_DIR, exist_ok=True)
+    for base, src in files.items():
+        dest = os.path.join(MARKET_DIR, base)
+        if not os.path.exists(dest) or os.path.getsize(dest) != os.path.getsize(src):
+            shutil.copyfile(src, dest)
+    doc = {"generated_at": int(time.time()), "plugins": plugins}
+    atomic_write(MARKET_ETC, json.dumps(doc, indent=1, sort_keys=True) + "\n", mode=0o640)
+    return {"plugins": len(plugins), "files": len(files)}
+
+
+def market_patch_yaml(st: dict, name: str) -> str:
+    """The patch rows that turn on DSH's Discover tab, pointed at our feed."""
+    inst = st["instances"].get(name) or {}
+    if not market_served_by(inst) or not relay_enabled(st["config"]):
+        return ""
+    index_url = market_base_url(name)
+    return f"""
+# generated by dsh-muctl - plugin market (Discover tab) fed by the platform
+- insert:
+    - id: plugin-market
+      name: '@deepseek-ai/dsh-plugin-market'
+      disabled: !!js "!ctx.get('profileContext')"
+      config:
+        indexes:
+          - "{index_url}"
+    - id: ui-plugin-market
+      name: '@deepseek-ai/dsh-client-ui-plugin-market'
+"""
+
+
+def market_catalog() -> dict:
+    """Assets the platform prepared, keyed by package name."""
+    st = load_state()
+    out = {}
+    for spec, row in (plugin_assets(st) or {}).items():
+        name = str(row.get("name") or "")
+        if not name:
+            continue
+        current = out.get(name)
+        if current and version_tuple(current.get("version")) >= version_tuple(row.get("version")):
+            continue
+        out[name] = {"name": name, "version": str(row.get("version") or ""),
+                     "source": str(row.get("source") or "npm"),
+                     "spec": spec, "file": str(row.get("file") or ""),
+                     "managed_by": str(row.get("managed_by") or "")}
+    return out
+
+
+def market_installed_counts() -> tuple[dict, dict]:
+    """package -> number of instances that have it, and package -> [instance...]."""
+    counts: dict[str, int] = {}
+    owners: dict[str, list[str]] = {}
+    st = load_state()
+    for inst in sorted(st["instances"]):
+        try:
+            rows = instance_plugins(inst)
+        except Exception:  # noqa: BLE001 - a broken profile must not break the market
+            continue
+        for row in rows:
+            pkg = str(row.get("pkg") or "")
+            if not pkg:
+                continue
+            counts[pkg] = counts.get(pkg, 0) + 1
+            owners.setdefault(pkg, []).append(inst)
+    return counts, owners
+
+
+def market_install_allowed(instance: str) -> bool:
+    """Per-instance switch for user self-service installs (default: allowed)."""
+    inst = load_state()["instances"].get(instance) or {}
+    return bool(inst.get("market", True))
+
+
+def market_list(instance: str = "") -> dict:
+    """The marketplace: prepared assets *union* what instances already run.
+
+    Counts are anonymous by construction: only numbers leave this function, never the
+    list of instances that installed something.
+    """
+    catalog = market_catalog()
+    counts, _owners = market_installed_counts()
+    here = set()
+    if instance:
+        if instance not in load_state()["instances"]:
+            raise MarketError(404, "no_such_instance", f"no such instance: {instance}")
+        here = {str(r.get("pkg")) for r in instance_plugins(instance)}
+    rows = []
+    for name in sorted(set(catalog) | set(counts)):
+        asset = catalog.get(name) or {}
+        rows.append({
+            "name": name,
+            "version": asset.get("version") or "",
+            "source": asset.get("source") or ("installed" if name in counts else "npm"),
+            "managed": bool(asset.get("managed_by")),
+            "managed_by": asset.get("managed_by") or "",
+            "installable": bool(asset.get("file")) and os.path.exists(str(asset.get("file")))
+                           and (not instance or market_install_allowed(instance)),
+            "installs": counts.get(name, 0),
+            "installed_here": name in here,
+        })
+    return {"plugins": rows, "total": len(rows),
+            "market_root": MARKET_STAGE_IN_JAIL}
+
+
+def market_stage(instance: str, asset: str) -> tuple[int, dict]:
+    """Copy an approved offline package into *that* instance's home.
+
+    The path is fixed (`<home>/.cache/dsh-mu-market/`); nothing in the request may
+    influence it -- no `..`, no absolute paths, no target argument at all. The instance
+    then runs `dsh plugin add file:<returned path>` itself, which is DSH's normal,
+    hot-loading install path (no restart).
+    """
+    if not instance:
+        raise MarketError(400, "missing_instance", "instance is required")
+    st = load_state()
+    if instance not in st["instances"]:
+        raise MarketError(404, "no_such_instance", f"no such instance: {instance}")
+    if not market_install_allowed(instance):
+        raise MarketError(403, "market_disabled",
+                          f"market installs are disabled for {instance} by the administrator")
+    catalog = market_catalog()
+    row = catalog.get(asset) or catalog.get(str(asset).split("@")[0])
+    if not row:
+        raise MarketError(404, "no_such_asset", f"no approved offline package for {asset}")
+    src = str(row.get("file") or "")
+    if not src or not os.path.exists(src):
+        raise MarketError(409, "asset_missing", f"offline package for {asset} is missing")
+    base = os.path.basename(src)
+    if not base.endswith(".tgz") or "/" in base or base.startswith("."):
+        raise MarketError(500, "bad_asset", "offline package has an unexpected file name")
+    dest_dir = f"{instance_home(instance)}/.cache/dsh-mu-market"
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, base)
+    if not os.path.exists(dest) or os.path.getsize(dest) != os.path.getsize(src):
+        shutil.copyfile(src, dest)
+    inst = st["instances"][instance]
+    with contextlib.suppress(OSError):
+        os.chown(dest, int(inst.get("uid", 0)), int(inst.get("gid", inst.get("uid", 0))))
+    return 200, {"ok": True, "asset": row["name"], "version": row["version"],
+                 "path": f"{MARKET_STAGE_IN_JAIL}/{base}",
+                 "install": f"dsh plugin add file:{MARKET_STAGE_IN_JAIL}/{base}"}
+
+
+def reserved_ports() -> dict[int, str]:
+    """Ports the platform itself owns; an extension must not squat on them."""
+    st = load_state()
+    cfg = st.get("config") or {}
+    out: dict[int, str] = {}
+    for value, who in ((cfg.get("relay_listen"), "relay"),
+                       (cfg.get("gateway_listen"), "gateway"),
+                       (cfg.get("tls_listen"), "gateway (tls)")):
+        with contextlib.suppress(TypeError, ValueError):
+            if value:
+                out[int(value)] = who
+    with contextlib.suppress(TypeError, ValueError):
+        admin_port = int(str(cfg.get("admin_listen") or "127.0.0.1:8787").rsplit(":", 1)[-1])
+        out[admin_port] = "admin backend"
+    for name, inst in (st.get("instances") or {}).items():
+        with contextlib.suppress(TypeError, ValueError):
+            if inst.get("port"):
+                out[int(inst["port"])] = f"instance {name}"
+    return out
+
+
+def ext_port_problems() -> list[str]:
+    """Duplicate / reserved ports across extensions.
+
+    Nothing allocates ports for extensions: each manifest picks its own. That is fine
+    until two of them pick the same one (the second one just logs EADDRINUSE and dies).
+    So at reload time we check for duplicates and clashes with platform ports.
+    """
+    problems: list[str] = []
+    reserved = reserved_ports()
+    seen: dict[int, list[str]] = {}
+    for name, manifest in ext_manifests().items():
+        ports = []
+        service = int(((manifest.get("service") or {}).get("port") or 0))
+        admin_p = int(((manifest.get("admin") or {}).get("port") or 0))
+        for label, port in (("service.port", service), ("admin.port", admin_p)):
+            if not port:
+                continue
+            ports.append(port)
+            seen.setdefault(port, []).append(f"{name}({label})")
+        for port in ports:
+            if port in reserved:
+                problems.append(f"{name}: port {port} is already used by the platform "
+                                f"({reserved[port]})")
+    for port, owners in sorted(seen.items()):
+        if len(owners) > 1:
+            problems.append(f"port {port} is claimed by {', '.join(owners)}")
+    return problems
+
+
+def render_ext_locations() -> str:
+    """Gateway blocks that expose each extension's admin page to the browser.
+
+    The extension listens on the *host's* loopback, so an iframe pointing at
+    `http://127.0.0.1:<port>/` resolves on the operator's laptop instead of the
+    server (that is the "Firefox cannot connect to 127.0.0.1:8791" report).
+    Everything is proxied under /ext/<name>/ behind the same admin session check.
+    The extension must serve its page with **relative** URLs.
+    """
+    blocks = []
+    for name, manifest in sorted(ext_registered().items()):
+        sock = ext_socket_path(name, "admin")
+        port = 0 if sock else ext_admin_port(manifest)
+        if not sock and not port:
+            continue
+        ext_token = ext_admin_token(name, manifest)
+        target = f"http://unix:{sock}:/" if sock else f"http://127.0.0.1:{port}/"
+        target_escaped = target.replace("'", "")
+        socket_dir = ext_admin_socket_dir(name) if sock else f"(TCP 127.0.0.1:{port})"
+        blocks.append(f"""    # ---------- extension '{name}': admin page proxied (loopback is host-only)
+    location = /ext/{name} {{
+        return 302 /ext/{name}/;
+    }}
+
+    location ^~ /ext/{name}/ {{
+        set                 $admin_token "";
+        set                 $admin_user "";
+        set                 $admin_must_change "";
+        access_by_lua_file  /usr/local/lib/dsh-mu/lua/admin.lua;
+        proxy_pass          {target};
+        proxy_http_version  1.1;
+        proxy_set_header    Host              $host;
+        proxy_set_header    X-Real-IP         $remote_addr;
+        proxy_set_header    X-Forwarded-For   $proxy_add_x_forwarded_for;
+        # Do NOT hand the platform admin token to an appliance: if it were ever
+        # compromised it could call the admin API on 127.0.0.1:8787. The extension gets
+        # its own token instead, which it can compare against admin.token.
+        proxy_set_header    X-DSH-MU-Ext-Token {ext_token};
+        proxy_set_header    Cookie            "";
+        proxy_set_header    Accept-Encoding   "";
+        proxy_read_timeout  300s;
+        proxy_connect_timeout 10s;
+        error_page 502 503 504 = @gw_ext_down_{name};
+    }}
+
+    location @gw_ext_down_{name} {{
+        default_type text/html;
+        return 200 '<!doctype html><meta charset="utf-8"><title>扩展不可用</title>
+<style>body{{font:14px/1.6 system-ui;margin:0;padding:24px;background:#0f1218;color:#e6e8eb}}
+code{{background:#1b212b;padding:1px 6px;border-radius:4px}}pre{{background:#1b212b;padding:12px;border-radius:8px}}
+.muted{{color:#8b949e;font-size:12px}}</style>
+<h3>扩展 {name} 的页面连不上</h3>
+<p class="muted">平台已把 <code>/ext/{name}/</code> 代理到该扩展的
+<code>{target_escaped}</code>；代理到上游失败（502）。</p>
+<p>在服务器上按顺序检查：</p>
+<pre>dsh-muctl ext status {name}      # 服务是否 running、socket/端口是否在
+dsh-muctl ext logs {name} -n 50  # 它自己为什么没起来
+ls -l {socket_dir}               # socket 是否出现（socket 模式）</pre>
+<p class="muted">如果 manifest 已改 socket 但扩展还在监听端口（或反过来），
+重启一次：<code>dsh-muctl ext restart {name}</code>；换过 manifest 后还要
+<code>dsh-muctl instance restart &lt;实例&gt;</code> 才能把新 socket 绑进实例。</p>';
+    }}
+""")
+    return "\n".join(blocks)
+
+
 def render_gateway_fragments(cfg: dict, quiet: bool = False) -> dict[str, str]:
     http_dir = cfg["nginx_conf_d_dir"]
     server_dir = cfg["nginx_http_d_dir"]
@@ -2938,6 +3796,7 @@ def render_gateway_fragments(cfg: dict, quiet: bool = False) -> dict[str, str]:
     rendered = (server_tpl
                 .replace("@LISTEN_DIRECTIVES@", listen_block)
                 .replace("@SERVER_NAMES@", " ".join(names))
+                .replace("@EXT_LOCATIONS@", render_ext_locations())
                 # Cache-buster for the panel UI: /mu-static has a 10 min cache, and
                 # a new release must not keep serving the old panel.js. Derive it
                 # from the files themselves so any edit changes the URL.
@@ -3276,6 +4135,8 @@ def cmd_install(args):
          "log rotation: logrotate not present; schedule `dsh-muctl logs rotate` yourself "
          "(apk add logrotate for the daily drop-in)")
     install_admin(st["config"])
+    with contextlib.suppress(Exception):
+        ext_reload(quiet=True)
     for entry in ensure_system_admins(load_state()):
         if entry.get("demoted"):
             info(f"note: {entry['user']} is no longer an administrator ({entry['detail']})")
@@ -3705,6 +4566,285 @@ def instance_plugins(name: str) -> list[dict]:
     return rows
 
 
+# ------------------------------------------------------------------ extensions
+# An extension is a *self-contained jailed appliance*: the apk ships a manifest, a
+# prebuilt rootfs and (optionally) plugin bundles. The platform only runs the jail and
+# wires ports/egress/admin/CLI -- no extension runtime lives on the host, so the same
+# package stays usable when dsh-mu runs on another OS later.
+EXT_SHARE = "/usr/share/dsh-mu/extensions"
+EXT_CONF = f"{ETC}/extensions"
+EXT_DATA = f"{VAR}/extensions"
+EXT_CGROUP_PARENT = "/sys/fs/cgroup/dsh-mu-ext"
+EXT_REQUIRED = ("name", "version")
+
+
+def ext_service(name: str) -> str:
+    return f"/etc/init.d/dsh-mu-ext-{name}"
+
+
+def ext_jail_conf(name: str) -> str:
+    return f"{EXT_CONF}/{name}.conf"
+
+
+def ext_manifests() -> dict:
+    """Manifests shipped by installed extension packages (read-only source of truth)."""
+    out = {}
+    for path in sorted(glob.glob(f"{EXT_SHARE}/*/manifest.json")):
+        try:
+            doc = json.loads(read_text(path) or "{}")
+        except ValueError:
+            info(f"WARNING: {path} is not valid JSON; skipped")
+            continue
+        name = str(doc.get("name") or os.path.basename(os.path.dirname(path)))
+        missing = [k for k in EXT_REQUIRED if not doc.get(k)]
+        if missing:
+            info(f"WARNING: {path} lacks {', '.join(missing)}; skipped")
+            continue
+        doc["name"] = name
+        doc["_dir"] = os.path.dirname(path)
+        out[name] = doc
+    return out
+
+
+def ext_registered() -> dict:
+    out = {}
+    for path in sorted(glob.glob(f"{EXT_CONF}/*.json")):
+        try:
+            doc = json.loads(read_text(path) or "{}")
+        except ValueError:
+            continue
+        if doc.get("name"):
+            out[str(doc["name"])] = doc
+    return out
+
+
+def version_tuple(text: str) -> tuple:
+    return tuple(int(p) for p in re.findall(r"\d+", str(text))[:3]) or (0,)
+
+
+def ext_requires_ok(manifest: dict) -> tuple[bool, str]:
+    want = str(((manifest.get("requires") or {}).get("dsh-mu") or "")).strip()
+    if not want:
+        return True, ""
+    m = re.match(r"^>=\s*([\w.-]+)$", want)
+    if not m:
+        return True, ""
+    if version_tuple(VERSION) < version_tuple(m.group(1)):
+        return False, f"needs dsh-mu >= {m.group(1)} (this is {VERSION})"
+    return True, ""
+
+
+def ext_ports() -> list[int]:
+    """Loopback ports declared by enabled extensions (instances may reach them)."""
+    ports = []
+    for manifest in ext_registered().values():
+        has_socket = bool(str(((manifest.get("service") or {}).get("socket") or "")).strip())
+        port = int(((manifest.get("service") or {}).get("port") or 0))
+        if port and not has_socket:
+            ports.append(port)
+    return sorted(set(ports))
+
+
+def render_ext_conf(manifest: dict) -> str:
+    name = manifest["name"]
+    port = int(((manifest.get("service") or {}).get("port") or 0))
+    rootfs = f"{EXT_DATA}/{name}/rootfs"
+    lines = [
+        "# generated by dsh-muctl - extension appliance (do not edit)",
+        f"NAME=ext-{name}",
+        f"ROOTFS={rootfs}",
+        f"INSTANCE_HOME={EXT_DATA}/{name}/home",
+        f"INSTANCE_WORK={EXT_DATA}/{name}/work",
+        f"PORT={port}",
+        "INST_UID=0",
+        "INST_GID=0",
+        f"CGROUP_PATH={EXT_CGROUP_PARENT}/{name}",
+        "DSH_HOST=127.0.0.1",
+        "DSH_HOME_IN_JAIL=/home/dsh/.dsh",
+        "DSH_WORK_IN_JAIL=/home/dsh/workspace",
+        "DSH_RUNTIME_DIR=",
+        'DSH_EXTRA_ARGS=""',
+        'DSH_LAUNCH_ARGS=""',
+        'KEEP_CAPS=""',
+        'DSH_PERMISSION_MODE="danger-full-access"',
+        f'EXTRA_MOUNTS="{manifest["_dir"]}:/opt/ext:ro,{EXT_DATA}/{name}:/var/lib/ext:rw,'
+        f'{ext_api_socket_dir(name)}:/run/dsh-mu-ext/api:rw,'
+        f'{ext_admin_socket_dir(name)}:/run/dsh-mu-ext/admin:rw"',
+        'RO_PATHS=""',
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def render_ext_service(manifest: dict) -> str:
+    name = manifest["name"]
+    entry = str(((manifest.get("service") or {}).get("entry") or "/opt/ext/dsh-mu-broker"))
+    return f"""#!/sbin/openrc-run
+# generated by dsh-muctl - extension appliance '{name}'
+name="dsh-mu extension {name}"
+description="{str(manifest.get('summary') or name)}"
+command="{JAIL}"
+command_args="--conf {ext_jail_conf(name)} ext-{name} -- {entry}"
+command_user="root:root"
+pidfile="/run/dsh-mu-ext-{name}.pid"
+output_log="/var/log/dsh-mu/ext-{name}.log"
+error_log="/var/log/dsh-mu/ext-{name}.err.log"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+respawn_period=120
+depend() {{
+	need dsh-mu-cgroup
+}}
+"""
+
+
+def _port_open(port: int) -> bool:
+    import socket
+    with socket.socket() as sock:
+        sock.settimeout(0.6)
+        return sock.connect_ex(("127.0.0.1", int(port))) == 0
+
+
+def socket_probe(path: str) -> str:
+    """connect() to a unix socket: ok / missing / eacces / refused."""
+    import socket as _socket
+    if not path:
+        return "n/a"
+    if not os.path.exists(path):
+        return "missing"
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.0)
+            sock.connect(path)
+        return "ok"
+    except PermissionError:
+        return "eacces"
+    except (ConnectionRefusedError, FileNotFoundError, OSError) as exc:
+        return "refused" if isinstance(exc, ConnectionRefusedError) else str(exc)[:40]
+
+
+def ext_status(name: str) -> str:
+    if not os.path.exists(ext_service(name)):
+        return "absent"
+    res = run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "status"], check=False, capture=True)
+    text = ((res.stdout or "") + (res.stderr or "")).lower()
+    return "running" if "started" in text or "running" in text else "stopped"
+
+
+def ext_import_bundles(manifest: dict) -> list[str]:
+    """Copy the extension's plugin tarballs in as *approved* assets (source=apk)."""
+    imported = []
+    for path in sorted(glob.glob(f"{manifest['_dir']}/bundles/*.tgz")):
+        try:
+            doc = package_from_tarball(path)
+        except (ValueError, OSError):
+            info(f"WARNING: {os.path.basename(path)} is not an npm tarball; skipped")
+            continue
+        name = str(doc.get("name") or "")
+        if not name:
+            continue
+        digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        target = f"{plugin_cache_dir()}/{name.replace('/', '-').replace('@', '')}-{doc.get('version')}.tgz"
+        os.makedirs(plugin_cache_dir(), exist_ok=True)
+        if not os.path.exists(target) or hashlib.sha256(open(target, "rb").read()).hexdigest() != digest:
+            shutil.copyfile(path, target)
+        st = load_state()
+        assets = st.setdefault(PLUGIN_ASSET_KEY, {})
+        spec = f"{name}@{doc.get('version')}"
+        # Drop any other row for the same package: the newest bundle replaces it, and the
+        # policy pointer must follow (otherwise instances keep the old spec forever).
+        for old_spec in [s for s, r in assets.items() if str(r.get("name")) == name and s != spec]:
+            assets.pop(old_spec, None)
+            info(f"extension {manifest['name']}: replaced bundle {old_spec} -> {spec}")
+        policy = st.setdefault(PLUGIN_POLICY_KEY, {})
+        if name in policy:
+            policy[name]["spec"] = spec
+        unchanged = (assets.get(spec) or {}).get("sha256") == digest
+        assets[spec] = {"name": name, "version": doc.get("version"), "file": target,
+                        "sha256": digest, "source": "apk",
+                        "managed_by": str(manifest["name"]),
+                        "fetched_at": int(time.time())}
+        if not unchanged:
+            save_state(st)
+            imported.append(f"{name} {doc.get('version')}")
+    return imported
+
+
+def ext_reload(quiet: bool = False) -> dict:
+    """Register/refresh every installed extension; retire the ones that vanished."""
+    os.makedirs(EXT_CONF, exist_ok=True)
+    os.makedirs(EXT_DATA, exist_ok=True)
+    os.makedirs(EXT_CGROUP_PARENT, exist_ok=True)
+    manifests = ext_manifests()
+    report = {"installed": [], "skipped": {}, "retired": [], "conflicts": []}
+    for problem in ext_port_problems():
+        report["conflicts"].append(problem)
+        info(f"WARNING: extension port conflict: {problem}")
+    for name, manifest in manifests.items():
+        ok, why = ext_requires_ok(manifest)
+        if not ok:
+            report["skipped"][name] = why
+            info(f"WARNING: extension {name} skipped: {why}")
+            continue
+        data = f"{EXT_DATA}/{name}"
+        ext_ensure_socket_dirs(name)
+        for sub in ("home", "work"):
+            os.makedirs(f"{data}/{sub}", exist_ok=True)
+        rootfs = f"{data}/rootfs"
+        if not os.path.isdir(rootfs):
+            report["skipped"][name] = "rootfs not built (see the extension's build script)"
+            info(f"WARNING: extension {name} has no rootfs yet: {rootfs}")
+            continue
+        # The appliance's entry point must be executable *in the package*: the extension
+        # directory is mounted read-only, so a chmod inside the jail is impossible.
+        entry = str(((manifest.get("service") or {}).get("entry") or "")).lstrip("/")
+        rel = entry[len("opt/ext/"):] if entry.startswith("opt/ext/") else entry
+        host_entry = os.path.join(manifest["_dir"], rel)
+        if entry and os.path.exists(host_entry) and not os.access(host_entry, os.X_OK):
+            info(f"WARNING: extension {name}: {rel} is not executable "
+                 f"(chmod +x it in the package; the jail mounts it read-only)")
+        # Every registered extension gets its token here: it is what proves "this call
+        # came from the appliance" to /ext-api, and an extension without an admin page
+        # would otherwise never have one minted.
+        ext_admin_token(name, manifest)
+        atomic_write(ext_jail_conf(name), render_ext_conf(manifest), mode=0o644)
+        atomic_write(f"{EXT_CONF}/{name}.json",
+                     json.dumps({k: v for k, v in manifest.items() if not k.startswith("_")},
+                                indent=2, sort_keys=True) + "\n", mode=0o644)
+        atomic_write(ext_service(name), render_ext_service(manifest), mode=0o755)
+        run(["/sbin/rc-update", "add", f"dsh-mu-ext-{name}", "default"], check=False)
+        run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "restart"], check=False)
+        imported = ext_import_bundles(manifest)
+        for line in imported:
+            info(f"extension {name}: imported plugin {line}")
+        if imported:
+            st_push = load_state()
+            for inst_name in sorted(st_push["instances"]):
+                with contextlib.suppress(Exception):
+                    install_phase(st_push, inst_name, {"push"})
+        report["installed"].append(name)
+    for name in sorted(set(ext_registered()) - set(manifests)):
+        run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "stop"], check=False)
+        run(["/sbin/rc-update", "del", f"dsh-mu-ext-{name}"], check=False)
+        for path in (ext_service(name), ext_jail_conf(name), f"{EXT_CONF}/{name}.json"):
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+        st = load_state()
+        assets = st.setdefault(PLUGIN_ASSET_KEY, {})
+        orphaned = 0
+        for row in assets.values():
+            if str(row.get("source")) == "apk":
+                row["orphaned"] = True
+                orphaned += 1
+        if orphaned:
+            save_state(st)
+        report["retired"].append(name)
+        info(f"extension {name} removed from disk; service stopped, its plugin bundles "
+             f"are now marked orphaned")
+    return report
+
+
 PLUGIN_POLICY_KEY = "plugin_policy"
 PLUGIN_ASSET_KEY = "plugin_assets"
 
@@ -3818,6 +4958,19 @@ def package_from_tarball(path: str) -> dict:
     raise ValueError(f"{path} does not look like an npm package tarball")
 
 
+def asset_managed_by(st: dict, name: str) -> str:
+    """Extension that ships this plugin package ('' when it is admin-managed).
+
+    Packages delivered by an extension apk are *managed*: /admin may pin them for
+    instances (受保护/预装/推送) but must not delete or replace them -- the apk owns
+    their lifecycle, and `apk del` is the only way to remove them.
+    """
+    for row in plugin_assets(st).values():
+        if str(row.get("name")) == str(name) and row.get("managed_by"):
+            return str(row["managed_by"])
+    return ""
+
+
 def add_plugin_asset(st: dict, spec: str, proxy: str | None = None) -> dict:
     """Download `spec` once, remember it, and return {spec, name, version, file}."""
     meta = fetch_plugin_to_cache(spec, proxy=proxy)
@@ -3828,6 +4981,15 @@ def add_plugin_asset(st: dict, spec: str, proxy: str | None = None) -> dict:
            "file": meta["file"], "sha256": meta.get("sha256"),
            "source": spec.split(":")[0] if ":" in spec else "npm",
            "fetched_at": meta.get("fetched_at")}
+    with contextlib.suppress(Exception):
+        report = market_cache_dependency_tree([row["name"]], proxy=proxy)
+        if report.get("packuments"):
+            info(f"market cache: {row['name']} -> {report['packuments']} packument(s), "
+                 f"{report['tarballs']} tarball(s)")
+    managed = asset_managed_by(st, row["name"])
+    if managed:
+        raise ValueError(f"{row['name']} is shipped by the extension '{managed}' and is "
+                         f"managed there; upgrade the extension package instead")
     assets = st.setdefault(PLUGIN_ASSET_KEY, {})
     # One row per PACKAGE: `@scope/x` and `@scope/x@1.2.0` must not coexist (the policy
     # is keyed by package name, so two assets would fight over the same row).
@@ -3849,28 +5011,118 @@ def add_plugin_asset(st: dict, spec: str, proxy: str | None = None) -> dict:
     return out
 
 
+def installed_package_version(name: str, pkg: str) -> str:
+    """Version physically present in the profile's node_modules ('' when absent)."""
+    base = f"{instance_home(name)}/.dsh/profiles/{instance_profile(name)}/node_modules"
+    path = f"{base}/{pkg}/package.json"
+    try:
+        return str(json.loads(read_text(path) or "{}").get("version") or "")
+    except (OSError, ValueError):
+        return ""
+
+
+def install_package_direct(name: str, pkg: str, asset: dict) -> tuple[bool, str]:
+    """Unpack a plugin tarball straight into the profile -- no pnpm, no network.
+
+    `pnpm add file:...` can block for minutes on a profile whose earlier install linked a
+    different store (pnpm re-resolves the whole tree). For an *upgrade* we only need the
+    new files in place, so we extract the tarball ourselves and point package.json at the
+    same `file:` spec pnpm would have written.
+    """
+    import tarfile
+    file_path = str(asset.get("file") or "")
+    version = str(asset.get("version") or "")
+    if not file_path or not os.path.exists(file_path):
+        return False, "offline package missing"
+    profile_dir = f"{instance_home(name)}/.dsh/profiles/{instance_profile(name)}"
+    target = os.path.join(profile_dir, "node_modules", *pkg.split("/"))
+    stage = f"{instance_home(name)}/.cache/dsh-mu-plugins"
+    os.makedirs(stage, exist_ok=True)
+    dest = f"{stage}/{os.path.basename(file_path)}"
+    shutil.copyfile(file_path, dest)
+    tmp = f"{stage}/.unpack-{os.getpid()}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    try:
+        with tarfile.open(file_path, "r:gz") as tf:
+            tf.extractall(tmp)  # noqa: S202 - our own cache, root-only
+        entries = [e for e in os.listdir(tmp) if e != "package.json" or True]
+        root = os.path.join(tmp, "package") if os.path.isdir(os.path.join(tmp, "package")) else tmp
+        if not os.path.isdir(root):
+            return False, "tarball layout unexpected"
+        uid, gid = int(load_state()["instances"][name].get("uid", 0)), \
+                   int(load_state()["instances"][name].get("gid", 0))
+        old = f"{target}.old-{os.getpid()}"
+        if os.path.exists(target):
+            os.rename(target, old)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copytree(root, target, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("node_modules"))
+        shutil.rmtree(old, ignore_errors=True)
+        for base_dir, _dirs, files in os.walk(target):
+            with contextlib.suppress(OSError):
+                os.chown(base_dir, uid, gid)
+            for fname in files:
+                with contextlib.suppress(OSError):
+                    os.chown(os.path.join(base_dir, fname), uid, gid)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    # record the dependency exactly like `pnpm add file:` would
+    pkg_json = os.path.join(profile_dir, "package.json")
+    try:
+        doc = json.loads(read_text(pkg_json) or "{}")
+    except ValueError:
+        doc = {}
+    deps = doc.setdefault("dependencies", {})
+    deps[pkg] = f"file:{dest}"
+    if not doc.get("name"):
+        doc["name"] = f"dsh-profile-{instance_profile(name)}"
+    atomic_write(pkg_json, json.dumps(doc, indent=2, sort_keys=True) + "\n", mode=0o644)
+    with contextlib.suppress(OSError):
+        os.chown(pkg_json, uid, gid)
+    return True, f"direct-unpack {version} -> {target}"
+
+
 def install_phase(st: dict, name: str, phases: set[str]) -> list[str]:
     """Install policy plugins into one instance for the given phases.
 
     phases: {"create"} for a new instance, {"push"} when pushing to existing ones.
     """
     done = []
-    have = installed_package_dirs(name) | {r["pkg"] for r in instance_plugins(name)}
+    have = installed_package_dirs(name)
     for pkg, row in sorted(plugin_policy(st).items()):
         wanted = ("create" in phases and row.get("preinstall")) or \
                  ("push" in phases and row.get("push"))
-        if not wanted or pkg in have:
+        if not wanted:
             continue
         spec, asset = asset_by_name(st, pkg)
-        info(f"{name}: installing {pkg} ({'from ' + str(spec) if spec else 'network'})")
+        want_version = str((asset or {}).get("version") or "")
+        # Version, not just the package name: an extension can ship a newer bundle while
+        # the profile still holds the old copy (that used to be silently skipped).
+        have_version = installed_package_version(name, pkg) if pkg in have else ""
+        if pkg in have and (not want_version or have_version == want_version):
+            continue
+        if pkg in have:
+            info(f"{name}: upgrading {pkg} {have_version or '?'} -> {want_version}")
+        else:
+            info(f"{name}: installing {pkg} ({'from ' + str(spec) if spec else 'network'})")
+        ok, out = False, "no offline package"
         try:
             if asset and asset.get("file") and os.path.exists(str(asset["file"])):
-                stage = f"{instance_home(name)}/.cache/dsh-mu-plugins"
-                os.makedirs(stage, exist_ok=True)
-                dest = f"{stage}/{os.path.basename(str(asset['file']))}"
-                shutil.copyfile(str(asset["file"]), dest)
-                ok, out = plugin_exec(name, "add", f"file:/home/dsh/.cache/dsh-mu-plugins/"
-                                                   f"{os.path.basename(str(asset['file']))}")
+                if pkg in have:
+                    # An upgrade: pnpm may re-resolve the whole tree (minutes, and on a
+                    # mismatched store it can hang), so unpack the tarball directly.
+                    ok, out = install_package_direct(name, pkg, asset)
+                else:
+                    stage = f"{instance_home(name)}/.cache/dsh-mu-plugins"
+                    os.makedirs(stage, exist_ok=True)
+                    dest = f"{stage}/{os.path.basename(str(asset['file']))}"
+                    shutil.copyfile(str(asset["file"]), dest)
+                    ok, out = plugin_exec(name, "add", "file:/home/dsh/.cache/dsh-mu-plugins/"
+                                                       f"{os.path.basename(str(asset['file']))}")
+                    if not ok and "ERR_PNPM" in str(out):
+                        info(f"{name}: pnpm could not add {pkg}; unpacking directly")
+                        ok, out = install_package_direct(name, pkg, asset)
             else:
                 info(f"WARNING: {name}: {pkg} has no offline package; "
                      f"add it again from the admin page")
@@ -3879,10 +5131,11 @@ def install_phase(st: dict, name: str, phases: set[str]) -> list[str]:
             ok, out = False, str(exc)
         if ok:
             done.append(pkg)
-            record_plugin(load_state(), name, pkg,
-                          str((asset or {}).get("version") or "*"), "policy", "platform")
+            st_now = load_state()
+            record_plugin(st_now, name, pkg, want_version or "*", "policy", "platform")
+            save_state(st_now)
         else:
-            info(f"WARNING: {name}: {pkg} could not be installed: {out[-160:]}")
+            info(f"WARNING: {name}: {pkg} could not be installed: {str(out)[-160:]}")
     return done
 
 
@@ -3909,6 +5162,94 @@ def protected_paths(name: str) -> list[str]:
 
 def plugin_manifest_path(name: str) -> str:
     return f"{instance_home(name)}/.dsh/profiles/{instance_profile(name)}/package.json"
+
+
+def _locked_inodes() -> set[str]:
+    """Inodes with an active advisory lock, from /proc/locks (no subprocess)."""
+    out: set[str] = set()
+    try:
+        with open("/proc/locks", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 6:
+                    continue
+                # "... 00:2b:1234567 0 EOF" -- the last field holds dev:inode
+                for token in parts[4:6]:
+                    if ":" in token:
+                        out.add(token.rsplit(":", 1)[-1])
+                        break
+    except OSError:
+        pass
+    return out
+
+
+def instance_activity(name: str) -> dict:
+    """Is anybody using this instance right now, and when was it last used?
+
+    Two signals, both inside the instance home (no DSH change needed):
+      * `sessions/<ws>/<sid>/session.lock` held by the running dsh  -> that conversation
+        is open right now (the UI writes the lock while a session is attached);
+      * the newest `session.v4.jsonl.zstd` mtime -> when the last message was written.
+
+    Deliberately NOT counted: established TCP connections to the instance port. nginx
+    keeps idle upstream connections around, so the count is non-zero even when nobody is
+    there (measured: 1 connection, no user).
+    """
+    base = f"{instance_home(name)}/.dsh/sessions"
+    newest = 0.0
+    locks: list[str] = []
+    try:
+        for workspace in os.listdir(base):
+            ws_dir = os.path.join(base, workspace)
+            if not os.path.isdir(ws_dir):
+                continue
+            for session in os.listdir(ws_dir):
+                sess_dir = os.path.join(ws_dir, session)
+                if not os.path.isdir(sess_dir):
+                    continue
+                for fname in os.listdir(sess_dir):
+                    path = os.path.join(sess_dir, fname)
+                    try:
+                        mtime = os.path.getmtime(path)
+                    except OSError:
+                        continue
+                    if mtime > newest and fname.startswith("session.v4."):
+                        newest = mtime
+                lock = os.path.join(sess_dir, "session.lock")
+                if os.path.exists(lock):
+                    locks.append(lock)
+    except OSError:
+        pass
+    held = False
+    if locks:
+        locked = _locked_inodes()
+        for lock in locks:
+            with contextlib.suppress(OSError):
+                if str(os.stat(lock).st_ino) in locked:
+                    held = True
+                    break
+    now = time.time()
+    age = int(now - newest) if newest else None
+    if held:
+        state = "active"
+    elif age is not None and age <= 120:
+        state = "recent"
+    else:
+        state = "idle"
+    return {"state": state, "age_s": age, "last": int(newest) if newest else None,
+            "session_open": held}
+
+
+def human_age(seconds: int | None) -> str:
+    if seconds is None:
+        return "从未"
+    if seconds < 90:
+        return f"{max(seconds, 0)} 秒前"
+    if seconds < 5400:
+        return f"{seconds // 60} 分钟前"
+    if seconds < 172800:
+        return f"{seconds // 3600} 小时前"
+    return f"{seconds // 86400} 天前"
 
 
 def installed_package_dirs(name: str) -> set[str]:
@@ -4117,6 +5458,34 @@ def download_proxy(explicit: str | None = None) -> str:
     return str(load_config().get("download_proxy") or "").strip()
 
 
+def _proxy_variants(proxy: str) -> list[str]:
+    """Try the proxy as given, then `socks5h://` (remote DNS) when it was `socks5://`.
+
+    `socks5://` makes curl resolve the name locally and hand over an IP; some SOCKS
+    servers then reset the TLS handshake (`curl: (35) ... unexpected eof`), while the
+    same proxy works with `socks5h://`. Cheap to retry, so we always do.
+    """
+    out = [proxy]
+    if proxy.startswith("socks5://"):
+        out.append("socks5h://" + proxy[len("socks5://"):])
+    return [p for p in out if p]
+
+
+def _curl_get(urls: list[str], proxy: str = "", max_time: str = "60") -> tuple[bool, bytes, str]:
+    """GET the first URL that answers; returns (ok, body, reason)."""
+    last = ""
+    for url in urls:
+        for attempt in (_proxy_variants(proxy) if proxy else [""]):
+            cmd = ["curl", "-fsSL", "--max-time", max_time]
+            if attempt:
+                cmd += ["--proxy", attempt]
+            res = run(cmd + [url], check=False, capture=True)
+            if res.returncode == 0:
+                return True, (res.stdout or "").encode("utf-8", "replace"), ""
+            last = f"{url}{_curl_reason(res, attempt)}"
+    return False, b"", last
+
+
 def fetch_plugin_to_cache(spec: str, proxy: str | None = None) -> dict:
     """Download `spec` once on the host: `github:` via codeload, npm via the mirror.
 
@@ -4125,9 +5494,6 @@ def fetch_plugin_to_cache(spec: str, proxy: str | None = None) -> dict:
     """
     spec = str(spec).strip()
     use_proxy = download_proxy(proxy)
-    curl = ["curl", "-fsSL"]
-    if use_proxy:
-        curl += ["--proxy", use_proxy, "--max-time", "300"]
     if not plugin_spec_ok(spec) or spec.startswith("file:"):
         raise ValueError(f"cannot download {spec!r} "
                          f"(use an npm name or github:owner/repo[#ref])")
@@ -4152,23 +5518,41 @@ def fetch_plugin_to_cache(spec: str, proxy: str | None = None) -> dict:
         # 404 (it treats the extra path segment as something else). pnpm encodes this
         # itself, which is why a user install worked while our download did not.
         encoded = name.replace("/", "%2F") if name.startswith("@") else name
-        res = run(curl + ["--max-time", "60", f"{registry}/{encoded}/{want or 'latest'}"],
-                  check=False, capture=True)
-        if res.returncode != 0:
-            raise ValueError(f"cannot reach {registry}{_curl_reason(res, use_proxy)}")
-        meta = json.loads(res.stdout or "{}")
+        # Try the configured mirror first, then the upstream registry: behind a proxy a
+        # single CDN can reset the TLS handshake while the other answers fine.
+        urls = [f"{registry}/{encoded}/{want or 'latest'}"]
+        if "registry.npmjs.org" not in registry:
+            urls.append(f"https://registry.npmjs.org/{encoded}/{want or 'latest'}")
+        ok, body, reason = _curl_get(urls, proxy=use_proxy, max_time="60")
+        if not ok:
+            raise ValueError(f"cannot reach the npm registry ({reason})")
+        meta = json.loads(body.decode("utf-8", "replace") or "{}")
         tarball = str((meta.get("dist") or {}).get("tarball") or "")
         if not tarball:
             raise ValueError(f"{spec}: the registry returned no tarball")
         url = re.sub(r"^https?://[^/]+", registry, tarball)
         kind, version = "npm", str(meta.get("version") or want or "latest")
     target = base + ".tgz"
-    res = run(curl + ["--max-time", "300", "-o", target, url],
-              check=False, capture=True)
-    if res.returncode != 0 or not os.path.exists(target) or os.path.getsize(target) == 0:
+    ok = False
+    reason = ""
+    for candidate in dict.fromkeys([url, url.replace(registry, "https://registry.npmjs.org")
+                                    if kind == "npm" and "registry.npmjs.org" not in registry
+                                    else url]):
+        for attempt in (_proxy_variants(use_proxy) if use_proxy else [""]):
+            cmd = ["curl", "-fsSL", "--max-time", "300"]
+            if attempt:
+                cmd += ["--proxy", attempt]
+            res = run(cmd + ["-o", target, candidate], check=False, capture=True)
+            if res.returncode == 0 and os.path.exists(target) and os.path.getsize(target) > 0:
+                ok, url = True, candidate
+                break
+            reason = f"{candidate}{_curl_reason(res, attempt)}"
+        if ok:
+            break
+    if not ok:
         with contextlib.suppress(OSError):
             os.unlink(target)
-        raise ValueError(f"download failed: {url}{_curl_reason(res, use_proxy)}")
+        raise ValueError(f"download failed ({reason})")
     doc = {"spec": spec, "kind": kind, "version": version, "url": url, "file": target,
            "bytes": os.path.getsize(target),
            "sha256": hashlib.sha256(open(target, "rb").read()).hexdigest(),
@@ -4325,6 +5709,10 @@ def cmd_plugin_policy(st: dict, args) -> int:
         name = str(getattr(args, "pkg", "") or "").strip()
         if not name:
             die("usage: dsh-muctl plugin remove <package-name> [--delete-asset]")
+        managed = asset_managed_by(st, name)
+        if managed:
+            die(f"{name} is shipped by the extension '{managed}'; it cannot be removed here "
+                f"(the extension apk owns it -- remove that package instead)")
         table = st.get(PLUGIN_POLICY_KEY) or {}
         row = table.get(name) or {}
         spec = str(row.get("spec") or "")
@@ -4368,6 +5756,633 @@ def cmd_plugin_policy(st: dict, args) -> int:
         return 0
 
     die(f"unknown plugin action: {action}")
+
+
+PROVIDERS_CACHE = f"{VAR}/providers.json"
+# Providers whose auth is a single API key: the platform can hold the key and inject it
+# through the relay. Everything else (SigV4, OAuth, GCP service accounts, Azure resource
+# names) has to be configured by the user inside the instance.
+# Providers whose auth is one API key: the platform can hold the key and inject it via
+# the relay. The rest need SigV4 / OAuth / GCP / Azure-specific fields and must be
+# configured by the user inside the instance.
+# Providers whose endpoint carries an account/project/region segment. We keep a template
+# and let the administrator fill the parameters; the import lands disabled until they do,
+# so a half-filled provider can never be selected by a plan.
+PROVIDER_URL_TEMPLATES = {
+    "amazon-bedrock": ("https://bedrock-runtime.{region}.amazonaws.com", ["region"]),
+    "azure": ("https://{resource}.openai.azure.com/openai/v1", ["resource"]),
+    "cloudflare-ai-gateway": ("https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}",
+                              ["account_id", "gateway_id"]),
+    "cloudflare-workers-ai":
+        ("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1", ["account_id"]),
+    "google-vertex": ("https://{location}-aiplatform.googleapis.com", ["location"]),
+}
+
+# Providers the harness directory lists without a default endpoint (they expect the
+# operator to know the URL). These are the ones we already ship in our own presets.
+PROVIDER_KNOWN_ENDPOINTS = {
+    "opencode-go": "https://opencode.ai/inference/go/openai/v1",
+    "opencode": "https://opencode.ai/inference/anthropic",
+}
+
+# Vendors that serve different wire protocols on *different* paths. The harness catalog
+# carries one base for the whole provider, so without this map the anthropic models would
+# be sent to the openai path (404 with an empty body).
+PROVIDER_PROTOCOL_BASES = {
+    "opencode-go": {"anthropic-messages": "https://opencode.ai/inference/go/anthropic"},
+    "opencode": {"openai-completions": "https://opencode.ai/inference/v1",
+                 "openai-responses": "https://opencode.ai/inference/v1"},
+}
+
+# Only these truly cannot be proxied: their credential is an OAuth session, not a key.
+PROVIDER_NEEDS_USER = {"github-copilot", "openai-codex"}
+
+PROVIDERS_DUMP_SCRIPT = """\
+const mod = await import('@earendil-works/pi-ai/providers/all');
+const list = typeof mod.getBuiltinProviders === 'function' ? mod.getBuiltinProviders() : [];
+console.log(JSON.stringify(Array.isArray(list) ? list : Object.values(list || {})));
+"""
+
+
+def _runtime_provider_ids() -> list[str]:
+    """Ask the installed harness for its provider list (single source of truth)."""
+    rootfs = runtime_rootfs()
+    if not rootfs:
+        return []
+    dsh_dir = f"{rootfs}/usr/local/lib/node_modules/@deepseek-ai/dsh"
+    script = f"{dsh_dir}/dump-providers.mjs"
+    with contextlib.suppress(OSError):
+        atomic_write(script, PROVIDERS_DUMP_SCRIPT, mode=0o644)
+    res = run(["chroot", rootfs, "/bin/sh", "-c",
+               f"cd /usr/local/lib/node_modules/@deepseek-ai/dsh && "
+               f"/usr/bin/node dump-providers.mjs"], check=False, capture=True)
+    with contextlib.suppress(OSError):
+        os.unlink(script)
+    text = (res.stdout or "").strip().splitlines()
+    if not text:
+        return []
+    try:
+        ids = json.loads(text[-1])
+    except ValueError:
+        return []
+    return [str(i) for i in ids if isinstance(i, str) and i]
+
+
+def dsh_provider_catalog(force: bool = False) -> list[dict]:
+    """The provider directory the harness ships, plus our managed/user split.
+
+    Read from the installed runtime so the admin list cannot drift from DSH; the small
+    cache keeps the page fast and survives a runtime that cannot be queried right now.
+    """
+    cached = None
+    if not force:
+        with contextlib.suppress(ValueError):
+            cached = json.loads(read_text(PROVIDERS_CACHE) or "null")
+    if isinstance(cached, list) and cached:
+        return cached
+    ids = _runtime_provider_ids()
+    if not ids:
+        # Last resort: keep whatever we cached before, else an empty list.
+        return cached if isinstance(cached, list) else []
+    catalog = [{"id": pid,
+                "label": pid,
+                "managed": pid not in PROVIDER_NEEDS_USER,
+                "needsUserConfig": pid in PROVIDER_NEEDS_USER} for pid in sorted(ids)]
+    with contextlib.suppress(OSError):
+        os.makedirs(VAR, exist_ok=True)
+        atomic_write(PROVIDERS_CACHE, json.dumps(catalog, indent=1) + "\n", mode=0o644)
+    return catalog
+
+
+MODELS_LOCK_PREFIX = "平台托管 · "
+MODELS_CLIENT_REL = ("/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/"
+                     "@deepseek-ai/dsh-client-ui-settings-models/lib/client.js")
+# (label, stock text, patched text) - applied one by one, each guarded by its own marker
+# so a partially-matching bundle still gets whatever we can hide.
+MODELS_ROW_COND = 'String(row.entry.displayName ?? "").startsWith("平台托管")'
+MODELS_PATCHES = (
+    ("edit",
+     'row.entry.provider === "deepseek-account" ? null',
+     '(row.entry.provider === "deepseek-account" || '
+     + MODELS_ROW_COND + ') ? null'),
+    ("delete",
+     "row.removable ? (0, react_jsx_runtime.jsx)(\"button\"",
+     "(row.removable && !" + MODELS_ROW_COND + ') ? (0, react_jsx_runtime.jsx)("button"'),
+)
+
+
+DSH_CATALOG_CACHE = f"{VAR}/dsh-catalog.json"
+DSH_CATALOG_SCRIPT = """\
+const mod = await import('@earendil-works/pi-ai/providers/all');
+const models = typeof mod.builtinModels === 'function' ? mod.builtinModels() : null;
+const metas = typeof mod.builtinProviders === 'function' ? mod.builtinProviders() : [];
+const meta = {};
+for (const p of (Array.isArray(metas) ? metas : Object.values(metas || {}))) {
+  if (p && p.id) meta[p.id] = { baseURL: p.baseURL ?? null, name: p.name ?? null };
+}
+const out = {};
+const ids = typeof mod.getBuiltinProviders === 'function' ? mod.getBuiltinProviders() : [];
+for (const pid of ids) {
+  let rows = [];
+  try {
+    const list = models && typeof models.getModels === 'function' ? models.getModels(pid) : [];
+    rows = (list || []).map(m => ({ id: m.id ?? null, name: m.name ?? null, api: m.api ?? null,
+      contextWindow: m.contextWindow ?? null, maxTokens: m.maxTokens ?? null }));
+  } catch (e) { /* no catalog for this provider */ }
+  out[pid] = { baseURL: (meta[pid] || {}).baseURL ?? null, models: rows.filter(m => m.id) };
+}
+console.log(JSON.stringify(out));
+"""
+
+
+def dsh_provider_base_urls() -> dict[str, str]:
+    """Map provider id -> defaultBaseURL, parsed from `dsh-llm-pi-ai`'s PROVIDER_DATA.
+
+    The harness keeps those endpoints in a generated object literal inside its bundle
+    (double-quoted keys, unlike the TypeScript source), and does not expose them through
+    any public API, so parsing the literal is the only way to inherit them.
+    """
+    rootfs = runtime_rootfs()
+    if not rootfs:
+        return {}
+    bundle = read_text(f"{rootfs}/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/"
+                       f"@deepseek-ai/dsh-llm-pi-ai/lib/index.js") or ""
+    out: dict[str, str] = {}
+    pattern = re.compile(
+        r'["\']([a-z0-9][a-z0-9-]{1,40})["\']\s*:\s*\{([^{}]*?)\}', re.S)
+    for match in pattern.finditer(bundle):
+        pid, body = match.group(1), match.group(2)
+        # the bundle's literals are unquoted on the left (`env: [...]`)
+        if not re.search(r"\benv\s*:", body):
+            continue
+        url = re.search(r'defaultBaseURL\s*:\s*["\']([^"\']+)["\']', body)
+        if url:
+            out[pid] = url.group(1)
+    return out
+
+
+def resolve_base_url(template: str, params: dict | None) -> str:
+    """Substitute `{region}` / `{account_id}` style slots from a provider's params."""
+    text = str(template or "")
+    for name, value in (params or {}).items():
+        text = text.replace("{" + str(name) + "}", str(value))
+    return text
+
+
+def unresolved_slots(template: str) -> list[str]:
+    return sorted(set(re.findall(r"\{([a-z_]+)\}", str(template or ""))))
+
+
+def dsh_catalog(force: bool = False) -> dict:
+    """Provider metadata + model catalog of the installed harness (cached)."""
+    if not force:
+        with contextlib.suppress(ValueError):
+            cached = json.loads(read_text(DSH_CATALOG_CACHE) or "null")
+            # Guard the shape: an older cache (provider -> bare model list) must not be
+            # mistaken for the current one (provider -> {baseURL, models}).
+            if (isinstance(cached, dict) and cached
+                    and all(isinstance(v, dict) and "models" in v for v in cached.values())):
+                return cached
+    rootfs = runtime_rootfs()
+    if not rootfs:
+        return {}
+    dsh_dir = f"{rootfs}/usr/local/lib/node_modules/@deepseek-ai/dsh"
+    script = f"{dsh_dir}/dump-catalog.mjs"
+    with contextlib.suppress(OSError):
+        atomic_write(script, DSH_CATALOG_SCRIPT, mode=0o644)
+    res = run(["chroot", rootfs, "/bin/sh", "-c",
+               "cd /usr/local/lib/node_modules/@deepseek-ai/dsh && "
+               "/usr/bin/node dump-catalog.mjs"], check=False, capture=True)
+    with contextlib.suppress(OSError):
+        os.unlink(script)
+    text = (res.stdout or "").strip()
+    with contextlib.suppress(ValueError):
+        doc = json.loads(text.splitlines()[-1] if text else "{}")
+        if isinstance(doc, dict) and doc:
+            with contextlib.suppress(OSError):
+                os.makedirs(VAR, exist_ok=True)
+                atomic_write(DSH_CATALOG_CACHE, json.dumps(doc) + "\n", mode=0o644)
+            return doc
+    return {}
+
+
+def provider_dir() -> str:
+    return f"{VAR}/providers"
+
+
+def provider_import_from_catalog(pid: str, params: dict | None = None) -> tuple[bool, dict | str]:
+    """Materialise one harness provider into a dsh-mu provider package.
+
+    Imported rows are platform-owned (`origin: "dsh"`): the admin can disable them but
+    never delete them. Providers whose endpoint needs an account/region segment keep a
+    `{slot}` template and land disabled until the parameters are filled in.
+    """
+    pid = str(pid or "").strip()
+    if not pid:
+        return False, "empty provider id"
+    if pid in PROVIDER_NEEDS_USER:
+        return False, (f"{pid} authenticates with an OAuth session (no API key); "
+                       "it can only be configured inside the instance")
+    catalog = dsh_catalog()
+    row = catalog.get(pid)
+    if not row:
+        return False, f"{pid} is not in the harness provider directory"
+    models = row.get("models") or []
+    if not models:
+        return False, f"{pid} has no model catalog"
+    params = {str(k): str(v) for k, v in (params or {}).items() if str(v).strip()}
+    template, needs = PROVIDER_URL_TEMPLATES.get(pid, ("", []))
+    base_url = (dsh_provider_base_urls().get(pid) or template
+                or PROVIDER_KNOWN_ENDPOINTS.get(pid, ""))
+    if not base_url:
+        return False, (f"{pid} has no known endpoint (the harness ships none and we have "
+                       f"no preset); import it as JSON with an explicit base_url")
+    api = next((m.get("api") for m in models if m.get("api")), "openai-completions")
+    pkg = {
+        "schema": "dsh-mu.provider/v1",
+        "id": pid,
+        "label": pid,
+        "base_url": base_url,
+        "auth": {"type": "bearer"},
+        "api": api,
+        "origin": "dsh",
+        "disabled": True if (needs or unresolved_slots(base_url)) else False,
+        "models": [{"id": m["id"], "name": m.get("name") or m["id"], "api": m.get("api") or api,
+                    "contextWindow": m.get("contextWindow"), "maxTokens": m.get("maxTokens")}
+                   for m in models if m.get("id")],
+    }
+    # anthropic-messages adapters append `/v1/messages` themselves; a harness catalog
+    # that already ends its base with `/v1` would then double the segment (404 with an
+    # empty body). Strip it for those models only -- openai-* protocols need the `/v1`.
+    _proto_bases = PROVIDER_PROTOCOL_BASES.get(pid, {})
+    for _m in pkg["models"]:
+        _api = str(_m.get("api") or "")
+        if _api in _proto_bases:
+            _m["base_url"] = _proto_bases[_api]
+            continue
+        _base = str(_m.get("base_url") or pkg.get("base_url") or "").rstrip("/")
+        if _api == "anthropic-messages" and _base.endswith("/v1"):
+            _m["base_url"] = _base[:-3]
+    # Harness catalogs sometimes carry the full endpoint per model. Our schema wants
+    # only the prefix (the adapter appends the protocol path), so strip a known suffix
+    # rather than rejecting the whole provider.
+    _suffixes = ("/v1/messages", "/chat/completions", "/responses", "/v1")
+    for _m in pkg["models"]:
+        _b = str(_m.get("base_url") or "")
+        for _s in _suffixes:
+            if _b.rstrip("/").endswith(_s):
+                _m["base_url"] = _b.rstrip("/")[: -len(_s)]
+                break
+    pkg["models"] = [{k: v for k, v in m.items() if v is not None} for m in pkg["models"]]
+    missing = [slot for slot in (needs or unresolved_slots(base_url)) if slot not in params]
+    if params:
+        pkg["params"] = params
+        pkg["base_url"] = resolve_base_url(base_url, params)
+        if not unresolved_slots(pkg["base_url"]):
+            pkg["disabled"] = False
+    if missing:
+        pkg["needs_params"] = missing
+    pkg["default_model"] = str(pkg["models"][0]["id"])
+    path = f"{PROVIDERS_DIR}/{pid}.json"
+    os.makedirs(PROVIDERS_DIR, exist_ok=True)
+    atomic_write(path, json.dumps(pkg, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+                 mode=0o600)
+    return True, pkg
+
+def models_lock_enabled() -> bool:
+    return bool(load_config().get("models_lock", True))
+
+
+def patch_models_client() -> str:
+    """Hide edit/delete on platform-managed provider rows (guarded text patches).
+
+    DSH draws edit for every row except the hardcoded `deepseek-account` one, and draws
+    delete whenever the row is removable. There is no read-only flag, so we rewrite those
+    two conditions to also skip rows whose displayName carries our prefix. Best effort:
+    each patch is applied only when its exact stock text appears once; anything else is
+    skipped and the stock UI stays (an extra button that only affects the user's own
+    instance, which is harmless).
+    """
+    rootfs = runtime_rootfs()
+    path = f"{rootfs}{MODELS_CLIENT_REL}"
+    if not os.path.exists(path):
+        return "client package missing"
+    try:
+        text = read_text(path) or ""
+    except OSError:
+        return "unreadable"
+    applied, skipped = [], []
+    if not os.path.exists(path + ".dshmu-orig"):
+        with contextlib.suppress(OSError):
+            shutil.copyfile(path, path + ".dshmu-orig")
+    for label, stock, patched in MODELS_PATCHES:
+        if patched in text:
+            continue
+        count = text.count(stock)
+        if count != 1:
+            skipped.append(f"{label}: {count} matches")
+            continue
+        text = text.replace(stock, patched, 1)
+        applied.append(label)
+    if applied:
+        atomic_write(path, text, mode=0o644)
+    if applied:
+        return "applied " + ", ".join(applied)
+    if skipped:
+        return "skipped (" + "; ".join(skipped) + ")"
+    return "already patched"
+
+
+def runtime_rootfs() -> str:
+    """The rootfs that holds the DSH runtime (shared by instances and the gateway)."""
+    st = load_state()
+    rt = dsh_runtime_dir(st["config"])
+    # dsh_runtime_dir points at <rootfs>/usr/local/lib/node_modules/@deepseek-ai/dsh
+    marker = "/usr/local/lib/node_modules/@deepseek-ai/dsh"
+    if marker in rt:
+        return rt.split(marker)[0]
+    gw = gateway_paths()
+    return gw.get("rootfs", "")
+
+
+def node_pty_dir(rootfs: str) -> str:
+    return (f"{rootfs}/usr/local/lib/node_modules/@deepseek-ai/dsh/"
+            f"node_modules/node-pty")
+
+
+def node_pty_is_glibc(rootfs: str) -> bool:
+    """node-pty ships glibc prebuilds; on musl they load and then segfault on spawn.
+
+    That is exactly the "terminal/create → HTTP 503" symptom: DSH spawns, the module
+    crashes the call, and the request fails. A musl build has no GLIBC_* symbols.
+    """
+    import subprocess as _sp
+    pre = f"{node_pty_dir(rootfs)}/prebuilds/linux-x64/pty.node"
+    built = f"{node_pty_dir(rootfs)}/build/Release/pty.node"
+    target = built if os.path.exists(built) else pre
+    if not os.path.exists(target):
+        return False
+    try:
+        out = _sp.run(["/usr/bin/strings", target], capture_output=True, text=True).stdout
+    except OSError:
+        return False
+    return "GLIBC_2" in out
+
+
+def find_latest_apk() -> str:
+    """Newest dsh-mu apk in the usual places (so the command needs no argument)."""
+    import glob as _glob
+    candidates = []
+    for pattern in ("/root/dsh-mu-*.apk", "/tmp/dsh-mu-*.apk", "dsh-mu-*.apk",
+                    "/mnt/ssd4t/workroot/dsh_install/dsh-mu/dist/dsh-mu-*.apk"):
+        candidates.extend(_glob.glob(pattern))
+    candidates = [c for c in candidates if os.path.isfile(c)]
+    return max(candidates, key=os.path.getmtime) if candidates else ""
+
+
+def cmd_upgrade(args):
+    """Install an apk and bring the whole platform in line -- one command.
+
+    The steps used to live in a wiki page (apk add --allow-untrusted --force-overwrite,
+    then sync, then check doctor, then maybe fix node-pty, then maybe restart instances).
+    Doing it by hand is where the "which commands do I run after an upgrade?" pain came
+    from, so this wraps them in the order that matters and prints what is left over.
+    """
+    ensure_root()
+    apk_path = str(getattr(args, "apk", "") or "").strip()
+    if not apk_path or apk_path == "--latest":
+        apk_path = find_latest_apk()
+        if not apk_path:
+            die("no dsh-mu-*.apk found; pass the file: dsh-muctl upgrade /root/dsh-mu-x.apk")
+        info(f"using the newest apk: {apk_path}")
+
+    # optional safety check (opt-in; the default is "just do it")
+    if getattr(args, "safe", False):
+        st = load_state()
+        busy = []
+        for name in sorted(st["instances"]):
+            act = instance_activity(name)
+            if act["state"] in ("active", "recent"):
+                busy.append(f"{name}（{human_age(act['age_s'])}"
+                            f"{'，会话开着' if act['session_open'] else ''}）")
+        if busy:
+            die("这些实例正在使用：" + "、".join(busy) + "\n"
+                "确认要中断就先停用它们，或用 --safe 之外的方式（默认不检查）")
+
+    def on_disk_version() -> str:
+        # the running process still holds the pre-upgrade constant, so read the file
+        here = os.path.dirname(os.path.abspath(__file__))
+        return (read_text(os.path.join(here, "VERSION")) or VERSION).strip()
+
+    before = on_disk_version()
+    info(f"1/4 installing {os.path.basename(apk_path)}")
+    res = run(["/sbin/apk", "add", "--allow-untrusted", "--force-overwrite", apk_path],
+              check=False, capture=True)
+    tail = ((res.stdout or "") + (res.stderr or "")).strip().splitlines()[-3:]
+    for line in tail:
+        print(f"    {line}")
+    if res.returncode != 0:
+        die("apk add failed; nothing else was changed")
+
+    info("2/4 syncing (gateway Lua, admin backend, egress, instance configs)")
+    sync_all(load_state())
+
+    after = on_disk_version()
+    with contextlib.suppress(Exception):
+        reload_gateway_if_stale(quiet=True)
+    info("3/4 checking")
+    warnings = []
+    checks = doctor_checks(load_state())
+    for check in checks:
+        if check["status"] == DOCTOR_WARN:
+            warnings.append(f"{check['check']}: {check['detail']}")
+        if check["status"] == DOCTOR_FAIL:
+            warnings.append(f"FAIL {check['check']}: {check['detail']}")
+
+    info(f"4/4 done: {before} -> {after}")
+    if warnings:
+        info("still needs attention:")
+        for line in warnings[:6]:
+            info(f"  - {line}")
+    else:
+        info("no warnings")
+
+    # instances keep running the old code until restarted; ask only when it matters
+    st = load_state()
+    running = [n for n, i in st["instances"].items() if i.get("state") == "running"]
+    if running and not getattr(args, "no_restart", False):
+        info(f"{len(running)} instance(s) are still running the previous build: "
+             f"{', '.join(running[:5])}")
+        info("restart them with: dsh-muctl instance restart <name>   (or keep them for now)")
+    return 0
+
+
+def cmd_runtime(args):
+    """DSH runtime helpers (shared rootfs; the host needs nothing)."""
+    ensure_root()
+    action = getattr(args, "action", "status") or "status"
+    rootfs = runtime_rootfs()
+    if not rootfs or not os.path.isdir(rootfs):
+        die(f"runtime rootfs not found: {rootfs!r}")
+    pty_dir = node_pty_dir(rootfs)
+    if action == "status":
+        glibc = node_pty_is_glibc(rootfs)
+        built = os.path.exists(f"{pty_dir}/build/Release/pty.node")
+        info(f"  rootfs      {rootfs}")
+        info(f"  node-pty    {pty_dir}")
+        info(f"  prebuilt    {'yes' if os.path.exists(pty_dir + '/prebuilds/linux-x64/pty.node') else 'no'}"
+             f"  musl-build {'yes' if built else 'no'}")
+        info(f"  verdict     {'glibc build (terminals will segfault)' if glibc else 'ok'}")
+        return 0 if not glibc else 1
+
+    if action == "install":
+        st = load_state()
+        want = str(getattr(args, "version", "") or "").strip() \
+            or str(st["config"].get("dsh_version") or VERSION)
+        info(f"installing @deepseek-ai/dsh@{want} into the shared runtime "
+             f"(this runs npm inside the gateway rootfs; takes a few minutes)")
+        install_dsh_runtime(st, want, force=True)
+        got = installed_dsh_version()
+        info(f"runtime now: @deepseek-ai/dsh@{got or '?'}")
+        if got and got != want:
+            info("WARNING: the installed version does not match the requested one")
+            return 1
+        # A fresh node_modules tree ships node-pty's glibc prebuild again; terminals
+        # segfault on musl until it is rebuilt.
+        if node_pty_is_glibc(rootfs):
+            info("node-pty is a glibc build again -> rebuilding for musl")
+            return cmd_runtime(type("A", (), {"action": "fix-pty", "version": ""})())
+        info("instances pick this up on their next restart: dsh-muctl instance restart <name>")
+        return 0
+
+    if action != "fix-pty":
+        die(f"unknown runtime action: {action}")
+
+    info("installing build tools inside the runtime rootfs (host untouched)")
+    with contextlib.suppress(OSError):
+        shutil.copyfile("/etc/resolv.conf", f"{rootfs}/etc/resolv.conf")
+    rc = run(["chroot", rootfs, "/bin/sh", "-c",
+              "apk add --no-cache python3 make g++ linux-headers"],
+             check=False, capture=True)
+    if rc.returncode != 0:
+        info("WARNING: could not install build tools (offline?); terminals stay broken")
+        info(((rc.stdout or "") + (rc.stderr or ""))[-300:])
+        return 1
+    info("rebuilding node-pty from source (musl)")
+    rc = run(["chroot", rootfs, "/bin/sh", "-c",
+              "cd /usr/local/lib/node_modules/@deepseek-ai/dsh && "
+              "npm rebuild node-pty --build-from-source 2>&1 | tail -3"],
+             check=False, capture=True)
+    print((rc.stdout or "") + (rc.stderr or ""))
+    if node_pty_is_glibc(rootfs):
+        info("WARNING: still a glibc build; the rebuild did not take effect")
+        return 1
+    info("node-pty rebuilt for musl; restart instances so they load the new module")
+    return 0
+
+
+def cmd_ext(args):
+    """Extensions: self-contained jailed appliances shipped by extension packages."""
+    ensure_root()
+    action = getattr(args, "action", "list") or "list"
+
+    if action == "list":
+        registered = ext_registered()
+        manifests = ext_manifests()
+        if not registered and not manifests:
+            info("no extensions installed (packages drop a manifest under "
+                 f"{EXT_SHARE}/<name>/manifest.json)")
+            return 0
+        print(f"{'NAME':14} {'VERSION':9} {'PORT':7} {'ADMIN':7} {'SERVICE':9} PLUGINS")
+        for name in sorted(set(registered) | set(manifests)):
+            manifest = registered.get(name) or manifests.get(name) or {}
+            port = ((manifest.get("service") or {}).get("port")) or "-"
+            bundles = glob.glob(f"{manifests.get(name, {}).get('_dir', '/nonexistent')}/bundles/*.tgz")
+            admin_port = ((manifest.get("admin") or {}).get("port")) or "-"
+            print(f"{name:14} {str(manifest.get('version') or '-'):9} {str(port):7} "
+                  f"{str(admin_port):7} {ext_status(name):9} {len(bundles)}")
+        return 0
+
+    if action == "reload":
+        report = ext_reload()
+        info(f"installed: {', '.join(report['installed']) or '-'}")
+        if report["skipped"]:
+            for name, why in report["skipped"].items():
+                info(f"  skipped {name}: {why}")
+        if report["retired"]:
+            info(f"retired: {', '.join(report['retired'])}")
+        sync_all(load_state())
+        return 0
+
+    name = str(getattr(args, "name", "") or "").strip()
+    if not name:
+        die(f"usage: dsh-muctl ext {action} <name>")
+    # The registered copy intentionally drops "_" fields, so `_dir` only exists in the
+    # scan result -- prefer it, and derive _dir for anything that came from /etc.
+    manifest = ext_manifests().get(name) or ext_registered().get(name)
+    if manifest is not None and not manifest.get("_dir"):
+        manifest = {**manifest, "_dir": os.path.join(EXT_SHARE, name)}
+    if not manifest and action != "logs":
+        die(f"no such extension: {name}")
+
+    if action == "status":
+        port = ((manifest.get("service") or {}).get("port")) or "-"
+        info(f"  name     {name}")
+        info(f"  version  {manifest.get('version')}")
+        info(f"  service  {ext_status(name)}")
+        info(f"  port     {port}" + (" (answering)" if port != "-" and _port_open(int(port)) else ""))
+        sock_api = str(((manifest.get("service") or {}).get("socket") or "")).strip()
+        sock_admin = str(((manifest.get("admin") or {}).get("socket") or "")).strip()
+        if sock_api or sock_admin:
+            info(f"  api sock {ext_api_socket_dir(name)}/{sock_api or '-'}"
+                 f"  (mounted into instances as /run/dsh-mu-ext/{name}/)")
+            admin_path = ext_socket_path(name, "admin")
+            info(f"  adm sock {ext_admin_socket_dir(name)}/{sock_admin or '-'}"
+                 + (f"  (connect: {socket_probe(admin_path)})" if sock_admin else ""))
+        info(f"  jail     {ext_jail_conf(name)}")
+        info(f"  data     {EXT_DATA}/{name}")
+        info(f"  egress   {', '.join((manifest.get('net') or {}).get('egress') or []) or 'deny-all'}")
+        return 0
+
+    if action in ("start", "stop", "restart"):
+        run(["/sbin/rc-service", f"dsh-mu-ext-{name}", action], check=False)
+        info(f"{name}: {ext_status(name)}")
+        return 0
+
+    if action == "logs":
+        path = f"{LOGS}/ext-{name}.log"
+        count = int(getattr(args, "lines", 40) or 40)
+        if not os.path.exists(path):
+            info(f"no log yet: {path}")
+            return 0
+        with open(path, errors="replace") as fh:
+            for line in fh.readlines()[-count:]:
+                print(line.rstrip())
+        return 0
+
+    if action == "doctor":
+        cli = os.path.join(manifest["_dir"], "cli")
+        if not os.path.exists(cli):
+            info(f"{name}: extension ships no cli; platform checks only")
+            info(f"  service {ext_status(name)}")
+            return 0
+        res = subprocess.run([JAIL, "--conf", ext_jail_conf(name), f"ext-{name}", "--",
+                              "/opt/ext/cli", "doctor"], capture_output=True, text=True)
+        print((res.stdout or "") + (res.stderr or ""))
+        return 0 if "FAIL" not in (res.stdout or "") else 1
+
+    if action == "cli":
+        cli = os.path.join(manifest["_dir"], "cli")
+        if not os.path.exists(cli):
+            die(f"{name} ships no cli")
+        rest = [a for a in (getattr(args, "rest", None) or []) if a != "--"]
+        res = subprocess.run([JAIL, "--conf", ext_jail_conf(name), f"ext-{name}", "--",
+                              "/opt/ext/cli", *rest], capture_output=True, text=True)
+        print((res.stdout or ""), end="")
+        if res.stderr:
+            print(res.stderr, file=sys.stderr, end="")
+        return res.returncode
+    die(f"unknown ext action: {action}")
 
 
 def cmd_plugin(args):
@@ -5565,9 +7580,30 @@ def restart_admin_if_stale(quiet: bool = False) -> bool:
     return True
 
 
+LUA_STAMP = "/run/dsh-mu/gateway-lua.stamp"
+
+
+def lua_reload_stamp() -> float:
+    with contextlib.suppress(OSError, ValueError):
+        return float((read_text(LUA_STAMP) or "0").strip() or 0)
+    return 0.0
+
+
+def mark_lua_reloaded() -> None:
+    """Record that the workers picked up the current lua files.
+
+    `nginx -s reload` replaces the workers but keeps the master, so comparing file
+    mtimes against the *process* start time reported "stale after upgrade" forever and
+    every doctor run after an upgrade showed a warning that was not real.
+    """
+    with contextlib.suppress(OSError):
+        os.makedirs("/run/dsh-mu", exist_ok=True)
+        atomic_write(LUA_STAMP, f"{time.time():.0f}\n", mode=0o644)
+
+
 def stale_lua_files() -> list[str]:
-    """Lua files changed after the gateway started: openresty caches them in memory."""
-    started = gateway_started_at()
+    """Lua files changed after the gateway (or its last reload) started."""
+    started = max(gateway_started_at() or 0.0, lua_reload_stamp())
     if not started:
         return []
     return [path for path in lua_files()
@@ -5593,6 +7629,7 @@ def reload_gateway_if_stale(quiet: bool = False) -> bool:
         run(["/sbin/rc-service", "dsh-mu-gateway", "restart"], check=False)
     else:
         run(["/sbin/rc-service", "openresty", "reload"], check=False)
+    mark_lua_reloaded()
     return True
 
 
@@ -6127,7 +8164,15 @@ def cmd_provider(args):
 
 
 PROVIDER_PACKAGE_SCHEMA = "dsh-mu.provider/v1"
-PROVIDER_APIS = ("openai-completions", "openai-responses", "anthropic-messages")
+# Wire protocols a model may declare. The first three are what our own presets use;
+# the rest come straight from the harness catalog (pi-ai speaks them itself, and the
+# relay is transparent, so accepting them costs nothing and keeps imported catalogs
+# intact instead of dropping the whole provider).
+PROVIDER_APIS = (
+    "openai-completions", "openai-responses", "anthropic-messages",
+    "google-generative-ai", "google-vertex", "bedrock-converse-stream",
+    "azure-openai-responses", "openai-codex-responses", "anthropic-oauth",
+)
 
 PROVIDER_SPEC_TEXT = """\
 # provider 配置文件规范（dsh-mu.provider/v1）
@@ -6276,9 +8321,22 @@ def validate_provider_package(doc) -> tuple[dict, list[str]]:
     base_url = str(doc.get("base_url") or doc.get("baseURL") or "").strip()
     if not base_url.startswith(("http://", "https://")):
         problems.append("base_url must be an http(s) URL")
+    # Provenance and availability. Providers imported from the harness directory are
+    # platform-owned: they can be disabled but never deleted, so a user cannot remove a
+    # row the administrator relies on.
+    origin = str(doc.get("origin") or "custom").strip()
+    if origin not in ("custom", "dsh"):
+        problems.append("origin must be 'custom' or 'dsh'")
+    disabled = bool(doc.get("disabled"))
+    params_in = doc.get("params") if isinstance(doc.get("params"), dict) else {}
+    params = {str(k): str(v) for k, v in params_in.items() if str(v).strip()}
+    needs = [str(x) for x in (doc.get("needs_params") or []) if str(x).strip()]
     api = str(doc.get("api") or "openai-completions").strip()
-    if api not in PROVIDER_APIS:
-        problems.append("api must be one of: " + ", ".join(PROVIDER_APIS))
+    # Any well-formed wire-protocol name is accepted: imported harness catalogs use
+    # protocols we do not enumerate (mistral-conversations, radius, …) and the relay is
+    # transparent, so there is nothing for us to refuse here.
+    if not re.fullmatch(r"[a-z][a-z0-9-]{1,40}", api):
+        problems.append("api must be a lowercase protocol name (e.g. openai-completions)")
     headers = doc.get("headers") if isinstance(doc.get("headers"), dict) else {}
     models_in = doc.get("models")
     models: list[dict] = []
@@ -6300,12 +8358,14 @@ def validate_provider_package(doc) -> tuple[dict, list[str]]:
             row = {"id": mid, "api": str(item.get("api") or api).strip(),
                    "base_url": str(item.get("base_url") or item.get("baseURL")
                                    or base_url).strip()}
-            if row["api"] not in PROVIDER_APIS:
-                problems.append(f"models[{i}].api must be one of: " + ", ".join(PROVIDER_APIS))
+            if not re.fullmatch(r"[a-z][a-z0-9-]{1,40}", row["api"]):
+                problems.append(f"models[{i}].api must be a lowercase protocol name")
             _tail = {"anthropic-messages": ("/v1", "/v1/messages"),
                      "openai-completions": ("/chat/completions",),
                      "openai-responses": ("/responses",)}.get(row["api"], ())
-            if _tail and row["base_url"].rstrip("/").endswith(_tail):
+            # Harness catalogs bake the full endpoint into base_url; that rule exists to
+            # catch hand-written packages that would otherwise double the path.
+            if origin != "dsh" and _tail and row["base_url"].rstrip("/").endswith(_tail):
                 problems.append(
                     f"models[{i}].base_url already contains {row['api']}'s path; "
                     f"give only the prefix (the platform appends it)")
@@ -6385,7 +8445,11 @@ def validate_provider_package(doc) -> tuple[dict, list[str]]:
                   "docs": str(doc.get("docs") or ""), "auth": {"type": auth_type},
                   "headers": {str(k): str(v) for k, v in headers.items()},
                   "base_url": base_url, "api": api, "default_model": default_model,
-                  "models": models}
+                  "models": models, "origin": origin, "disabled": disabled}
+    if params:
+        normalised["params"] = params
+    if needs:
+        normalised["needs_params"] = needs
     if discover:
         normalised["discover"] = discover
     if usage:
@@ -6574,6 +8638,18 @@ def save_plan(plan: dict, key: str | None = None) -> dict:
     """Persist a plan (and its credential, if one was supplied)."""
     os.makedirs(PLANS_DIR, exist_ok=True)
     plan = dict(plan)
+    pid = str(plan.get("provider") or "").strip()
+    if pid:
+        pkg = load_provider_package(pid)
+        if not pkg and preset_as_package(pid):
+            pkg = None          # built-in preset: exists, has no file to disable
+        elif not pkg:
+            raise ValueError(f"provider {pid!r} does not exist "
+                             f"(import it from the harness directory or as JSON first)")
+        if pkg and pkg.get("disabled"):
+            raise ValueError(f"provider {pid!r} is disabled"
+                             + (f" (needs: {', '.join(pkg.get('needs_params') or [])})"
+                                if pkg.get("needs_params") else ""))
     plan.setdefault("schema", PLAN_SCHEMA)
     plan.setdefault("visible_to", ["*"])
     plan.setdefault("enabled", True)
@@ -6901,6 +8977,11 @@ def set_plan_models(plan: dict, models: list[str], select_all_available: bool = 
             "default_model": plan.get("default_model") or ""}
 
 
+# The only wire protocols `llm-pi-ai`'s config schema accepts (validated by the plugin
+# itself; anything else fails the whole row).
+LLM_PATCH_APIS = ("openai-completions", "openai-responses", "anthropic-messages")
+
+
 def plan_routes(plan: dict, user: str) -> list[dict]:
     """Turn one plan into the pi-ai routes it needs (one per base URL)."""
     pkg = plan_package(plan)
@@ -6910,6 +8991,12 @@ def plan_routes(plan: dict, user: str) -> list[dict]:
     available = plan_available_set(plan)
     models = []
     for m in pkg["models"]:
+        # llm-pi-ai's schema accepts exactly three wire protocols; a single model with
+        # any other one (google-generative-ai, bedrock-converse-stream, …) makes the
+        # whole config invalid, the plugin never activates, and EVERY provider of the
+        # instance disappears. Drop them here instead of poisoning the patch.
+        if str(m.get("api") or "") not in LLM_PATCH_APIS:
+            continue
         if subset and m["id"] not in subset:
             continue
         # A probed plan only exposes models its key could actually use; the rest are
@@ -7016,16 +9103,14 @@ def plans_patch_yaml(user: str, instance: str,
     lines = [SANDBOX_PATCH,
              "# generated by dsh-muctl - model plans visible to this user",
              "# one pi-ai route per plan (displayName is the selector group name)",
-             "# the built-in DeepSeek route keeps an empty catalog: plans are the only",
-             "# way to pick a model, so nobody hits `no API key for deepseek-official`.",
-             "- id: llm-deepseek",
-             "  config:",
-             "    models: []"]
+             "# The built-in DeepSeek catalog is deliberately left alone: clearing it made",
+             "# a dropped provider fatal (the composer then had no model at all), so plans",
+             "# are additive -- if every plan fails to load, DeepSeek still works."]
     lines += ["- id: llm-pi-ai", "  config:", "    providers:"]
     for route in routes:
         lines += [
             f"      {route['route']}:",
-            f"        displayName: {json.dumps(route['display_name'], ensure_ascii=False)}",
+            f"        displayName: {json.dumps(MODELS_LOCK_PREFIX + str(route['display_name']), ensure_ascii=False)}",
             *([] if (route.get("keyless") and not relay) or not route.get("api_key_env")
               else [f"        apiKeyEnv: {route['api_key_env']}"]),
             f"        api: {route['api']}",
@@ -7362,6 +9447,12 @@ def sync_instance_plans(st: dict, name: str) -> dict:
         _default_key = RELAY_PLACEHOLDER if relay else plan_key(default)
         if _default_key:
             credentials.setdefault("DEEPSEEK_API_KEY", _default_key)
+    launch_yaml, llm_block = split_plans_patch(yaml)
+    if llm_block:
+        with contextlib.suppress(Exception):
+            write_profile_llm_block(st, name, llm_block)
+        yaml = launch_yaml
+    yaml = yaml + market_patch_yaml(st, name)
     uid = int(inst.get("uid", 0))
     os.makedirs(os.path.dirname(patch_path), exist_ok=True)
     atomic_write(patch_path, yaml, mode=0o644)
@@ -7371,6 +9462,248 @@ def sync_instance_plans(st: dict, name: str) -> dict:
     write_instance_refs(cred_path, credentials, uid)
     return {"plans": len(plans), "patch": patch_path, "default_plan": default["id"],
             "refs": sorted(credentials)}
+
+
+LLM_BLOCK_START = "# >>> dsh-mu:llm (managed by dsh-muctl - re-written on every sync)"
+LLM_BLOCK_END = "# <<< dsh-mu:llm"
+
+
+def split_plans_patch(yaml: str) -> tuple[str, str]:
+    """Separate the model configuration from the sandbox part of the launch patch.
+
+    Anything we pass through `--patch` makes that namespace read-only for DSH's own
+    settings page ("Configuration for \"llm-pi-ai\" is overridden by a home patch or
+    command-line overlay"), so the model rows must live in the *profile's* patch file
+    instead -- that is the layer the settings page itself edits.
+    """
+    marker = "- id: llm-pi-ai"
+    idx = yaml.find(marker)
+    if idx < 0:
+        return yaml, ""
+    head, rest = yaml[:idx], yaml[idx:]
+    # Stop at the first top-level entry we do not own. Cutting only at known names left
+    # web-search-deepseek/tool-web inside the block, which then failed validation.
+    stop = len(rest)
+    for line in rest.split("\n")[1:]:
+        if not line.startswith("- "):
+            continue
+        body = line[2:].strip()
+        if not body.startswith("id:"):
+            continue
+        ident = body[3:].strip().strip('"').strip("'")
+        if ident in OWN_PATCH_IDS:
+            continue
+        stop = rest.find(line)
+        break
+    llm_part, tail = rest[:stop], rest[stop:]
+    tail = tail.strip()
+    return head.rstrip() + "\n" + (tail + "\n" if tail else ""), llm_part.strip() + "\n"
+
+
+BUNDLED_PLUGINS_DIR = f"{LIB}/plugins"
+
+
+def ensure_bundled_plugins(st: dict, name: str) -> list[str]:
+    """Install the client plugins this apk ships into one instance's profile.
+
+    They live under /usr/local/lib/dsh-mu/plugins and are copied into the profile's
+    node_modules, added to `dsh.profile.bundles` and marked 受保护 so a user cannot
+    remove them. Everything is idempotent: an instance that already has the current
+    files is left alone.
+    """
+    changed: list[str] = []
+    if not os.path.isdir(BUNDLED_PLUGINS_DIR):
+        return changed
+    home = instance_home(name)
+    profile = instance_profile(name)
+    prof_dir = f"{home}/.dsh/profiles/{profile}"
+    pkg_path = f"{prof_dir}/package.json"
+    doc = {}
+    with contextlib.suppress(ValueError):
+        doc = json.loads(read_text(pkg_path) or "{}")
+    bundles = ((doc.get("dsh") or {}).get("profile") or {}).get("bundles") or []
+    inst = st["instances"].get(name) or {}
+    uid = int(inst.get("uid", 0))
+
+    for plugin in sorted(os.listdir(BUNDLED_PLUGINS_DIR)):
+        src = f"{BUNDLED_PLUGINS_DIR}/{plugin}"
+        if not os.path.isdir(src):
+            continue
+        with contextlib.suppress(ValueError):
+            meta = json.loads(read_text(f"{src}/package.json") or "{}")
+        pkg_name = str(meta.get("name") or plugin)
+        dst = f"{prof_dir}/node_modules/{pkg_name}"
+        stale = True
+        with contextlib.suppress(ValueError):
+            have = json.loads(read_text(f"{dst}/package.json") or "{}")
+            stale = str(have.get("version")) != str(meta.get("version"))
+        if stale or not os.path.isdir(dst):
+            with contextlib.suppress(OSError):
+                shutil.rmtree(dst)
+            os.makedirs(dst, exist_ok=True)
+            for root, _dirs, files in os.walk(src):
+                rel = os.path.relpath(root, src)
+                target_dir = dst if rel == "." else f"{dst}/{rel}"
+                os.makedirs(target_dir, exist_ok=True)
+                for fname in files:
+                    shutil.copyfile(f"{root}/{fname}", f"{target_dir}/{fname}")
+                    os.chmod(f"{target_dir}/{fname}", 0o644)
+            changed.append(f"{pkg_name}: installed")
+        if pkg_name not in bundles:
+            bundles.append(pkg_name)
+            changed.append(f"{pkg_name}: bundle added")
+        with contextlib.suppress(OSError):
+            os.chown(dst, uid, uid)
+        # Marked `bundled`, not `protected`: a protected plugin gets a read-only bind
+        # mount, which makes pnpm installs in that instance fail with EBUSY. Bundled
+        # plugins are restored by everysync instead, so a user still cannot break them.
+        row = dict(plugin_policy(st).get(pkg_name) or {})
+        if not row.get("bundled"):
+            row["bundled"] = True
+            st.setdefault("plugin_policy", {})[pkg_name] = row
+
+    if changed:
+        doc.setdefault("dsh", {}).setdefault("profile", {})["bundles"] = bundles
+        atomic_write(pkg_path, json.dumps(doc, indent=2) + "\n", mode=0o600)
+        with contextlib.suppress(OSError):
+            os.chown(pkg_path, uid, uid)
+    return changed
+
+
+def models_native_enabled(st: dict, name: str) -> bool:
+    """The harness Models page: off by default, openable per instance."""
+    inst = st["instances"].get(name) or {}
+    if "models_native" in inst:
+        return bool(inst["models_native"])
+    return bool(st["config"].get("models_native", False))
+
+
+OWN_PATCH_IDS = {"llm-deepseek", "llm-pi-ai", "plugin-market", "ui-plugin-market",
+                 "ui-settings-models", "dsh-mu-models"}
+
+
+def profile_patch_problem(text: str) -> str:
+    """Cheap structural check of the profile patch before it is written.
+
+    Outside our marker block the file belongs to the user, so anything with a valid
+    `- id:` shape is fine. Inside the block only entries we own may appear -- that is
+    exactly the failure we hit: the block swallowed `agent-default-model` and the whole
+    file became one entry, so the harness ignored it and every provider vanished.
+    """
+    if not text.strip():
+        return "empty"
+    inside = False
+    for lineno, line in enumerate(text.split("\n"), 1):
+        if line.startswith(LLM_BLOCK_START):
+            inside = True
+            continue
+        if line.startswith(LLM_BLOCK_END):
+            inside = False
+            continue
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line.startswith((" ", "\t")):
+            continue
+        if not line.startswith("- "):
+            return f"line {lineno}: a top-level entry must start with '- '"
+        body = line[2:].strip()
+        if not body.startswith("id:"):
+            return f"line {lineno}: a top-level entry must start with '- id:'"
+        if not inside:
+            continue
+        ident = body[3:].strip().strip('"').strip("'")
+        if ident not in OWN_PATCH_IDS:
+            return f"line {lineno}: entry {ident!r} inside the dsh-mu block is not ours"
+    return ""
+
+
+def strip_llm_block(text: str) -> str:
+    """Drop every dsh-mu block, keeping everything that is not ours."""
+    out: list[str] = []
+    inside = False
+    for line in text.split("\n"):
+        if line.startswith(LLM_BLOCK_START):
+            inside = True
+            continue
+        if line.startswith(LLM_BLOCK_END):
+            inside = False
+            continue
+        if not inside:
+            out.append(line)
+    kept = "\n".join(out).strip()
+    return kept + "\n" if kept else ""
+
+
+def split_patch_entries(text: str) -> list[tuple[str, str]]:
+    """Split a profile patch into (id, chunk) pairs, ignoring marker comments.
+
+    Parsing by entry instead of by marker is what makes the writer immune to a file an
+    older build mangled: whatever the markers look like, each `- id:` chunk stands on
+    its own and we can keep the ones that are not ours.
+    """
+    entries: list[tuple[str, list[str]]] = []
+    current: list[str] | None = None
+    current_id = ""
+    for line in text.split("\n"):
+        if line.startswith(LLM_BLOCK_START) or line.startswith(LLM_BLOCK_END):
+            continue
+        if line.startswith("- "):
+            body = line[2:].strip()
+            ident = ""
+            if body.startswith("id:"):
+                ident = body[3:].strip().strip('"').strip("'")
+            if current is not None:
+                entries.append((current_id, current))
+            current, current_id = [line], ident
+            continue
+        if current is None:
+            continue                       # preamble comments
+        current.append(line)
+    if current is not None:
+        entries.append((current_id, current))
+    out: list[tuple[str, str]] = []
+    for ident, lines in entries:
+        chunk = "\n".join(lines).strip()
+        if chunk:
+            out.append((ident, chunk))
+    return out
+
+
+def write_profile_llm_block(st: dict, name: str, block: str) -> None:
+    """Rebuild the profile patch: the user's entries, then our marked block.
+
+    Entries are copied verbatim, so a file that an older build swallowed inside our
+    markers is repaired as a side effect -- the swallowed entries simply reappear as
+    top-level entries again.
+    """
+    if not block:
+        info(f"profile patch: {name}: no model block to write (skipped)")
+        return
+    profile = instance_profile(name)
+    path = f"{instance_home(name)}/.dsh/profiles/{profile}/cordis.patch.yml"
+    raw = read_text(path) or ""
+    user = [chunk for ident, chunk in split_patch_entries(raw) if ident not in OWN_PATCH_IDS]
+    if bool(st["config"].get("hide_builtin_deepseek", True)):
+        # The builtin DeepSeek channel talks to api.deepseek.com directly with a
+        # placeholder credential, so selecting it can only fail. Our own providers are
+        # separate rows and keep working.
+        block = block.rstrip() + "\n- id: llm-deepseek\n  disabled: true"
+    if not models_native_enabled(st, name):
+        block = block.rstrip() + "\n- id: ui-settings-models\n  disabled: true"
+    text = "\n".join(user + [LLM_BLOCK_START, block.rstrip(), LLM_BLOCK_END]).strip() + "\n"
+    info(f"profile patch: {name}: user entries={len(user)}, block={len(block)} chars, "
+         f"target={path}")
+    problem = profile_patch_problem(text)
+    if problem:
+        info(f"WARNING: {name}: refusing to write the profile patch ({problem}); "
+             f"the file was left untouched")
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    atomic_write(path, text, mode=0o600)
+    info(f"profile patch: {name}: wrote {len(text)} chars")
+    inst = st["instances"].get(name) or {}
+    with contextlib.suppress(OSError):
+        os.chown(path, int(inst.get("uid", 0)), int(inst.get("gid", inst.get("uid", 0))))
 
 
 def write_instance_refs(cred_path: str, extra: dict, uid: int) -> None:
@@ -7496,7 +9829,7 @@ def provider_package_to_defn(pkg: dict) -> dict:
     # lets one group carry chat-completions, responses and messages models.
     by_base: dict[str, list[dict]] = {}
     for m in pkg["models"]:
-        by_base.setdefault(m["base_url"], []).append(m)
+        by_base.setdefault(resolve_base_url(m["base_url"], pkg.get("params")), []).append(m)
     first_base = next(iter(by_base))
     models = []
     for base, rows in by_base.items():
@@ -7737,6 +10070,106 @@ def preset_as_package(name: str) -> dict | None:
             "auth": {"type": "x-api-key" if api == "anthropic-messages" else "bearer"},
             "headers": dict(defn.get("headers") or {}), "base_url": base, "api": api,
             "default_model": defn.get("model") or models[0]["id"], "models": models}
+
+
+class ProviderProtectedError(ValueError):
+    """Raised when someone tries to delete a platform-imported provider."""
+
+
+def delete_provider_package(pid: str) -> None:
+    """Delete a hand-made provider; refuse for anything imported from the harness."""
+    pid = str(pid or "").strip()
+    pkg = load_provider_package(pid)
+    if not pkg:
+        raise FileNotFoundError(f"no such provider: {pid}")
+    if str(pkg.get("origin") or "custom") == "dsh":
+        raise ProviderProtectedError(
+            f"{pid} comes from the harness provider directory and cannot be deleted "
+            f"(disable it instead: POST /api/packages/{pid}/toggle)")
+    os.unlink(f"{PROVIDERS_DIR}/{pid}.json")
+
+
+def set_provider_disabled(pid: str, disabled: bool, params: dict | None = None) -> dict:
+    """Flip a provider's availability (and optionally fill its URL parameters)."""
+    pkg = load_provider_package(pid)
+    if not pkg:
+        raise FileNotFoundError(f"no such provider: {pid}")
+    if params:
+        merged = dict(pkg.get("params") or {})
+        merged.update({str(k): str(v) for k, v in params.items() if str(v).strip()})
+        pkg["params"] = merged
+        pkg["base_url"] = resolve_base_url(
+            dsh_provider_base_urls().get(pid) or pkg.get("base_url") or "", merged) \
+            or pkg.get("base_url") or ""
+        left = unresolved_slots(pkg["base_url"])
+        if left:
+            pkg["needs_params"] = left
+        else:
+            pkg.pop("needs_params", None)
+    if bool(disabled) and (pkg.get("needs_params") or unresolved_slots(pkg.get("base_url") or "")):
+        raise ValueError("fill in the endpoint parameters first ("
+                         + ", ".join(pkg.get("needs_params") or unresolved_slots(pkg["base_url"]))
+                         + ")")
+    pkg["disabled"] = bool(disabled)
+    save_provider_package(pkg)
+    return pkg
+
+
+def provider_id_problem(pid: str, origin: str = "custom") -> str:
+    """Refuse ids that collide with the harness directory or with another label.
+
+    Imported harness providers own their plain ids (`deepseek`, `groq`, …); hand-made
+    providers must not shadow them, which is why `mu-` is the documented prefix.
+    """
+    pid = str(pid or "").strip()
+    if origin == "dsh":
+        return ""
+    if pid in dsh_provider_ids():
+        return (f"id {pid!r} is a provider the harness ships; pick another id "
+                f"(convention: mu-{pid})")
+    return ""
+
+
+def dsh_provider_ids() -> set[str]:
+    return {str(p.get("id")) for p in dsh_provider_catalog()}
+
+
+def provider_label_problem(label: str, my_id: str, origin: str = "custom") -> str:
+    label = str(label or "").strip()
+    if not label:
+        return ""
+    for pid, pkg in list_provider_packages().items():
+        if pid == my_id:
+            continue
+        if str(pkg.get("label") or "").strip().lower() == label.lower():
+            return f"label {label!r} is already used by provider {pid}"
+    if origin == "custom" and label in dsh_provider_ids():
+        return f"label {label!r} collides with a harness provider id"
+    return ""
+
+
+def migrate_provider_ids(st: dict) -> list[str]:
+    """Rename hand-made providers that shadow a harness id (one-off, idempotent)."""
+    changed: list[str] = []
+    harness = dsh_provider_ids()
+    if not harness:
+        return changed
+    for pid, pkg in list(list_provider_packages().items()):
+        if str(pkg.get("origin") or "custom") == "dsh" or pid not in harness:
+            continue
+        new_id = f"mu-{pid}"
+        if new_id in harness or os.path.exists(f"{PROVIDERS_DIR}/{new_id}.json"):
+            continue
+        pkg = dict(pkg)
+        pkg["id"] = new_id
+        save_provider_package(pkg)
+        os.unlink(f"{PROVIDERS_DIR}/{pid}.json")
+        for plan in list_plans().values():
+            if str(plan.get("provider") or "") == pid:
+                plan["provider"] = new_id
+                save_plan(plan)
+        changed.append(f"provider {pid} -> {new_id}")
+    return changed
 
 
 def list_provider_packages() -> dict[str, dict]:
@@ -8840,6 +11273,140 @@ def doctor_checks(st: dict) -> list[dict]:
                 add("egress rules", DOCTOR_PASS,
                     f"policy={policy}, {len(enforced)} instance(s) enforced")
 
+    # ------------------------------------------------------ runtime: node-pty
+    with contextlib.suppress(Exception):
+        rt = runtime_rootfs()
+        if rt and node_pty_is_glibc(rt):
+            add("runtime pty", DOCTOR_WARN,
+                "node-pty is a glibc build on a musl runtime (terminals crash)",
+                "dsh-muctl runtime fix-pty   # then restart instances")
+        elif rt:
+            add("runtime pty", DOCTOR_PASS, "node-pty matches the musl runtime")
+    # ------------------------------------------------------ profile patch
+    for _name in sorted(st["instances"])[:8]:
+        _profile = instance_profile(_name)
+        _path = f"{instance_home(_name)}/.dsh/profiles/{_profile}/cordis.patch.yml"
+        _text = read_text(_path) or ""
+        if not _text:
+            continue
+        _problem = profile_patch_problem(_text)
+        if _problem:
+            add(f"patch {_name}", DOCTOR_FAIL, f"profile patch is malformed: {_problem}",
+                "dsh-muctl sync   # re-renders it; a refused write leaves the file as is")
+    # ---------------------------------------------------------- models page
+    native = [n for n in st["instances"] if models_native_enabled(st, n)]
+    if native:
+        add("models page", DOCTOR_PASS,
+            "harness Models page open on: " + ", ".join(sorted(native)[:4])
+            + (" …" if len(native) > 4 else ""))
+    else:
+        add("models page", DOCTOR_PASS,
+            "closed everywhere (users cannot add their own provider keys)")
+
+    # ------------------------------------------------------------ models lock
+    if not models_lock_enabled():
+        add("models lock", DOCTOR_PASS, "disabled (models_lock=false)")
+    else:
+        rootfs = ""
+        with contextlib.suppress(Exception):
+            rootfs = runtime_rootfs()
+        client = f"{rootfs}{MODELS_CLIENT_REL}" if rootfs else ""
+        if not client or not os.path.exists(client):
+            add("models lock", DOCTOR_WARN, "DSH models client not found in the runtime",
+                "dsh-muctl runtime install   # reinstall the runtime, then sync")
+        else:
+            text = read_text(client) or ""
+            have = [label for label, _stock, patched in MODELS_PATCHES if patched in text]
+            if len(have) == len(MODELS_PATCHES):
+                add("models lock", DOCTOR_PASS,
+                    "platform-managed providers show no edit / delete button")
+            elif have:
+                add("models lock", DOCTOR_WARN,
+                    "partial patch (" + ", ".join(have) + " hidden)",
+                    "dsh-muctl sync   # retries the rest; a changed bundle stays stock")
+            else:
+                add("models lock", DOCTOR_WARN,
+                    "patch not applied (stock UI: every row has an edit button)",
+                    "dsh-muctl sync   # retries; if the bundle changed, stock behaviour stays")
+
+    # ------------------------------------------------------ plugin market feed
+    if market_enabled():
+        try:
+            feed = json.loads(read_text(MARKET_ETC) or "{}")
+            count = len(feed.get("plugins") or [])
+            missing = [p["file"] for p in (feed.get("plugins") or [])
+                       if not os.path.exists(os.path.join(MARKET_DIR, str(p.get("file"))))]
+            served = [n for n, i in st["instances"].items() if market_served_by(i)]
+            if missing:
+                add("market feed", DOCTOR_WARN,
+                    f"{len(missing)} tarball(s) missing from {MARKET_DIR}",
+                    "dsh-muctl sync   # re-renders the feed and copies the tarballs")
+            else:
+                protected = [n for n, r in (plugin_policy(st) or {}).items() if r.get("protected")]
+                note = ("" if served else
+                        " (enable with: dsh-muctl config market_enabled true)")
+                if protected and served:
+                    add("market feed", DOCTOR_WARN,
+                        f"{count} package(s); protected plugin(s) {', '.join(protected[:3])} "
+                        f"block pnpm installs (EBUSY) in {len(served)} instance(s)",
+                        "market installs work only where no plugin is 受保护; use "
+                        "`dsh-muctl plugin protect <pkg> false` or push from /admin instead")
+                else:
+                    add("market feed", DOCTOR_PASS,
+                        f"{count} package(s), served to {len(served)} instance(s)" + note)
+        except ValueError:
+            add("market feed", DOCTOR_WARN, "market.json is unreadable",
+                "dsh-muctl sync")
+    else:
+        add("market feed", DOCTOR_PASS, "disabled (market_enabled=false)")
+
+    # ------------------------------------------------- supervisor hygiene
+    dupes = []
+    for unit in ["dsh-mu-" + n for n in sorted(st["instances"])]:
+        extra = stale_supervisors(unit)
+        if extra:
+            dupes.append(f"{unit} (+{len(extra)})")
+    if dupes:
+        add("supervisors", DOCTOR_WARN,
+            "duplicate supervise-daemon: " + ", ".join(dupes[:4]),
+            "dsh-muctl instance restart <name>   # reaps the stale ones")
+    else:
+        add("supervisors", DOCTOR_PASS, "one supervisor per service")
+
+    # ------------------------------------------------------------------ extensions
+    conflicts = ext_port_problems()
+    if conflicts:
+        add("ext ports", DOCTOR_WARN, "; ".join(conflicts[:3]),
+            "change service.port / admin.port in the extension manifest, then ext reload")
+    elif ext_registered():
+        add("ext ports", DOCTOR_PASS, f"{len(ext_registered())} extension(s), no clashes")
+    for name, manifest in sorted(ext_registered().items()):
+        port = int(((manifest.get("service") or {}).get("port") or 0))
+        state_txt = ext_status(name)
+        if state_txt != "running":
+            add(f"ext {name}", DOCTOR_FAIL,
+                f"{manifest.get('version')} installed but the appliance is {state_txt}",
+                f"dsh-muctl ext reload   # recreates the jail conf and restarts it")
+        elif str(((manifest.get("admin") or {}).get("socket") or "")).strip() and \
+                socket_probe(ext_socket_path(name, "admin")) not in ("ok", "n/a"):
+            add(f"ext {name}", DOCTOR_FAIL,
+                f"admin socket {ext_socket_path(name, 'admin')} is "
+                f"{socket_probe(ext_socket_path(name, 'admin'))} -- /ext/{name}/ cannot work",
+                f"dsh-muctl ext restart {name}   (and check ext logs {name})")
+        elif str(((manifest.get("service") or {}).get("socket") or "")).strip() \
+                and not os.path.exists(ext_socket_path(name, "api")):
+            sock = ext_socket_path(name, "api")
+            add(f"ext {name}", DOCTOR_WARN,
+                f"service running but the socket {sock} has not appeared",
+                "the appliance must bind the path from service.socket, inside /run/dsh-mu-ext/api")
+        elif port and not _port_open(port):
+            add(f"ext {name}", DOCTOR_WARN,
+                f"service running but 127.0.0.1:{port} is not answering",
+                "dsh-muctl ext logs " + name)
+        else:
+            add(f"ext {name}", DOCTOR_PASS,
+                f"v{manifest.get('version')} running on 127.0.0.1:{port or '-'}")
+
     # ------------------------------------------------------ admin backend freshness
     if admin_backend_pid():
         if stale_admin_code():
@@ -9646,6 +12213,24 @@ def build_parser() -> argparse.ArgumentParser:
                     help="with `models --refresh`: probe each new model to learn its protocol")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_provider)
+    sp = sub.add_parser("upgrade", help="install an apk and sync everything (one step)")
+    sp.add_argument("apk", nargs="?", help="path to dsh-mu-*.apk (default: newest found)")
+    sp.add_argument("--safe", action="store_true",
+                    help="refuse to upgrade while an instance is in active use")
+    sp.add_argument("--no-restart", action="store_true", help="do not mention instance restarts")
+    sp.set_defaults(func=cmd_upgrade)
+    sp = sub.add_parser("runtime", help="DSH runtime helpers (shared rootfs)")
+    sp.add_argument("action", choices=["status", "fix-pty", "install"], nargs="?",
+                    default="status")
+    sp.add_argument("version", nargs="?", help="with `install`: dsh version, e.g. 0.2.1-rc.5")
+    sp.set_defaults(func=cmd_runtime)
+    sp = sub.add_parser("ext", help="extensions: jailed appliances shipped by plugin packages")
+    sp.add_argument("action", choices=["list", "reload", "status", "start", "stop", "restart",
+                                       "logs", "doctor", "cli"], nargs="?", default="list")
+    sp.add_argument("name", nargs="?", help="extension name")
+    sp.add_argument("-n", "--lines", type=int, default=40)
+    sp.add_argument("rest", nargs=argparse.REMAINDER, help="arguments for `ext cli`")
+    sp.set_defaults(func=cmd_ext)
     sp = sub.add_parser("plugin", help="plugin packages + policy: protected / preinstall / push")
     sp.add_argument("action", choices=["list", "policy", "add", "remove", "rm",
                                        "protect", "unprotect", "preinstall", "unpreinstall",

@@ -113,6 +113,17 @@ build_unsigned() {
 		install_file 0644 "$f" "/usr/local/lib/dsh-mu/nginx/$(basename "$f")"
 	done
 	install_file 0644 "$SRC/admin/index.html" /usr/local/lib/dsh-mu/admin/index.html
+	# Bundled client plugins (preinstalled into every instance by `dsh-muctl sync`).
+	if [ -d "$SRC/plugins" ]; then
+		for plug in "$SRC"/plugins/*/; do
+			[ -d "$plug" ] || continue
+			pname=$(basename "$plug")
+			find "$plug" -type f | while read -r pf; do
+				rel=${pf#"$plug"}
+				install_file 0644 "$pf" "/usr/local/lib/dsh-mu/plugins/$pname/$rel"
+			done
+		done
+	fi
 	for f in "$SRC"/gateway/static/*; do
 		install_file 0644 "$f" "/usr/local/lib/dsh-mu/static/$(basename "$f")"
 	done
@@ -159,7 +170,7 @@ build_unsigned() {
 	#
 	# Keep this list in sync with packaging/APKBUILD (the --signed path) -- and note
 	# that `apk mkpkg` only honours the LAST `-I depends:` given.
-	DEPENDS="python3 util-linux logrotate curl ca-certificates openssl nftables"
+	DEPENDS="python3 util-linux logrotate curl ca-certificates openssl nftables openssh-client"
 	set -- "$@" -I "depends:$DEPENDS"
 	for action in pre-install post-install pre-upgrade post-upgrade pre-deinstall post-deinstall; do
 		[ -f "$SRC/packaging/dsh-mu.$action" ] && set -- "$@" -s "$action:$SRC/packaging/dsh-mu.$action"

@@ -127,7 +127,9 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
   <button data-tab="instances">实例</button>
   <button data-tab="logs">实例日志</button>
   <button data-tab="providers">模型接入</button>
+  <button data-tab="models">模型</button>
   <button data-tab="plugins">插件</button>
+  <button data-tab="ext">扩展</button>
   <button data-tab="platform">平台</button>
   <button data-tab="doctor">自检</button>
   <button data-tab="audit">审计</button>
@@ -137,6 +139,7 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
   <div id="pwBanner"></div>
 
   <section id="tab-overview" class="on">
+    <div id="usageHint" class="muted" style="margin:0 0 10px;font-size:12px"></div>
     <div class="cards" id="ovCards"></div>
     <div id="ovInstances"></div>
   </section>
@@ -233,11 +236,35 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
       word-break:break-word;margin:0"></pre>
   </section>
 
+  <section id="tab-models">
+    <div class="banner" style="border-color:#2b3240;line-height:1.9">
+      这里填的是<strong>你自己的</strong> key：保存后由平台托管（经 relay 转发 ✓ key 不进实例 ✓），
+      立刻能在会话的模型选择器里选到 ✓。管理员统一配置的 provider 显示为
+      <code>平台托管 · …</code>，不能在这里改 ✓。
+    </div>
+    <div class="row" id="myForm" style="margin:12px 0 8px;gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <label>套餐名<input id="myName" placeholder="我的 groq" style="min-width:160px"></label>
+      <label>provider<select id="myProvider" style="min-width:220px"></select></label>
+      <label>API key<input id="myKey" type="password" placeholder="只写进平台，0600"
+             autocomplete="new-password" style="min-width:220px"></label>
+      <button class="primary" type="button" onclick="myAddPlan()">保存</button>
+    </div>
+    <div class="muted" id="myHint" style="font-size:12px;margin-bottom:10px"></div>
+    <h3 style="font-size:14px;margin:16px 0 8px">我的套餐</h3>
+    <div id="myTable"></div>
+    <h3 style="font-size:14px;margin:20px 0 8px">需要厂商 OAuth 的 provider</h3>
+    <div class="muted" style="font-size:12px;line-height:1.9" id="myNative">
+      Copilot / Codex 这类只能用 OAuth 会话，平台无法代持凭据 ✓ ——
+      请在你自己的 DSH 实例里『设置 → 模型』直接登录/填写 ✓（那部分不归平台管 ✓）。
+    </div>
+  </section>
   <section id="tab-providers">
     <div class="row" style="margin-bottom:8px">
       <button class="primary" type="button" onclick="openTemplates()">读取线上模板列表</button>
       <button class="primary" type="button" onclick="openCreate('pkgForm','导入 provider 配置（JSON）','粘贴一个 dsh-mu.provider/v1 的 JSON。也可以先在弹窗里点「只校验」看看有没有问题。')">＋ 导入 provider（JSON）</button>
-      <span class="muted" style="font-size:12px">两种方式二选一：从模板库挑，或自己贴 JSON。导入后还要为它建一个套餐。</span>
+      <button class="primary" type="button" onclick="importFromDsh()">＋ 从 DSH 目录添加</button>
+      <button class="primary" type="button" onclick="importAllFromDsh()">⇩ 一键导入全部可托管</button>
+      <span class="muted" style="font-size:12px">三种方式：从模板库挑、贴 JSON、或直接用 DSH 自带的 provider（含模型目录）。导入后还要为它建一个套餐。</span>
     </div>
     <div class="muted" style="margin:0 0 10px;font-size:12px">
       线上模板来自项目仓库的 <code>provider-packages/</code>：下载后**先按配置规范校验**再保存 ✓，
@@ -292,7 +319,16 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
     </div>
     <form id="planForm" hidden autocomplete="off" data-lpignore="true" data-1p-ignore>
       <label>套餐名<input name="name" placeholder="公司的 opencode go" required></label>
-      <label>provider<input name="provider" placeholder="opencode-go" required style="min-width:150px"></label>
+      <label>provider
+        <div class="row" style="gap:6px;align-items:center">
+          <select id="providerPick" onchange="pickProvider(this)" style="min-width:170px">
+            <option value="">（从目录选择…）</option>
+          </select>
+          <input name="provider" id="providerInput" placeholder="opencode-go" required
+                 style="min-width:150px" oninput="providerHint(this.value)">
+        </div>
+        <div class="muted" id="providerHintText" style="font-size:12px"></div>
+      </label>
       <label>key<input name="key" type="password" placeholder="只写进 0600 文件" required
         autocomplete="new-password" data-lpignore="true" style="min-width:200px"></label>
       <label>可见用户<input name="visible_to" placeholder="留空=团队（所有人可见）">
@@ -305,12 +341,15 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
   </section>
 
   <section id="tab-plugins">
-    <h2>插件</h2>
+    <h2>插件（dsh 侧）</h2>
     <p class="muted" style="margin:0 0 12px">
-      用户仍可在自己的 DSH 界面里装插件 ✓。这里列出的，是<b>平台已经下载好离线安装包</b>的插件 ✓ ——
+      <b>插件</b>指装进实例里的 dsh 插件（npm 包）✓；<b>扩展</b>是 apk 包（见「扩展」页）✓，
+      它自带的服务与自己的插件一起交付 ✓。用户仍可在自己的 DSH 界面里装插件 ✓。
+      这里列出的，是<b>平台已经下载好离线安装包</b>的插件 ✓ ——
       只有它们能配策略 ✓：<b>受保护</b>（装了就删不掉，内核级只读挂载 ✓）、
       <b>预装</b>（新建实例时自动装 ✓）、<b>推送</b>（推给已有实例，并在此后每次重启时补齐 ✓）。
       点表里的 <b>■ / □</b> 可以只看某个实例已装了什么 ✓。
+      标着 <b>随扩展</b> 的包由扩展 apk 提供 ✓：这里只能决定"给谁装"✓，**不能删除或更新** ✗（升级请换扩展包 ✓）。
     </p>
     <div class="row" style="margin-bottom:10px">
       <button class="primary" type="button" onclick="openPolicyAdd()">＋ 添加插件</button>
@@ -323,6 +362,21 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
     <p class="muted" style="margin:0 0 12px">用户自己装的也在里面（来源列写明）。</p>
     <div id="plugInstRows"><div class="muted">加载中…</div></div>
   </section>
+  <section id="tab-ext">
+    <h2>扩展</h2>
+    <p class="muted" style="margin:0 0 12px">
+      <b>扩展</b> = 一个 apk 包（<code>dsh-mu-*-ext</code>）✓：它自带 rootfs ✓、在受管 jail 里跑自己的服务 ✓，
+      并把自己那份 dsh 插件（记为 <b>随扩展</b> ✓）交给平台分发 ✓。
+      这里能看状态、起停、打开它自带的配置页 ✓；<b>安装/升级/卸载都走 apk</b> ✓。
+    </p>
+    <div class="row" style="margin-bottom:10px">
+      <button class="act" type="button" onclick="loadExt()">刷新</button>
+      <button class="act" type="button" onclick="extReload()">重新扫描</button>
+      <span class="muted" id="extMsg" style="font-size:12px"></span>
+    </div>
+    <div id="extRows"><div class="muted">加载中…</div></div>
+  </section>
+
 
   <section id="tab-platform">
     <form id="cfgForm">
@@ -398,7 +452,10 @@ document.querySelectorAll('nav button').forEach(b => b.addEventListener('click',
   if (b.dataset.tab === 'doctor') loadDoctor();
   if (b.dataset.tab === 'platform') loadConfig();
   if (b.dataset.tab === 'providers')  loadPackages();
+  if (b.dataset.tab === 'providers') loadProviderCatalog();
+  if (b.dataset.tab === 'models') loadMyModels();
   if (b.dataset.tab === 'plugins') loadPolicies();
+  if (b.dataset.tab === 'ext') loadExt();
   if (b.dataset.tab === 'instances') { fillLogInstances(); loadEgress().then(loadInstances); }
 
   if (b.dataset.tab === 'logs') { fillLogInstances(); }
@@ -410,23 +467,143 @@ document.querySelectorAll('nav button').forEach(b => b.addEventListener('click',
   }
 }));
 
+let PROVIDERS = [];
+
+async function togglePackage(id, disabled) {
+  const pkg = (PKGS || []).find(p => p.id === id) || {};
+  let params = null;
+  const missing = pkg.needs_params || [];
+  if (!disabled && missing.length) {
+    const answer = window.prompt('这个 provider 的地址需要参数，用 键=值 逗号分隔：\n需要：'
+                                 + missing.join(', '), missing.map(k => k + '=').join(', '));
+    if (answer === null) return;
+    params = {};
+    for (const pair of answer.split(/[,，\s]+/)) {
+      const [k, ...rest] = pair.split('=');
+      if (k && rest.length) params[k.trim()] = rest.join('=').trim();
+    }
+  }
+  try {
+    await api(`packages/${encodeURIComponent(id)}/toggle`, {
+      method: 'POST', body: JSON.stringify({ disabled, params }),
+    });
+    flash(`${id} 已${disabled ? '停用' : '启用'}`);
+    loadPackages();
+  } catch (e) { flash(e.message, 'err'); }
+}
+
+async function importAllFromDsh() {
+  if (!confirm('把 DSH 目录里所有"平台可托管"的 provider（A 类 + 需要填参数的 B 类）一次导入？\n'
+               + '已存在的会被覆盖；需要参数的会先落成停用状态。')) return;
+  try {
+    const r = await api('provider-import-all', { method: 'POST', body: JSON.stringify({}) });
+    const ok = (r.imported || []).length;
+    const bad = (r.failed || []).length;
+    flash(`导入完成：成功 ${ok}${bad ? '，失败 ' + bad : ''}` + (bad ? '（' + r.failed.slice(0, 3).join('; ') + '）' : ''));
+    loadPackages();
+  } catch (e) { flash(e.message, 'err'); }
+}
+
+async function importFromDsh() {
+  await loadProviderCatalog();
+  if (!PROVIDERS.length) { flash('没读到 DSH 的 provider 目录', 'err'); return; }
+  const managed = PROVIDERS.filter(p => !p.needsUserConfig).map(p => p.id);
+  const picked = window.prompt(
+    '输入要导入的 provider id（逗号分隔），可用的有：\n\n' + managed.join(', '), 'groq');
+  if (!picked) return;
+  const ids = picked.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
+  try {
+    const r = await api('provider-import', { method: 'POST', body: JSON.stringify({ ids }) });
+    const ok = (r.imported || []).join(', ');
+    const bad = (r.failed || []).join('; ');
+    flash((ok ? '已导入：' + ok : '没有导入任何 provider')
+          + (bad ? ' ｜ 失败：' + bad : ''), bad ? 'err' : '');
+    loadPackages();
+  } catch (e) { flash(e.message, 'err'); }
+}
+
+async function loadProviderCatalog() {
+  if (PROVIDERS.length) return;
+  try {
+    const d = await api('provider-catalog');
+    PROVIDERS = d.providers || [];
+  } catch (e) {
+    PROVIDERS = [];
+  }
+  fillPlanProviderPicker();
+}
+
+/* A plan points at a provider *package* that dsh-mu holds, not at a raw harness id, so
+   this list is built from PKGS: enabled packages first, disabled ones shown as such and
+   not selectable (a disabled provider must not be usable in a new plan). */
+function fillPlanProviderPicker() {
+  const pick = $('#providerPick');
+  if (!pick) return;
+  const use = (PKGS || []).filter(p => !p.disabled);
+  const off = (PKGS || []).filter(p => p.disabled);
+  const opt = p => `<option value="${esc(p.id)}">${esc(p.id)} · ${esc(p.label || '')}`
+    + `（${(p.models || 0)} 模型${p.origin === 'dsh' ? ' · DSH' : ''}）</option>`;
+  const offOpt = p => `<option value="${esc(p.id)}" disabled>${esc(p.id)}（已停用）</option>`;
+  pick.innerHTML = '<option value="">（选择 provider…）</option>'
+    + (use.length ? `<optgroup label="可用（${use.length}）">${use.map(opt).join('')}</optgroup>` : '')
+    + (off.length ? `<optgroup label="已停用（${off.length}）">${off.map(offOpt).join('')}</optgroup>` : '')
+    + '<option value="__custom">其它（手填 id）</option>';
+}
+
+function pickProvider(sel) {
+  const input = $('#providerInput');
+  if (!input) return;
+  if (sel.value === '__custom') { input.value = ''; input.focus(); providerHint(''); return; }
+  input.value = sel.value;
+  providerHint(sel.value);
+}
+
+function providerHint(id) {
+  const box = $('#providerHintText');
+  if (!box) return;
+  const want = String(id || '').trim();
+  const row = (PKGS || []).find(p => p.id === want);
+  if (!row) { box.textContent = PKGS.length ? '这个 id 还不是 dsh-mu 里的 provider，先导入它。' : ''; return; }
+  const bits = [`${row.models || 0} 个模型`, row.origin === 'dsh' ? '来自 DSH 目录（不可删除）' : '自建'];
+  if (row.disabled) bits.push('已停用');
+  if (row.base_url) bits.push(row.base_url);
+  box.textContent = bits.join(' · ');
+}
+
+function activityBadge(a) {
+  if (!a) return '<span class="muted">—</span>';
+  if (a.state === 'active') return '<span class="pill ok">会话开着</span>';
+  if (a.state === 'recent') return '<span class="pill warn">刚活动过</span>';
+  return '<span class="pill">空闲</span>';
+}
+
 // ------------------------------------------------------------------ overview
 async function loadOverview() {
   const d = await api('overview');
   $('#ver').textContent = `v${d.version}`;
   const c = d.counts, k = d.disk;
+  const hint = $('#usageHint');
+  if (hint) {
+    hint.innerHTML = (d.busy || 0) > 0
+      ? `<span class="pill warn">正在使用</span> ${d.busy} 个实例最近有对话活动 —— 要重启/升级请先看下面「正在使用」列`
+      : `<span class="pill ok">空闲</span> 所有实例最近都没有对话活动，可以放心重启/升级`;
+  }
   $('#ovCards').innerHTML = [
     ['用户', c.users], ['实例', c.instances], ['在跑（端口实测）', c.running], ['管理员', c.admins],
+    ['正在使用', d.busy || 0],
     ['磁盘可用', mb(k.free_mb)], ['模板', mb(k.template_mb)], ['日志', mb(k.logs_mb)],
     ['自检', `PASS ${d.doctor.summary.PASS || 0} / FAIL ${d.doctor.summary.FAIL || 0}`],
   ].map(([kk, v]) => `<div class="card"><div class="k">${kk}</div><div class="v">${esc(v)}</div></div>`).join('');
   const fail = d.doctor.failing.map(x => `<span class="pill bad">${esc(x)}</span>`).join(' ');
   const warn = d.doctor.warning.map(x => `<span class="pill warn">${esc(x)}</span>`).join(' ');
   $('#ovInstances').innerHTML = `${fail || warn ? `<div class="banner">自检项：${fail} ${warn}</div>` : ''}
-    <table><thead><tr><th>实例</th><th>用户</th><th>端口</th><th>状态</th><th>实测</th><th>cookie</th><th>provider</th><th>磁盘</th><th>操作</th></tr></thead>
+    <table><thead><tr><th>实例</th><th>用户</th><th>端口</th><th>状态</th>
+      <th>正在使用</th><th>最近活动</th><th>实测</th><th>cookie</th><th>provider</th><th>磁盘</th><th>操作</th></tr></thead>
     <tbody>${d.instances.map(i => `<tr>
       <td><b>${esc(i.name)}</b></td><td>${esc(i.user)}</td><td>${i.port}</td>
       <td><span class="pill ${i.state === 'running' ? 'ok' : 'bad'}">${esc(i.state)}</span></td>
+      <td>${activityBadge(i.activity)}</td>
+      <td class="muted">${esc(i.activity_age || '—')}</td>
       <td><span class="pill ${i.live ? 'ok' : 'bad'}">${i.live ? 'listening' : 'closed'}</span></td>
       <td>${i.cookie ? '✅' : '—'}</td><td>${esc(i.provider)}${i.provider_model ? `<div class="muted">${esc(i.provider_model)}</div>` : ''}</td>
       <td>${mb(i.disk_mb)}</td>
@@ -538,7 +715,7 @@ $('#userForm').addEventListener('submit', async (ev) => {
     closeCreate();
     ev.target.reset();
   } catch (e) { flash(e.message, 'err'); }
-  loadUsers(); loadOverview();
+  loadUsers(); loadOverview(); loadProviderCatalog();
 });
 
 // ------------------------------------------------------------------ instances
@@ -964,6 +1141,72 @@ window.filterPlugins = (pkg) => {
   loadPolicies();
 };
 
+let EXTS = [];
+
+async function loadExt() {
+  try {
+    const d = await api('ext');
+    EXTS = d.extensions || [];
+    $('#extRows').innerHTML = EXTS.length ? `<table><thead><tr>
+        <th>扩展</th><th>版本</th><th>说明</th><th style="width:110px">服务</th>
+        <th style="width:80px">端口</th><th>出网（白名单）</th><th style="width:230px">操作</th>
+      </tr></thead><tbody>${EXTS.map(e => `<tr>
+        <td><b>${esc(e.name)}</b>${e.registered ? '' : ' <span class="pill warn">未注册</span>'}</td>
+        <td>${esc(String(e.version || '-'))}</td>
+        <td class="muted">${esc(e.summary || '')}</td>
+        <td><span class="pill ${e.state === 'running' ? 'ok' : 'bad'}">${esc(e.state)}</span></td>
+        <td>${esc(String(e.port || '-'))}</td>
+        <td class="muted" style="font-size:12px">${esc((e.egress || []).join(', ') || 'deny-all')}</td>
+        <td>
+          ${e.admin_url ? `<button class="act" onclick="extOpen('${esc(e.name)}')">配置</button>` : ''}
+          <button class="act" onclick="extAction('${esc(e.name)}','${e.state === 'running' ? 'stop' : 'start'}')">${e.state === 'running' ? '停止' : '启动'}</button>
+          <button class="act" onclick="extAction('${esc(e.name)}','restart')">重启</button>
+        </td></tr>`).join('')}</tbody></table>`
+      : '<div class="muted">还没有扩展。扩展由 apk 安装（<code>dsh-mu-*-ext</code>），装好后点「重新扫描」。</div>';
+  } catch (e) {
+    $('#extRows').innerHTML = `<div class="msg err">读取失败：${esc(e.message)}</div>`;
+  }
+}
+
+window.extReload = async () => {
+  const msg = $('#extMsg');
+  if (msg) msg.textContent = '扫描中…';
+  try {
+    const r = await api('ext', { method: 'POST', body: JSON.stringify({ action: 'reload' }) });
+    if (msg) msg.textContent = `已注册：${(r.installed || []).join(', ') || '无'}` +
+      (Object.keys(r.skipped || {}).length ? `；跳过：${Object.keys(r.skipped).join(', ')}` : '');
+    loadExt();
+  } catch (e) {
+    if (msg) { msg.className = 'msg err'; msg.textContent = '失败：' + e.message; }
+  }
+};
+
+window.extAction = async (name, action) => {
+  try {
+    await api('ext', { method: 'POST', body: JSON.stringify({ action, name }) });
+    flash(`${name}: ${action} 完成`);
+    loadExt();
+  } catch (e) { flash('失败：' + e.message, 'err'); }
+};
+
+window.extOpen = (name) => {
+  const ext = EXTS.find(e => e.name === name);
+  if (!ext) return flash('没有这个扩展', 'err');
+  // The extension listens on the *server's* loopback: the browser must go through the
+  // gateway proxy (/ext/<name>/), never http://127.0.0.1:<port> directly.
+  const url = ext.proxy_path || `/ext/${name}/`;
+  openPanel(`${name} · 配置`, `
+    <div class="muted" style="font-size:12px;margin-bottom:8px">
+      这是扩展 ${name} 自带的页面，经网关 <code>${esc(url)}</code> 代理进来
+      （服务实际监听 <code>${esc(String(ext.port || '-'))}</code>，只在服务器回环上）。
+    </div>
+    <iframe src="${esc(url)}" style="width:100%;height:60vh;border:1px solid #232a35;border-radius:8px;background:#0f1218"></iframe>
+    <div class="muted" style="font-size:12px;margin-top:8px">
+      打不开？<code>dsh-muctl ext logs ${name}</code> 看日志，或点「重启」；
+      若返回 502，先确认 <code>dsh-muctl ext status ${name}</code> 里服务在跑。
+    </div>`);
+};
+
 async function loadPolicies() {
   const d = await api('plugin-policy');
   PLUGIN_STATE = { policy: d.policy || {}, assets: d.assets || {},
@@ -991,7 +1234,9 @@ async function loadPolicies() {
       <th style="width:70px">推送</th><th style="width:120px">实例</th>
       <th style="width:190px">操作</th></tr></thead>
     <tbody>${rows.map(({ spec, asset, name, row }) => `<tr>
-      <td><b>${esc(name)}</b>${asset.name ? '' : ' <span class="pill bad">缺少离线包</span>'}</td>
+      <td><b>${esc(name)}</b>${asset.managed_by
+          ? ` <span class="pill" title="由扩展包 ${esc(asset.managed_by)} 提供；升级请换扩展 apk">随扩展</span>`
+          : ''}${asset.name ? '' : ' <span class="pill bad">缺少离线包</span>'}</td>
       <td class="muted" style="font-size:12px">${esc(spec)}</td>
       <td>${esc(String(asset.version || '-'))}</td>
       <td><input type="checkbox" ${row.protected ? 'checked' : ''}
@@ -1006,10 +1251,12 @@ async function loadPolicies() {
           title="推送到已有实例；重启时也补齐"
           onchange="setPolicy('${esc(name)}','push',this.checked)"></td>
       <td>${pluginMatrixCell(name)}</td>
-      <td>
-        <button class="act" onclick="updatePlugin('${esc(spec)}')">更新</button>
-        <button class="act" onclick="removePlugin('${esc(name)}','${esc(spec)}',false)">移除策略</button>
-        <button class="act danger" onclick="removePlugin('${esc(name)}','${esc(spec)}',true)">移除并删包</button>
+      <td>${asset.managed_by
+        ? `<span class="muted" style="font-size:12px">由扩展 ${esc(asset.managed_by)} 管；
+             升级/删除请换扩展包</span>`
+        : `<button class="act" onclick="updatePlugin('${esc(spec)}')">更新</button>
+           <button class="act" onclick="removePlugin('${esc(name)}','${esc(spec)}',false)">移除策略</button>
+           <button class="act danger" onclick="removePlugin('${esc(name)}','${esc(spec)}',true)">移除并删包</button>`}
       </td></tr>`).join('')}</tbody></table>`
     : '<div class="muted">还没有插件。点「＋ 添加插件」填一个规格，系统会先下载再允许配置策略。</div>';
 
@@ -1036,16 +1283,19 @@ function renderPlugInst() {
 window.openPolicyAdd = () => {
   const lastProxy = localStorage.getItem('dshmu.pluginProxy') || '';
   openPanel('添加插件', `
-    <label style="display:block;margin-bottom:8px">规格
-      <input id="plSpec" style="width:100%"
+    <label style="display:block;margin-bottom:10px">规格
+      <input id="plSpec" style="width:100%;box-sizing:border-box;padding:8px 11px"
         placeholder="github:owner/repo[#ref] 或 npm 包名[@版本]"></label>
     <label style="display:block;margin-bottom:6px">下载代理（可选）
-      <input id="plProxy" style="width:100%" value="${esc(lastProxy)}"
-        placeholder="http://127.0.0.1:7890"></label>
+      <input id="plProxy" style="width:100%;box-sizing:border-box;padding:8px 11px"
+        value="${esc(lastProxy)}"
+        placeholder="http://127.0.0.1:7890 / socks5h://host:1080"></label>
     <div class="muted" style="font-size:12px">
       支持 npm 包名（<code>@scope/name</code>）、<code>github:owner/repo</code>（可带 <code>#ref</code>）。
       点「下载并添加」会先在宿主下载一次并解析出真实包名与版本；失败不会产生任何行 ✓。<br>
-      代理留空则直连（也可以用 <code>dsh-muctl config download_proxy</code> 设默认 ✓）。
+      代理留空则直连（也可以用 <code>dsh-muctl config download_proxy</code> 设默认 ✓）。<br>
+      支持 http / https / socks5 / socks5h ✓；<code>socks5://</code> 握手失败时会**自动再试
+      <code>socks5h://</code>** ✓，镜像不通会自动回退官方 registry ✓。
     </div>
     <div class="msg" id="plMsg"></div>`, '下载并添加', async () => {
     const spec = ($('#plSpec').value || '').trim();
@@ -1301,18 +1551,101 @@ async function loadPackages() {
     PKGS = d.packages;
     $('#pkgTable').innerHTML = PKGS.length ? `<table><thead><tr><th>id</th><th>名称</th><th>模型</th><th>协议</th><th>发现</th><th>配额</th><th>操作</th></tr></thead>
       <tbody>${PKGS.map(p => `<tr>
-        <td><b>${esc(p.id)}</b></td><td>${esc(p.label)}</td><td>${p.models}</td>
+        <td><b>${esc(p.id)}</b>${p.origin === 'dsh'
+              ? '<span class="pill" style="margin-left:6px">DSH</span>' : ''}${
+              p.disabled ? '<span class="pill warn" style="margin-left:6px">已停用</span>' : ''}</td>
+        <td>${esc(p.label)}${(p.needs_params || []).length
+              ? `<div class="muted" style="font-size:11px">待填参数：${esc((p.needs_params || []).join(', '))}</div>` : ''}</td>
+        <td>${p.models}</td>
         <td class="muted">${esc((p.apis || []).join(', '))}</td>
         <td>${p.discover ? '<span class="pill ok">有</span>' : '<span class="muted">-</span>'}</td>
         <td>${p.usage ? '<span class="pill ok">有</span>' : '<span class="muted">-</span>'}</td>
         <td><button class="act" onclick="exportPackage('${p.id}')">导出</button>
             <button class="act" onclick="downloadPackage('${p.id}')">下载</button>
-            <button class="act danger" onclick="deletePackage('${p.id}')">删除</button></td></tr>`).join('')}</tbody></table>`
+            <button class="act" onclick="togglePackage('${p.id}', ${p.disabled ? 'false' : 'true'})">${p.disabled ? '启用' : '停用'}</button>
+            ${p.origin === 'dsh' ? '' : `<button class="act danger" onclick="deletePackage('${p.id}')">删除</button>`}</td></tr>`).join('')}</tbody></table>`
       : '<div class="muted">还没有导入任何 provider 配置文件。</div>';
     $('#planTable').innerHTML = '';
+    fillPlanProviderPicker();
     await loadPlans();
   } catch (e) { flash(e.message, 'err'); }
 }
+let MY = { plans: [], providers: [], native_only: [] };
+
+async function loadMyModels() {
+  try {
+    const d = await api('me/plans');
+    MY = { plans: d.plans || [], providers: d.providers || [], native_only: d.native_only || [] };
+  } catch (e) {
+    MY = { plans: [], providers: [], native_only: [] };
+    const admin = String(e.message || '').includes('acting user');
+    const form = $('#myForm');
+    if (form) form.style.display = admin ? 'none' : '';
+    const hint = $('#myHint');
+    if (admin) {
+      hint.textContent = '这一页是给平台用户填自己 key 的 ✓ 管理员账号没有"个人套餐" ✓ '
+        + '平台统一配置请用「模型接入」；想试用本页，请用普通用户登录 ✓。';
+      $('#myTable').innerHTML = '';
+      return;
+    }
+    hint.textContent = e.message;
+  }
+  const sel = $('#myProvider');
+  if (sel) {
+    sel.innerHTML = MY.providers.length
+      ? MY.providers.map(p => `<option value="${esc(p.id)}">${esc(p.id)} · ${esc(p.label || '')}（${(p.models || []).length} 模型${p.origin === 'dsh' ? ' · DSH' : ''}）</option>`).join('')
+      : '<option value="">（管理员还没有导入任何可托管的 provider）</option>';
+    const chosen = MY.providers.find(p => p.id === sel.value);
+    myHintFor(chosen);
+  }
+  const mine = MY.plans.filter(p => p.own);
+  $('#myTable').innerHTML = mine.length ? `<table><thead><tr><th>套餐</th><th>provider</th><th>key</th><th>模型</th><th>操作</th></tr></thead>
+    <tbody>${mine.map(p => `<tr>
+      <td><b>${esc(p.name)}</b><div class="muted">${esc(p.id)}</div></td>
+      <td>${esc(p.provider)}</td>
+      <td>${p.has_key ? '<span class="pill ok">有</span>' : '<span class="pill warn">缺</span>'}</td>
+      <td class="muted">${(p.effective_models || []).length} 个</td>
+      <td><button class="act" onclick="myProbe('${p.id}')">检测可用模型</button>
+          <button class="act danger" onclick="myDelete('${p.id}','${esc(p.name)}')">删除</button></td></tr>`).join('')}</tbody></table>`
+    : '<div class="muted">还没有你自己的套餐。</div>';
+  if (MY.native_only.length && $('#myNative')) {
+    $('#myNative').innerHTML = '需要用 DSH 原生页面配置的 provider：<b>'
+      + MY.native_only.map(esc).join('、') + '</b> —— 它们只能靠 OAuth 会话，平台无法代持凭据 ✓。'
+      + '请在你自己的 DSH 实例里「设置 → 模型」直接登录/填写 ✓。';
+  }
+}
+
+function myHintFor(p) {
+  const box = $('#myHint');
+  if (!box) return;
+  box.textContent = p
+    ? `将创建一个只对你自己可见的套餐；key 由平台保存（0600），实例里只有占位 ✓。`
+    : '';
+}
+
+function myAddPlan() {
+  const name = ($('#myName').value || '').trim();
+  const provider = $('#myProvider').value;
+  const key = $('#myKey').value || '';
+  if (!name || !provider || !key) { flash('套餐名、provider、key 都要填', 'err'); return; }
+  api('me/plans', { method: 'POST', body: JSON.stringify({ action: 'add', name, provider, key }) })
+    .then(() => { flash('已保存：' + name + '（重启你的实例后生效）'); $('#myKey').value = ''; loadMyModels(); })
+    .catch(e => flash(e.message, 'err'));
+}
+
+function myProbe(id) {
+  api('me/plans', { method: 'POST', body: JSON.stringify({ action: 'probe', id }) })
+    .then(r => { flash(`可用模型 ${(r.available || []).length} 个（新增 ${(r.added || []).length}）`); loadMyModels(); })
+    .catch(e => flash(e.message, 'err'));
+}
+
+function myDelete(id, name) {
+  if (!confirm(`删除套餐「${name}」？`)) return;
+  api('me/plans', { method: 'POST', body: JSON.stringify({ action: 'delete', id }) })
+    .then(() => { flash('已删除'); loadMyModels(); })
+    .catch(e => flash(e.message, 'err'));
+}
+
 async function loadPlans() {
   try {
     const d = await api('plans');
@@ -1324,7 +1657,7 @@ async function loadPlans() {
         ? `${sp.name}（${sp.id}${sp.order == null ? '' : `，顺序 ${sp.order}`}${sp.hidden ? '，隐藏' : ''}）`
         : '没有可用于搜索的套餐（需要一个 api.deepseek.com 的 anthropic-messages 套餐）';
     }
-    $('#planTable').innerHTML = PLANS.length ? `<table><thead><tr><th>顺序</th><th>套餐</th><th>provider</th><th>范围</th><th>key</th><th>模型</th><th>状态</th><th>操作</th></tr></thead>
+    $('#planTable').innerHTML = PLANS.length ? `<table><thead><tr><th>顺序</th><th>套餐</th><th>provider</th><th>范围</th><th>来源</th><th>key</th><th>模型</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>${PLANS.map((p, idx) => `<tr style="${p.hidden ? 'opacity:.6' : ''}">
         <td class="muted" style="white-space:nowrap">${p.order == null ? '—' : p.order}
           <button class="act" title="上移" onclick="planMove('${p.id}',-1)" ${idx === 0 ? 'disabled' : ''}>↑</button>
@@ -1332,6 +1665,7 @@ async function loadPlans() {
         <td><b>${esc(p.name)}</b>${p.id === PLAN_DEFAULT ? ' <span class="pill ok">默认</span>' : ''}${p.hidden ? ' <span class="pill warn" title="用户看不到；平台仍可用它做 web_search">隐藏</span>' : ''}<div class="muted">${esc(p.id)}</div></td>
         <td>${esc(p.provider)}</td>
         <td>${planScopeLabel(p)}</td>
+        <td>${p.owner && p.owner !== '*' ? '<span class="pill">用户自建</span>' : '<span class="muted">管理员</span>'}</td>
         <td>${p.has_key ? '<span class="pill ok">有</span>' : '<span class="pill warn">缺</span>'}</td>
         <td>${planModelCell(p)}</td>
         <td>${p.enabled ? '<span class="pill ok">on</span>' : '<span class="pill warn">off</span>'}</td>
@@ -1392,7 +1726,15 @@ function ensureAdminModal() {
   if (!m.dataset.wired) {
     m.dataset.wired = '1';
     m.querySelector('#am-close').onclick = () => closeCreate();
-    m.onclick = (e) => { if (e.target === m) closeCreate(); };
+    // Closing on a plain backdrop click is convenient, but a text selection that starts
+    // inside an input and ends on the backdrop also fires click here -- which made the
+    // dialog vanish while selecting text. Require the press to start on the backdrop.
+    let pressedBackdrop = false;
+    m.addEventListener('mousedown', (e) => { pressedBackdrop = (e.target === m); });
+    m.onclick = (e) => {
+      if (e.target === m && pressedBackdrop) closeCreate();
+      pressedBackdrop = false;
+    };
   }
   return m;
 }
@@ -1854,11 +2196,11 @@ window.changeOwnPassword = async () => {
 boot().catch(e => flash(`初始化失败：${e.message}（${e.status || ''}）`, 'err'));
 </script>
 <div id="admin-modal" style="position:fixed;inset:0;background:rgba(8,10,14,.66);display:none;align-items:center;justify-content:center;z-index:2147483647">
-  <div class="modal-card" style="background:#151a22;border:1px solid #2b3240;border-radius:12px;max-width:760px;width:94vw;max-height:86vh;display:flex;flex-direction:column;color:#e6e8eb">
-    <div style="padding:14px 16px;border-bottom:1px solid #232a35;display:flex;justify-content:space-between;align-items:center">
+  <div class="modal-card" style="background:#151a22;border:1px solid #2b3240;border-radius:12px;max-width:820px;width:94vw;max-height:86vh;display:flex;flex-direction:column;color:#e6e8eb">
+    <div style="padding:14px 24px;border-bottom:1px solid #232a35;display:flex;justify-content:space-between;align-items:center">
       <b id="am-title">模型</b><button class="act" id="am-close">关闭</button></div>
-    <div id="am-body" style="padding:12px 16px;overflow:auto"></div>
-    <div style="padding:12px 16px;border-top:1px solid #232a35;display:flex;gap:8px;justify-content:flex-end">
+    <div id="am-body" style="padding:16px 24px;overflow:auto"></div>
+    <div style="padding:12px 24px;border-top:1px solid #232a35;display:flex;gap:8px;justify-content:flex-end">
       <button class="act" id="am-all">全选可用</button><button class="act" id="am-none">全不选</button>
       <button class="btn primary" id="am-save">保存</button></div>
   </div>

@@ -1,0 +1,10 @@
+{
+  "name": "ssh",
+  "version": "0.1.0",
+  "summary": "SSH 资源代理（参考示例扩展）",
+  "requires": { "dsh-mu": ">=0.32", "jail-api": 1 },
+  "service": { "port": 8790, "entry": "/opt/ext/p/broker.py", "health": "/health" },
+  "net": { "egress": ["127.0.0.1/32"] },
+  "admin": { "tab": "SSH", "url": "http://127.0.0.1:8790/admin" },
+  "cgroup": { "cpu": "1", "memory": "512M", "pids": 256 }
+}
