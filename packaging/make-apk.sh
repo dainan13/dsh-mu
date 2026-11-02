@@ -113,6 +113,8 @@ build_unsigned() {
 		install_file 0644 "$f" "/usr/local/lib/dsh-mu/nginx/$(basename "$f")"
 	done
 	install_file 0644 "$SRC/admin/index.html" /usr/local/lib/dsh-mu/admin/index.html
+	# Operator tools that are not part of the running platform.
+	install_file 0755 "$SRC/tools/purge-dsh-mu.sh" /usr/local/lib/dsh-mu/tools/purge-dsh-mu.sh
 	# Bundled client plugins (preinstalled into every instance by `dsh-muctl sync`).
 	if [ -d "$SRC/plugins" ]; then
 		for plug in "$SRC"/plugins/*/; do

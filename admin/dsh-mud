@@ -984,9 +984,11 @@ class Handler(BaseHTTPRequestHandler):
                                  "unusable": res.get("unusable") or [],
                                  "unknown": res.get("unknown") or []}
                 mu.sync_all(st)
+                bounced = mu.restart_instances_for_plan(st, plan)
                 return 200, {"ok": True, "id": pid, "models": res["models"],
-                             "count": res["count"],
-                             "note": "restart your instance to apply"}
+                             "count": res["count"], "restarted": bounced,
+                             "note": ("restarted " + ", ".join(bounced)) if bounced
+                                     else "nothing running; the next start uses it"}
             if action == "probe":
                 res = mu.plan_probe_models(plan)
                 if not res.get("ok"):

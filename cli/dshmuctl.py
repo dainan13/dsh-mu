@@ -998,6 +998,15 @@ name="dsh-mu cgroup delegation"
 description="Make /sys/fs/cgroup/dsh-mu usable for per-instance resource limits"
 
 # One-shot service: OpenRC must not treat the immediate exit as a daemon crash.
+#
+# It must run *after* the cgroup2 mount exists: on a container the mount can appear
+# later than the boot runlevel's first pass, and running early used to leave
+# /sys/fs/cgroup/dsh-mu missing entirely (the script bailed out silently).
+depend() {
+	need localmount
+	after localmount
+}
+
 start() {
 	ebegin "Delegating cgroup v2 controllers to /sys/fs/cgroup/dsh-mu"
 	@CGROUP_INIT@
@@ -2665,6 +2674,30 @@ def stop_instance(st: dict, name: str, mark: bool = True):
         st["instances"][name]["state"] = "stopped"
         save_state(st)
         render_gateway(st)
+
+
+def restart_instances_for_plan(st: dict, plan: dict) -> list[str]:
+    """Restart the running instances whose patch a plan change just rewrote.
+
+    An instance reads its model list at boot, so editing a plan's models only takes
+    effect after a restart -- the admin surface used to save and stop there, which left
+    the running harness offering the previous set. Callers use this to make the change
+    take effect in one action, and report which instances bounced.
+    """
+    owner = str(plan.get("owner") or plan.get("user") or "").strip()
+    visible = {str(v) for v in (plan.get("visible_to") or [])}
+    bounced: list[str] = []
+    for name, inst in sorted((st.get("instances") or {}).items()):
+        user = str(inst.get("user") or name)
+        if owner and owner not in ("*", user) and user not in visible:
+            continue
+        if str(inst.get("state") or "") != "running":
+            continue
+        with contextlib.suppress(Exception):
+            stop_instance(st, name, mark=False)
+            start_instance(st, name, timeout=180)
+            bounced.append(name)
+    return bounced
 
 
 def instance_status(name: str) -> str:
@@ -4472,6 +4505,51 @@ def cmd_instance_status(args):
 def cmd_instance_list(args):
     """`instance list` is what people type; it is `status` without names."""
     return cmd_instance_status(argparse.Namespace(names=[], json=getattr(args, "json", False)))
+
+
+def cmd_instance_rebuild(args):
+    """Recreate an instance's jail rootfs from the current template, keeping its data.
+
+    A restored backup carries records plus `home`/`workspace` but no rootfs (it is ~190
+    MB of rebuildable system image), so an instance that came back from a backup cannot
+    start until its rootfs is materialised again. This does exactly that and nothing
+    else: copy the template over `rootfs`, re-inject the jail user, re-render the
+    service/config/patch and re-apply the recorded owner.
+    """
+    ensure_root()
+    st = load_state()
+    name = args.name
+    inst = st["instances"].get(name) or die(f"no such instance: {name}")
+    if not os.path.isdir(TEMPLATE):
+        die(f"template missing ({TEMPLATE}); run: dsh-muctl install")
+    base = f"{INSTANCES_DIR}/{name}"
+    rootfs = f"{base}/rootfs"
+    was_running = str(inst.get("state") or "") == "running"
+    info(f"rebuilding {name}: copying template -> {rootfs}")
+    if was_running:
+        stop_instance(st, name, mark=False)
+    if os.path.exists(rootfs):
+        shutil.rmtree(rootfs)
+    run(["cp", "-a", TEMPLATE, rootfs], check=True)
+    uid = int(inst.get("uid", 0))
+    with contextlib.suppress(Exception):
+        inject_jail_user(rootfs, uid, uid)
+    for volume in ("home", "workspace"):
+        os.makedirs(f"{base}/{volume}", exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chown(f"{base}/{volume}", uid, uid)
+    with contextlib.suppress(Exception):
+        render_service(st, name)
+    with contextlib.suppress(Exception):
+        sync_instance_plans(st, name)
+    with contextlib.suppress(Exception):
+        ensure_owner(name)
+    if was_running:
+        start_instance(st, name)
+        info(f"{name}: rebuilt and started")
+    else:
+        info(f"{name}: rebuilt (instance was stopped)")
+    return 0
 
 
 def cmd_instance_del(args):
@@ -7830,6 +7908,31 @@ BACKUP_FORMAT = 1
 BACKUP_MANIFEST = "MANIFEST.json"
 
 
+BACKUP_SKIP: set[str] = set()
+
+
+def backup_groups() -> dict[str, list[str]]:
+    """Backup members grouped by what an operator may want to leave out.
+
+    Grouping exists because the useful questions are "keep my users and settings, but
+    not the providers and plans of the old box" -- not "give me a list of paths". The
+    CLI filters these with --except/--only.
+    """
+    return {
+        "state": [f"{ETC}/state.json"],
+        "config": [f"{ETC}/dsh-mu.conf", f"{ETC}/dsh-mu.conf.default"],
+        "secrets": [f"{ETC}/admin.token", f"{ETC}/secret.key",
+                    f"{ETC}/providers.json"],
+        "gateway": [f"{GW_DIR}/{name}" for name in
+                    ("users.json", "upstreams.json", "config.json")],
+        # The platform's own provider packages and plans live outside /etc; leaving them
+        # out of a backup lost them silently, which is why they are first-class here.
+        "providers": [f"{PROVIDERS_DIR}", f"{ETC}/providers.json"],
+        "plans": [f"{PLANS_DIR}"],
+        "tls": [f"{ETC}/tls"],
+    }
+
+
 def backup_members(with_instances: bool = False) -> list[str]:
     """Paths (relative to /) that make up a platform backup.
 
@@ -7839,9 +7942,12 @@ def backup_members(with_instances: bool = False) -> list[str]:
     def rel(path: str) -> str:
         return os.path.relpath(path, "/")
 
-    members = [rel(f"{ETC}/{name}") for name in
-               ("state.json", "dsh-mu.conf", "dsh-mu.conf.default", "providers.json",
-                "admin.token", "secret.key")]
+    groups = backup_groups()
+    members = []
+    for group, paths in groups.items():
+        if group in BACKUP_SKIP:
+            continue
+        members += [rel(p) for p in paths]
     members += [rel(f"{GW_DIR}/{name}") for name in
                 ("users.json", "upstreams.json", "config.json")]
     if with_instances:
@@ -7857,10 +7963,30 @@ def backup_members(with_instances: bool = False) -> list[str]:
     return members
 
 
-def create_backup(out: str, with_instances: bool = False) -> dict:
+def selected_backup_groups(except_groups: str = "", only_groups: str = "") -> set[str]:
+    """Resolve --except/--only into the set of groups to skip."""
+    known = set(backup_groups())
+    def split(value: str) -> set[str]:
+        return {item.strip() for item in str(value or "").split(",") if item.strip()}
+    wanted, unwanted = split(only_groups), split(except_groups)
+    for name in wanted | unwanted:
+        if name not in known:
+            die(f"unknown backup group: {name} (have: {', '.join(sorted(known))})")
+    if wanted:
+        return known - wanted
+    return unwanted
+
+
+def create_backup(out: str, with_instances: bool = False,
+                  skip_groups: set[str] | None = None) -> dict:
     """Write a tar.gz with the platform records (optionally instance homes)."""
     st = load_state()
-    members = [m for m in backup_members(with_instances) if os.path.exists(f"/{m}")]
+    global BACKUP_SKIP
+    BACKUP_SKIP = set(skip_groups or ())
+    try:
+        members = [m for m in backup_members(with_instances) if os.path.exists(f"/{m}")]
+    finally:
+        BACKUP_SKIP = set()
     manifest = {
         "format": BACKUP_FORMAT,
         "created": int(time.time()),
@@ -7965,7 +8091,41 @@ def restore_plan(path: str) -> dict:
     }
 
 
-def apply_restore(path: str, plan: dict) -> dict:
+def member_group(rel_path: str) -> str:
+    """Which backup group a member belongs to (instance volumes fall back to `instances`)."""
+    rel_path = rel_path.strip("/")
+    for group, paths in backup_groups().items():
+        for path in paths:
+            if rel_path == path.strip("/") or rel_path.startswith(path.strip("/") + "/"):
+                return group
+    return "instances"
+
+
+def apply_restore(path: str, plan: dict, skip_groups: set[str] | None = None) -> dict:
+    """Restore the archive, optionally leaving whole groups of it untouched."""
+    skip_groups = set(skip_groups or ())
+    if skip_groups:
+        listed = run(["tar", "tzf", path], check=False, capture=True)
+        if listed.returncode == 0:
+            keep = [m for m in (listed.stdout or "").splitlines()
+                    if m.strip() and not m.endswith("/")
+                    and member_group(m) not in skip_groups]
+            if not keep:
+                die("nothing left to restore after --except/--only")
+            safety = f"{ETC}.bak-{time.strftime('%Y%m%d-%H%M%S')}.tgz"
+            with contextlib.suppress(OSError):
+                create_backup(safety, with_instances=False)
+            res = run(["tar", "xzf", path, "-C", "/"] + keep, check=False, capture=True)
+            if res.returncode != 0:
+                die(f"restore failed while unpacking: {(res.stderr or '').strip()[:300]}")
+            st = load_state()
+            save_config(st["config"])
+            sync_all(st)
+            return {"path": path, "members": len(keep), "skipped_groups": sorted(skip_groups)}
+    return _apply_restore_all(path, plan)
+
+
+def _apply_restore_all(path: str, plan: dict) -> dict:
     """Replace /etc/dsh-mu with the archive's copy (after backing up the current one)."""
     safety = f"{ETC}.bak-{time.strftime('%Y%m%d-%H%M%S')}.tgz"
     with contextlib.suppress(OSError):
@@ -8004,7 +8164,10 @@ def apply_restore(path: str, plan: dict) -> dict:
 def cmd_backup(args):
     ensure_root()
     out = args.out or f"/var/backups/dsh-mu-{time.strftime('%Y%m%d-%H%M%S')}.tgz"
-    manifest = create_backup(out, with_instances=args.with_instances)
+    manifest = create_backup(out, with_instances=args.with_instances,
+                             skip_groups=selected_backup_groups(
+                                 getattr(args, "except_groups", ""),
+                                 getattr(args, "only_groups", "")))
     if args.json:
         print(json.dumps(manifest, indent=2, sort_keys=True))
     else:
@@ -8046,7 +8209,10 @@ def cmd_restore(args):
     if not args.force:
         die("refusing to overwrite the live platform without --force "
             "(re-run with --force; the current state is backed up first)")
-    result = apply_restore(args.file, plan)
+    result = apply_restore(args.file, plan,
+                           skip_groups=selected_backup_groups(
+                               getattr(args, "except_groups", ""),
+                               getattr(args, "only_groups", "")))
     info(f"restored {result['restored']}; previous state saved to {result['safety_backup']}")
     info("gateway views re-rendered; run `dsh-muctl doctor` and restart instances if needed")
     return 0
@@ -9591,7 +9757,10 @@ def sync_instance_plans(st: dict, name: str) -> dict:
         # No visible plans: still write the sandbox patch (the instance needs it),
         # and drop only the plan refs, never the rest of the credential store.
         os.makedirs(os.path.dirname(patch_path), exist_ok=True)
-        atomic_write(patch_path, SANDBOX_PATCH + "\n", mode=0o644)
+        # A plan-less instance still gets a *valid* overlay: DSH rejects an empty file
+        # ("must be a top-level YAML array"), which used to make every instance of a plan
+        # -less user fail to start (the exact shape of a "restore without plans").
+        atomic_write(patch_path, (SANDBOX_PATCH or "[]") + "\n", mode=0o644)
         with contextlib.suppress(OSError):
             os.chown(patch_path, int(inst.get("uid", 0)), int(inst.get("uid", 0)))
         cred_path = f"{INSTANCES_DIR}/{name}/home/.dsh/.credentials.yaml"
@@ -11845,6 +12014,11 @@ def doctor_checks(st: dict) -> list[dict]:
     else:
         add("HTTPS", DOCTOR_PASS, "disabled (http only)")
 
+    tree_here = os.path.isdir("/sys/fs/cgroup/dsh-mu")
+    add("instance cgroup tree", DOCTOR_PASS if tree_here else DOCTOR_FAIL,
+        "/sys/fs/cgroup/dsh-mu" if tree_here else
+        "missing; run: rc-service dsh-mu-cgroup restart   "
+        "(it creates the tree even when delegation is refused)")
     add("cgroup v2 mounted", DOCTOR_PASS if os.path.exists("/sys/fs/cgroup/cgroup.controllers") else DOCTOR_FAIL,
         "/sys/fs/cgroup", "" if os.path.exists("/sys/fs/cgroup/cgroup.controllers") else "cgroup v2 required")
     controllers = (read_text("/sys/fs/cgroup/cgroup.controllers") or "").split()
@@ -12312,6 +12486,9 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("name")
     a.add_argument("--purge", action="store_true")
     a.set_defaults(func=cmd_instance_del)
+    a = isub.add_parser("rebuild", help="recreate an instance's jail rootfs, keeping its data")
+    a.add_argument("name")
+    a.set_defaults(func=cmd_instance_rebuild)
     a = isub.add_parser("logs")
     a.add_argument("name")
     a.add_argument("-n", "--lines", type=int, default=100)
@@ -12520,12 +12697,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", help="output file (default /var/backups/dsh-mu-<ts>.tgz)")
     sp.add_argument("--with-instances", dest="with_instances", action="store_true",
                     help="also archive each instance's home directory")
+    sp.add_argument("--except", dest="except_groups", default="",
+                    help="comma separated groups to leave out "
+                         "(state,config,secrets,gateway,providers,plans,tls)")
+    sp.add_argument("--only", dest="only_groups", default="",
+                    help="comma separated groups to keep; everything else is left out")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_backup)
     sp = sub.add_parser("restore", help="restore a platform backup")
     sp.add_argument("file")
     sp.add_argument("--dry-run", dest="dry_run", action="store_true", help="show the plan only")
     sp.add_argument("--force", action="store_true", help="actually overwrite the live platform")
+    sp.add_argument("--except", dest="except_groups", default="",
+                    help="comma separated groups to skip while restoring "
+                         "(state,config,secrets,gateway,providers,plans,tls)")
+    sp.add_argument("--only", dest="only_groups", default="",
+                    help="comma separated groups to restore; everything else is skipped")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_restore)
     sp = sub.add_parser("logs", help="platform log maintenance")

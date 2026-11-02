@@ -13,9 +13,38 @@ CG=/sys/fs/cgroup
 HOLD="$CG/init"
 TREE="$CG/dsh-mu"
 CONTROLLERS="cpu memory pids io"
+LOG=/var/log/dsh-mu/cgroup.log
+
+# One line per boot, always: a customer machine that comes back after a reboot with
+# FAILing cgroup checks used to leave no trace at all, because the script exited 0
+# before it could create anything. This records what the boot-time run actually saw.
+log() {
+	mkdir -p /var/log/dsh-mu 2>/dev/null || true
+	printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >>"$LOG" 2>/dev/null || true
+}
+
+log "start mount=$(test -f "$CG/cgroup.controllers" && echo cgroup2 || echo none) controllers=[$(cat "$CG/cgroup.controllers" 2>/dev/null | tr -d '\n')]"
+
+# The mount is not guaranteed: a container may come up before cgroup2 is mounted, or
+# with a hybrid layout. Try once here (idempotent) so the tree below always exists.
+if [ ! -f "$CG/cgroup.controllers" ]; then
+	mount -t cgroup2 none "$CG" 2>/dev/null || true
+	if [ ! -f "$CG/cgroup.controllers" ]; then
+		echo "dsh-mu-cgroup: cgroup2 is not mounted on $CG; creating the tree without delegation" >&2
+		mkdir -p "$TREE" 2>/dev/null || true
+		log "no-cgroup2 tree=$(test -d "$TREE" && echo created || echo failed)"
+		exit 0
+	fi
+fi
+
+# Instances need the tree whether or not delegation works, so create it before the
+# writability guard: on a host where the root cgroup stays busy the limits are lost,
+# but the jail can still start and `doctor` points at the delegation row.
+mkdir -p "$TREE"
 
 [ -w "$CG/cgroup.subtree_control" ] || {
-	echo "dsh-mu-cgroup: $CG/cgroup.subtree_control not writable; resource limits unavailable" >&2
+	echo "dsh-mu-cgroup: $CG/cgroup.subtree_control not writable; resource limits unavailable (tree created)" >&2
+	log "not-writable tree=$(test -d "$TREE" && echo created || echo failed) delegated=[$(cat "$TREE/cgroup.subtree_control" 2>/dev/null | tr -d '\n')]"
 	exit 0
 }
 
@@ -45,9 +74,9 @@ if [ "$needs_drain" = 1 ]; then
 	done
 fi
 
-mkdir -p "$TREE"
 for c in $available; do
 	grep -qw "$c" "$TREE/cgroup.subtree_control" 2>/dev/null || printf '+%s' "$c" > "$TREE/cgroup.subtree_control" 2>/dev/null || true
 done
 
 echo "dsh-mu-cgroup: root=[$(cat "$CG/cgroup.subtree_control" 2>/dev/null)] tree=[$(cat "$TREE/cgroup.subtree_control" 2>/dev/null)]"
+log "done root=[$(cat "$CG/cgroup.subtree_control" 2>/dev/null | tr -d '\n')] tree=[$(cat "$TREE/cgroup.subtree_control" 2>/dev/null | tr -d '\n')] limits=$(test -w "$TREE/memory.max" && echo yes || echo no)"
