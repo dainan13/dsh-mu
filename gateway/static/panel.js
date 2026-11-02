@@ -1,6 +1,6 @@
 /* dsh-mu user panel - injected into every proxied harness page.
  *
- * A chibi character peeks out of the left edge; clicking it slides open a drawer
+ * F2 opens this panel: a centred window over the conversation
  * with the account, the instance, a password form and the logout button. It is
  * rendered inside a shadow root so the harness stylesheet cannot touch it and it
  * cannot leak styles into the harness.
@@ -24,21 +24,6 @@
   :host { all: initial; }
   * { box-sizing: border-box; }
   .wrap { font: 13px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans SC",sans-serif; color: #e6e8eb; }
-  /* ---- peeking character on the left edge ---- */
-  .peek {
-    position: fixed; left: 0; top: 50%; transform: translate(-24px, -50%);
-    width: 35px; height: 76px; padding: 0; border: 0; background: transparent;
-    cursor: pointer; pointer-events: auto; transition: transform .22s ease;
-  }
-  .peek:hover, .peek:focus-visible { transform: translate(0, -50%); outline: none; }
-  .peek img { display: block; width: 35px; height: 76px; image-rendering: auto; }
-  .peek .tip {
-    position: absolute; left: 100%; top: 50%; transform: translate(-6px, -50%);
-    white-space: nowrap; padding: 4px 9px; border-radius: 8px; font-size: 12px;
-    background: rgba(23,26,33,.94); border: 1px solid #2b3240; color: #c9d1d9;
-    opacity: 0; transition: opacity .15s; pointer-events: none;
-  }
-  .peek:hover .tip { opacity: 1; }
   /* ---- drawer ---- */
   .scrim {
     position: fixed; inset: 0; z-index: 40;
@@ -46,13 +31,18 @@
     opacity: 0; pointer-events: none; transition: opacity .18s;
   }
   .scrim.open { opacity: 1; pointer-events: auto; }
+  /* A centred window, not a side drawer: F2 toggles it, and it reads as one panel
+     over the conversation instead of something docked to the edge. */
   .drawer {
-    position: fixed; left: 0; top: 0; bottom: 0; z-index: 50; width: 328px; max-width: 92vw;
-    background: #14171d; border-right: 1px solid #262b36; padding: 18px 18px 16px;
-    transform: translateX(-102%); transition: transform .22s ease; overflow-y: auto;
-    pointer-events: auto;
+    position: fixed; left: 50%; top: 50%; z-index: 50;
+    width: min(880px, 92vw); max-height: 86vh;
+    background: #14171d; border: 1px solid #262b36; border-radius: 14px;
+    padding: 18px 18px 16px; overflow-y: auto; pointer-events: auto;
+    box-shadow: 0 24px 64px rgba(0, 0, 0, .45);
+    transform: translate(-50%, -46%) scale(.98); opacity: 0; visibility: hidden;
+    transition: transform .18s ease, opacity .18s ease, visibility .18s;
   }
-  .drawer.open { transform: translateX(0); }
+  .drawer.open { transform: translate(-50%, -50%) scale(1); opacity: 1; visibility: visible; }
   .plan { display: flex; align-items: center; gap: 8px; padding: 6px 0;
           border-bottom: 1px solid #1d222c; }
   .plan:last-child { border-bottom: 0; }
@@ -157,10 +147,7 @@
 </style>
 <div class="wrap">
   <div class="scrim" id="scrim"></div>
-  <button class="peek" id="peek" title="账户 / 实例" aria-label="账户与实例面板">
-    <img src="/mu-static/icon.png" alt="">
-    <span class="tip">账户 / 实例</span>
-  </button>
+
   <aside class="drawer" id="drawer" role="dialog" aria-label="账户与实例">
     <button class="close" id="close" aria-label="关闭">×</button>
 
@@ -660,10 +647,14 @@
     }
   }
 
-  $("peek").addEventListener("click", () => setOpen(!state.open));
   $("close").addEventListener("click", () => setOpen(false));
   $("scrim").addEventListener("click", () => setOpen(false));
   document.addEventListener("keydown", (ev) => {
+    if (ev.key === "F2" && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+      ev.preventDefault();
+      setOpen(!state.open);
+      return;
+    }
     if (ev.key !== "Escape") return;
     const el = dq("dsh-mu-modal");
     if (el && el.style.display !== "none") { closeModal(); return; }
