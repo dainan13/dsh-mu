@@ -227,6 +227,11 @@ details{margin-top:10px}summary{cursor:pointer;color:var(--dim);font-size:13px}
         <option value="300" selected>300 行</option>
         <option value="1000">1000 行</option>
       </select></label>
+      <label style="flex:0 0 190px">来源<select id="logStream">
+        <option value="both" selected>标准输出 + 标准错误</option>
+        <option value="stdout">只看标准输出</option>
+        <option value="stderr">只看标准错误（报错在这里）</option>
+      </select></label>
       <label class="inline"><input type="checkbox" id="logLive"> 实时刷新（2 秒）</label>
       <button class="primary" id="logLoad">读取</button>
       <span class="muted" id="logMeta" style="font-size:12px;margin-left:auto"></span>
@@ -944,7 +949,8 @@ async function loadInstanceLog(keepScroll = false) {
   const view = $('#logView');
   const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 8;
   try {
-    const d = await api(`instances/${encodeURIComponent(name)}/logs?lines=${lines}`);
+    const stream = ($('#logStream') && $('#logStream').value) || 'both';
+    const d = await api(`instances/${encodeURIComponent(name)}/logs?lines=${lines}&stream=${stream}`);
     const rows = Array.isArray(d.lines) ? d.lines : [];
     const src = d.source || '';
     const meta = $('#logMeta');
@@ -1780,12 +1786,19 @@ function modelRowsHtml(catalog, selected, avail) {
     const effortText = efforts === false ? '<span class="muted">非推理</span>'
       : grades ? grades.map(g => `<span class="grade">${esc(g)}</span>`).join('')
         : '<span class="muted">-</span>';
+    // DSH blocks attachments only when a model declares modalities WITHOUT "image";
+    // an empty value means "let the upstream decide". Show which of the three it is.
+    const mods = typeof m === 'string' ? null : m.inputModalities;
+    const visionText = !mods || !mods.length ? '<span class="muted" title="未声明：DSH 放行，由上游决定">放行</span>'
+      : mods.includes('image') ? '<span class="pill ok">图文</span>'
+        : '<span class="pill warn" title="显式声明纯文本：DSH 会拒绝图片">文</span>';
     return `<tr style="${usable ? '' : 'opacity:.55'}">
       <td class="pick"><input type="checkbox" value="${esc(id)}" ${checked ? 'checked' : ''} ${usable ? '' : 'disabled'}></td>
       <td class="mid"><code title="${esc(id)}">${esc(id)}</code></td>
       <td class="muted">${esc(name) || '-'}</td>
       <td class="muted">${effortText}</td>
       <td class="ok" style="text-align:center">${usable ? '✅' : '⛔'}</td>
+      <td class="vision" style="text-align:center">${visionText}</td>
       <td class="state">${state}</td></tr>`;
   }).join('');
 }
@@ -1809,9 +1822,10 @@ function modelTableHtml(catalog, selected, avail, probe) {
       <th>名称</th>
       <th class="effort">推理等级</th>
       <th class="ok" title="用这个 key 实测可用">可用</th>
+      <th class="vision" title="图片输入：空=放行（由上游决定）、文=明确纯文本、图文=允许">图片</th>
       <th class="state">状态</th>
     </tr></thead>
-       <tbody>${catalog.length ? modelRowsHtml(catalog, selected, avail) : '<tr><td colspan="6" class="muted">这个 provider 目录里没有模型</td></tr>'}</tbody></table>`;
+       <tbody>${catalog.length ? modelRowsHtml(catalog, selected, avail) : '<tr><td colspan="7" class="muted">这个 provider 目录里没有模型</td></tr>'}</tbody></table>`;
 }
 
 // ---------------------------------------------------------- create-in-a-modal

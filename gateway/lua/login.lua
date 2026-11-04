@@ -112,7 +112,8 @@ local ok_user = mu.allow_attempt("login:u:" .. username, LOGIN_LIMIT_USER, LOGIN
 local ok_ip = mu.allow_attempt("login:i:" .. ip, LOGIN_LIMIT_IP, LOGIN_WINDOW)
 if not ok_user or not ok_ip then
 	ngx.log(ngx.WARN, "dshmu: login rate limited user=", username, " ip=", ip)
-	return reply(page(next_, "尝试次数过多，请稍后再试", username), 429)
+	return reply(page(next_, "尝试次数过多，请约 " .. math.ceil(LOGIN_WINDOW / 60)
+		.. " 分钟后重试（或让管理员执行 dsh-muctl gateway restart）", username), 429)
 end
 
 -- Administrators are the host's own accounts: the password is verified against

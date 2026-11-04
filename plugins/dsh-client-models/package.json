@@ -1,6 +1,6 @@
 {
   "name": "@dsh-mu/dsh-client-models",
-  "version": "0.6.9",
+  "version": "0.7.2",
   "description": "dsh-mu models section: see platform-managed providers and add your own key (platform-proxied, never stored in the instance)",
   "type": "module",
   "main": "lib/index.js",

@@ -172,8 +172,19 @@ window.__ModuleLoader__.load({
           .then((r) => r.json()).then(setMe).catch(() => {});
       }, []);
       if (!me) return jsx.jsx('div', { style: { fontSize: 12, opacity: 0.6 }, children: '读取中…' });
-      const plans = ((((me.plans || {}).plans)) || []).filter((p) => (p.models || []).length);
-      const current = me.default || {};
+      // A plan created from the user's own key carries its real list in `effective_models`
+      // (the models its key was verified to serve) while `models` stays empty until they
+      // pick a subset. Filtering on `models` alone hid exactly those plans, so the
+      // dropdown showed nothing but "(keep the platform default)".
+      // `/me` returns `plans` as an ARRAY; reading `.plans.plans` always yielded
+      // undefined, so the dropdown was empty for everyone -- team plans included.
+      const rawPlans = Array.isArray(me.plans) ? me.plans : ((me.plans || {}).plans || []);
+      const plans = rawPlans
+        .map((p) => ({ ...p, models: ((p.effective_models && p.effective_models.length)
+          ? p.effective_models : (p.models || [])) }))
+        .filter((p) => (p.models || []).length);
+      // `/me` names the user's own pick `my_default` (`default` never existed).
+      const current = me.my_default || me.default || {};
       const value = current.plan && current.model ? current.plan + '|' + current.model : '';
       const save = async (raw) => {
         if (!raw) return;
@@ -181,9 +192,11 @@ window.__ModuleLoader__.load({
         try {
           const res = await fetch('/me', { method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ action: 'plan-default', plan: parts[0], model: parts[1] }) });
+            body: JSON.stringify({ action: 'plan-default', id: parts[0], plan: parts[0],
+                                   model: parts[1] }) });
           const doc = await res.json().catch(() => ({}));
-          setNote(res.ok ? '已设为默认模型' : '失败：' + ((doc && doc.error) || res.status));
+          const why = (doc && (doc.detail || doc.error)) || res.status;
+          setNote(res.ok ? '已设为默认模型' : '失败：' + why);
         } catch (e) { setNote('失败：' + e.message); }
       };
       const options = [jsx.jsx('option', { value: '', children: '（保持平台默认）' }, '__none')];

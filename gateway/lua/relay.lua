@@ -292,6 +292,50 @@ ngx.var.relay_target = scheme .. "://" .. host .. full_path .. query
 ngx.var.relay_host = host
 ngx.var.relay_scheme = scheme
 
+-- The harness speaks the newest OpenAI shape, which uses the `developer` role. Several
+-- OpenAI-compatible upstreams (DeepSeek's, for one) reject it outright:
+--   422 ... messages[0].role: unknown variant `developer`, expected one of
+--   system, user, assistant, tool, latest_reminder
+-- Rename it to `system` before forwarding: same meaning, universally accepted.
+local function normalize_message_roles()
+	local ctype = ngx.var.content_type or ""
+	if not ctype:find("json", 1, true) then return end
+	ngx.req.read_body()
+	local data = ngx.req.get_body_data()
+	if not data then
+		-- A real harness request (system prompt + tool schemas) is large enough that
+		-- nginx buffers it to a temp file, where get_body_data() returns nil. Reading
+		-- that file is what makes this work for the UI, not just for small curl probes.
+		local path = ngx.req.get_body_file()
+		if not path then return end
+		local fh = io.open(path, "rb")
+		if not fh then return end
+		data = fh:read("*a")
+		fh:close()
+	end
+	if not data or #data == 0 or #data > 16 * 1024 * 1024 then return end
+	if not data:find("developer", 1, true) then return end
+	local ok, doc = pcall(cjson.decode, data)
+	if not ok or type(doc) ~= "table" or type(doc.messages) ~= "table" then return end
+	local changed = false
+	for _, m in ipairs(doc.messages) do
+		if type(m) == "table" and m.role == "developer" then
+			m.role = "system"
+			changed = true
+		end
+	end
+	if not changed then return end
+	local encoded = cjson.encode(doc)
+	ngx.req.set_body_data(encoded)
+	ngx.req.set_header("Content-Length", tostring(#encoded))
+	ngx.log(ngx.ERR, "dshmu relay: rewrote developer role -> system (",
+		tostring(#data), " bytes in)")
+end
+if not ngx.ctx.dshmu_roles_normalized then
+	ngx.ctx.dshmu_roles_normalized = true
+	normalize_message_roles()
+end
+
 -- Pick the header the provider expects and clear the other one, so the placeholder
 -- the harness sent never reaches the provider.
 local auth = auth_kind

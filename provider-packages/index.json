@@ -2,9 +2,9 @@
   "version": 1,
   "templates": [
     {
-      "name": "deepseek",
-      "label": "DeepSeek 官方",
-      "description": "官方 anthropic 端点，deepseek-flash / deepseek-v4-pro，带 5 档推理等级",
+      "name": "mu-deepseek",
+      "label": "DeepSeek 官方（Anthropic 端点）",
+      "description": "官方 anthropic 端点，deepseek-flash / deepseek-v4-pro，带 5 档推理等级；同 id 不带 mu- 的是 DSH 目录导入的 OpenAI 兼容版（不支持官方 web_search）",
       "api": "anthropic-messages",
       "models": 2
     },

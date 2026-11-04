@@ -528,6 +528,21 @@ MUTATING = {"auth_verify", "instance_ensure", "provider_save", "provider_delete"
             "instance_delete", "config_set"}
 
 
+
+def apply_plan_change(mu, st, plan=None):
+    """Write the plan change through: re-render every patch and restart what it affects.
+
+    A patch is read at boot, so syncing alone leaves running instances on the previous
+    model list. Every plan mutation used to stop at sync_all -- which is why "I added a
+    model to the plan" looked ignored until someone restarted by hand.
+    """
+    mu.save_state(st)
+    mu.sync_all(st)
+    bounced = []
+    with contextlib.suppress(Exception):
+        bounced = mu.restart_instances_for_plan(st, plan or {"owner": "*", "visible_to": ["*"]})
+    return bounced
+
 def run_async(fn, actor: str, action: str, target: str, ip: str) -> None:
     """Run a slow platform operation without blocking the HTTP request."""
     def worker():
@@ -1424,8 +1439,9 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("default") and owner == "*":
                 st["config"]["default_plan"] = saved["id"]
                 mu.save_config(st["config"])
-            mu.sync_all(st)
-            return 200, {"ok": True, "plan": {k: v for k, v in saved.items() if k != "has_key"}}
+            bounced = apply_plan_change(mu, st, saved)
+            return 200, {"ok": True, "plan": {k: v for k, v in saved.items() if k != "has_key"},
+                         "restarted": bounced}
         if name == "plan_action":
             st = mu.load_state()
             pid, action = groups
@@ -1441,9 +1457,9 @@ class Handler(BaseHTTPRequestHandler):
                         return 400, {"error": "order must be a number"}
                     plan["order"] = int(raw)
                 mu.save_plan(plan)
-                mu.sync_all(st)
+                bounced = apply_plan_change(mu, st, plan)
                 return 200, {"ok": True, "id": pid, "hidden": bool(plan.get("hidden")),
-                             "order": plan.get("order")}
+                             "order": plan.get("order"), "restarted": bounced}
             if action == "default":
                 if str(plan.get("owner") or "*") != "*":
                     return 400, {"error": "only team plans can be the platform default"}
@@ -1452,8 +1468,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 plan["enabled"] = action == "enable"
                 mu.save_plan(plan)
-            mu.sync_all(st)
-            return 200, {"ok": True, "id": pid, "action": action}
+            bounced = apply_plan_change(mu, st, plan)
+            return 200, {"ok": True, "id": pid, "action": action, "restarted": bounced}
         if name == "plan_delete":
             st = mu.load_state()
             pid = groups[0]
@@ -1463,14 +1479,15 @@ class Handler(BaseHTTPRequestHandler):
                 return 400, {"error": "the built-in fallback plan cannot be deleted",
                              "detail": "disable it instead; it remains the last resort for "
                                        "users who have no other plan"}
+            gone = mu.load_plan(pid) or {"owner": "*", "visible_to": ["*"]}
             for path in (f"{mu.PLANS_DIR}/{pid}.json", mu.plan_key_path(pid)):
                 with contextlib.suppress(OSError):
                     os.unlink(path)
             if str(st["config"].get("default_plan") or "") == pid:
                 st["config"].pop("default_plan", None)
                 mu.save_config(st["config"])
-            mu.sync_all(st)
-            return 200, {"ok": True, "id": pid}
+            bounced = apply_plan_change(mu, st, gone)
+            return 200, {"ok": True, "id": pid, "restarted": bounced}
 
         if name == "health":
             return 200, {"ok": True, "version": VERSION, "uptime_s": int(time.time() - STARTED),
@@ -1510,7 +1527,32 @@ class Handler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 return 400, {"error": "lines must be an integer", "got": str(raw_lines)[:32],
                              "detail": "the log tail is clamped to 1..2000 lines"}
-            payload = tail_log(f"{mu.LOGS}/{groups[0]}.log", want_lines)
+            # The launcher writes its own messages and the harness stdout to `.log`, while
+            # everything that explains a failure (node stack traces, jail errors) goes to
+            # `.err.log`. Serving only the first hid every real error behind a page of
+            # "dsh web: http://..." lines.
+            stream = str((query.get("stream") or ["both"])[0]).lower()
+            if stream not in ("stdout", "stderr", "both"):
+                stream = "both"
+            parts = []
+            if stream in ("stdout", "both"):
+                payload = tail_log(f"{mu.LOGS}/{groups[0]}.log", want_lines)
+                parts.append(("stdout", payload))
+            if stream in ("stderr", "both"):
+                err = tail_log(f"{mu.LOGS}/{groups[0]}.err.log", want_lines)
+                parts.append(("stderr", err))
+            if not parts:
+                return 400, {"error": "stream must be stdout, stderr or both"}
+            payload = parts[-1][1]
+            payload["stream"] = stream
+            merged = []
+            for label, part in parts:
+                for line in (part.get("lines") or []):
+                    merged.append(line if stream != "both" else f"[{label}] {line}")
+            payload["lines"] = merged[-want_lines:] if want_lines else merged
+            payload["sources"] = {label: {"file": part.get("file"), "source": part.get("source"),
+                                          "mtime": part.get("mtime"), "size": part.get("size")}
+                                  for label, part in parts}
             # The launcher prints its one-time launch URL to the service log, which
             # carries the session token. The file stays root-only, but the API should
             # not hand that token to anyone reading logs.

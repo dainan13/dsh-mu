@@ -2670,6 +2670,20 @@ def start_instance(st: dict, name: str, timeout: float = 900.0):
 def stop_instance(st: dict, name: str, mark: bool = True):
     service_action(name, "stop", check=False)
     kill_cgroup(name)
+    # supervise-daemon can time out ("Failed to stop") while leaving openrc's own state at
+    # "started". Every later start then answers "has already been started" and does
+    # nothing, which is how an instance ends up with no process, state=running and a
+    # closed port -- and why `instance rebuild` looked like it did not help.
+    # A live supervise-daemon respawns the unit forever (respawn-max=0) and rewrites
+    # openrc's "started" state, so zapping alone is not enough: it re-registers within
+    # a second and the next start answers "has already been started" while nothing runs.
+    for pattern in (f"supervise-daemon dsh-mu-{name}", f"dsh-mu-jail", f"dsh-mu-{name}"):
+        with contextlib.suppress(Exception):
+            run(["pkill", "-9", "-f", pattern], check=False, capture=True)
+    with contextlib.suppress(Exception):
+        run(["/sbin/rc-service", f"dsh-mu-{name}", "zap"], check=False, capture=True)
+    with contextlib.suppress(OSError):
+        os.unlink(f"/run/dsh-mu-{name}.pid")
     if mark:
         st["instances"][name]["state"] = "stopped"
         save_state(st)
@@ -3157,13 +3171,30 @@ def cmd_gateway_jail(args):
         print(json.dumps(render_gateway_jail_conf_files(cfg, port), indent=2, ensure_ascii=False))
         return 0
     if sub in ("start", "restart"):
-        run(["/sbin/rc-service", "dsh-mu-gateway", sub], check=False)
+        if sub == "restart":
+            run(["/sbin/rc-service", "dsh-mu-gateway", "stop"], check=False)
+            cgroup_kill("/sys/fs/cgroup/dsh-mu/gateway")
+            run(["pkill", "-9", "-f", f"{GATEWAY_CONF}"], check=False)
+            time.sleep(1)
+            sub_start = "start"
+        else:
+            sub_start = sub
+        run(["/sbin/rc-service", "dsh-mu-gateway", sub_start], check=False)
         time.sleep(2)
         health = gateway_health(port)
         print(json.dumps({"service": sub, **health}, indent=2, ensure_ascii=False))
         return 0 if health["ok"] else 1
     if sub == "stop":
         run(["/sbin/rc-service", "dsh-mu-gateway", "stop"], check=False)
+        # Do not trust the service's own stop hook: supervise-daemon signals only its
+        # direct child, and the jailed nginx (plus its lua_shared_dict, which holds the
+        # admin-token cache and the login rate limiter) survived on a customer box.
+        # Reaping the cgroup here makes `gateway stop` mean "no nginx left".
+        cgroup_kill("/sys/fs/cgroup/dsh-mu/gateway")
+        leftover = run(["pgrep", "-f", f"{GATEWAY_CONF}"], check=False, capture=True)
+        if (leftover.stdout or "").strip():
+            run(["pkill", "-9", "-f", f"{GATEWAY_CONF}"], check=False)
+            time.sleep(1)
         return 0
     if sub == "jail-status":
         started = bool(run(["pgrep", "-f", f"{GATEWAY_CONF}"], check=False, capture=True).stdout.strip())
@@ -4215,6 +4246,20 @@ def cmd_install(args):
         info(f"  FAIL {c['check']}: {c['detail']} -> {c['fix']}")
     for c in warns:
         info(f"  WARN {c['check']}: {c['detail']}")
+    # Extensions go last on purpose: their sockets live under /run/dsh-mu/ext, which the
+    # gateway brings up. Registering them earlier meant a restart mid-cycle, a broker that
+    # died on SIGTERM, and a FAIL in doctor that nobody had been told to expect.
+    with contextlib.suppress(Exception):
+        ext_reload(quiet=True)
+    for name in sorted(ext_manifests()):
+        if ext_status(name) != "running":
+            run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "zap"], check=False, capture=True)
+            run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "start"], check=False)
+            time.sleep(1.0)
+            state = ext_status(name)
+            info(f"extension {name}: {state}"
+                 + ("" if state == "running"
+                    else f" (see {LOGS}/ext-{name}.err.log; dsh-muctl ext restart {name})"))
     info("install complete")
 
 
@@ -4507,6 +4552,98 @@ def cmd_instance_list(args):
     return cmd_instance_status(argparse.Namespace(names=[], json=getattr(args, "json", False)))
 
 
+def instance_preflight(st: dict, name: str) -> list[str]:
+    """Read-only checks for the things that make a restart fail silently.
+
+    Judged from the host, but with two jail realities in mind:
+      * the DSH runtime is MOUNTED into the jail, so its absence from `rootfs` proves nothing
+      * `/home/dsh/workspace` inside the jail is `<inst>/workspace` on the host, so a
+        `link:` dependency must be resolved against that directory, not `home/workspace`
+    """
+    problems: list[str] = []
+    base = f"{INSTANCES_DIR}/{name}"
+    home = f"{base}/home"
+    rootfs = f"{base}/rootfs"
+    prof = f"{home}/.dsh/profiles/web"
+
+    if not os.path.isdir(rootfs):
+        problems.append("jail rootfs missing (run: dsh-muctl instance rebuild %s)" % name)
+    elif not os.access(f"{rootfs}/bin/sh", os.X_OK):
+        problems.append("rootfs has no executable /bin/sh")
+
+    # legacy overlay must stay a real YAML array
+    overlay = f"{home}/.dsh-mu-provider.yml"
+    if os.path.exists(overlay):
+        body = [ln for ln in (read_text(overlay) or "").splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")]
+        if not body:
+            problems.append(".dsh-mu-provider.yml holds only comments; write `[]`")
+
+    # profile patch: our marker, and a default model that actually exists in the patch
+    patch = f"{prof}/cordis.patch.yml"
+    text = read_text(patch) or ""
+    if not os.path.exists(patch):
+        problems.append("profile patch missing (run: dsh-muctl sync)")
+    elif "dsh-mu:llm" not in text:
+        problems.append("profile patch lost our managed block (run: dsh-muctl sync)")
+    m = re.search(r"- id: agent-default-model\s*\n\s+config:\s*\n\s+provider: \"?([^\"\n]+)\"?", text)
+    if m and f"{m.group(1)}:" not in text:
+        problems.append(f"agent-default-model points at missing provider {m.group(1)!r}")
+
+    # bundles whose package directory must exist inside the jail
+    pkg_path = f"{prof}/package.json"
+    if os.path.exists(pkg_path):
+        with contextlib.suppress(Exception):
+            doc = json.loads(read_text(pkg_path) or "{}")
+            bundles = ((doc.get("dsh") or {}).get("profile") or {}).get("bundles") or []
+            deps = doc.get("dependencies") or {}
+            nm = f"{prof}/node_modules"
+            for bundle in bundles:
+                if str(bundle).startswith("@deepseek-ai/"):
+                    continue            # provided by the mounted runtime
+                target = f"{nm}/{bundle}"
+                if os.path.islink(target) and not os.path.exists(target):
+                    link = os.readlink(target)
+                    # `link:` deps are declared from the jail's view: /home/dsh/X -> <inst>/X
+                    jailish = link.lstrip("./")
+                    host = os.path.normpath(f"{home}/{jailish}")
+                    if not os.path.exists(host):
+                        problems.append(f"bundle {bundle} is a dangling link ({link})")
+                elif not os.path.exists(target):
+                    problems.append(f"bundle {bundle} is not installed in the profile")
+            for dep in deps:
+                if str(dep).startswith("@deepseek-ai/"):
+                    continue
+                if not os.path.exists(f"{nm}/{dep}"):
+                    problems.append(f"dependency {dep} is not installed in the profile")
+    else:
+        problems.append("profile package.json missing")
+    return problems
+
+
+def cmd_instance_preflight(args):
+    """`dsh-muctl instance preflight [name ...]` -- read-only restart readiness check."""
+    ensure_root()
+    st = load_state()
+    names = list(args.name or []) or sorted(st.get("instances") or {})
+    bad = 0
+    for name in names:
+        if name not in st.get("instances"):
+            print(f"  {name:14} unknown instance")
+            bad += 1
+            continue
+        problems = instance_preflight(st, name)
+        if problems:
+            bad += 1
+            print(f"  {name:14} FAIL")
+            for item in problems:
+                print(f"      - {item}")
+        else:
+            print(f"  {name:14} ok")
+    info(f"preflight: {len(names) - bad}/{len(names)} ready")
+    return 1 if bad else 0
+
+
 def cmd_instance_rebuild(args):
     """Recreate an instance's jail rootfs from the current template, keeping its data.
 
@@ -4581,12 +4718,21 @@ def cmd_instance_del(args):
 
 
 def cmd_instance_logs(args):
-    log = f"{LOGS}/{args.name}.log"
+    which = getattr(args, "stream", None) or "stdout"
+    log = f"{LOGS}/{args.name}.log" if which == "stdout" else f"{LOGS}/{args.name}.err.log"
     if not os.path.exists(log):
         die(f"no log for {args.name} ({log})")
+    # The launch URL carries the instance session token. The file is root-only, but the
+    # admin API already masks it and the CLI should not print it either -- tails end up in
+    # tickets and screenshots.
+    mask = re.compile(r"(token=)[A-Za-z0-9_\-]+")
     if args.follow:
-        os.execvp("tail", ["tail", "-n", str(args.lines), "-f", log])
-    run(["tail", "-n", str(args.lines), log], check=False)
+        os.execvp("sh", ["sh", "-c",
+                         f"tail -n {int(args.lines)} -f {log} | sed -E 's/(token=)[A-Za-z0-9_-]+/\\1***/g'"])
+    res = run(["tail", "-n", str(args.lines), log], check=False, capture=True)
+    for line in (res.stdout or "").splitlines():
+        print(mask.sub(r"\1***", line))
+    return 0
 
 
 def cmd_instance_shell(args):
@@ -4785,6 +4931,11 @@ respawn_max=0
 respawn_period=120
 depend() {{
 	need dsh-mu-cgroup
+	# The gateway mounts /run/dsh-mu/ext into the instances and owns the admin backend's
+	# socket directory; starting before it (or during its restart) killed the broker with
+	# SIGTERM. `after` keeps the ordering without dragging the appliance down with it.
+	after dsh-mu-gateway
+	after dsh-mud
 }}
 """
 
@@ -4905,6 +5056,19 @@ def ext_reload(quiet: bool = False) -> dict:
         atomic_write(ext_service(name), render_ext_service(manifest), mode=0o755)
         run(["/sbin/rc-update", "add", f"dsh-mu-ext-{name}", "default"], check=False)
         run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "restart"], check=False)
+        time.sleep(1.0)
+        if ext_status(name) != "running":
+            # A restart issued while the gateway/admin backend are still cycling leaves
+            # the broker dead with no supervisor, and nothing retried it. Start it once
+            # more and, if it still refuses, say so instead of leaving a silent FAIL.
+            run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "zap"], check=False, capture=True)
+            run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "start"], check=False)
+            time.sleep(1.0)
+            if ext_status(name) == "running":
+                info(f"extension {name}: started after the initial restart did not stick")
+            else:
+                info(f"WARNING: extension {name} did not stay up; "
+                     f"see {LOGS}/ext-{name}.err.log and run `dsh-muctl ext restart {name}`")
         imported = ext_import_bundles(manifest)
         for line in imported:
             info(f"extension {name}: imported plugin {line}")
@@ -6131,6 +6295,12 @@ def provider_import_from_catalog(pid: str, params: dict | None = None) -> tuple[
                 _m["base_url"] = _b.rstrip("/")[: -len(_s)]
                 break
     pkg["models"] = [{k: v for k, v in m.items() if v is not None} for m in pkg["models"]]
+    # Harness catalogs label some vision families as text-only, which makes DSH refuse
+    # attachments ("MODEL_DOES_NOT_SUPPORT_IMAGES"). Upgrade the families we know take
+    # images; leave everything else exactly as the source declared it.
+    _vision = auto_provider_vision(pkg)
+    if _vision:
+        info(f"{pid}: marked image input for {len(_vision)} model(s)")
     missing = [slot for slot in (needs or unresolved_slots(base_url)) if slot not in params]
     if params:
         pkg["params"] = params
@@ -6526,7 +6696,21 @@ def cmd_ext(args):
         return 0
 
     if action in ("start", "stop", "restart"):
-        run(["/sbin/rc-service", f"dsh-mu-ext-{name}", action], check=False)
+        svc = f"dsh-mu-ext-{name}"
+        if action in ("stop", "restart"):
+            # Same openrc trap as instances: a supervisor that ignores SIGTERM leaves the
+            # unit marked "started", and every later start answers "has already been
+            # started" while nothing runs. Kill, reap the supervisor, then zap.
+            for pattern in (f"supervise-daemon {svc}", "dsh-mu-ext", f"ext-{name}"):
+                with contextlib.suppress(Exception):
+                    run(["pkill", "-9", "-f", pattern], check=False, capture=True)
+            with contextlib.suppress(OSError):
+                cgroup_kill(f"{EXT_CGROUP_PARENT}/{name}")
+            with contextlib.suppress(Exception):
+                run(["/sbin/rc-service", svc, "zap"], check=False, capture=True)
+            with contextlib.suppress(OSError):
+                os.unlink(f"/run/dsh-mu-ext-{name}.pid")
+        run(["/sbin/rc-service", svc, action], check=False)
         info(f"{name}: {ext_status(name)}")
         return 0
 
@@ -8298,6 +8482,32 @@ def cmd_provider(args):
             die(f"no imported package named {pid!r} (dsh-muctl provider import <file>)")
         print(json.dumps(package_for_display(pkg), indent=2, sort_keys=True, ensure_ascii=False))
         return 0
+    if action == "vision":
+        pid = args.name or ""
+        pkg = load_provider_package(pid)
+        if not pkg:
+            die(f"no imported package named {pid!r} (dsh-muctl provider import <file>)")
+        if getattr(args, "vision_auto", False):
+            changed = auto_provider_vision(pkg)
+            save_provider_package(pkg)
+            info("vision marked: " + (", ".join(changed) or "(nothing matched)"))
+        elif getattr(args, "model", None):
+            if not (getattr(args, "vision_on", False) or getattr(args, "vision_off", False)):
+                die("pass --on or --off together with --model")
+            set_provider_vision(pkg, args.model, bool(getattr(args, "vision_on", False)))
+            save_provider_package(pkg)
+            info(f"{args.model}: image input "
+                 f"{'allowed' if getattr(args, 'vision_on', False) else 'disabled'}")
+        else:
+            for m in pkg.get("models") or []:
+                state = m.get("inputModalities")
+                label = ("(unset: images allowed)" if not state
+                         else ("text+image" if "image" in state else "text only (images blocked)"))
+                print(f"  {m.get('id'):34} {label}")
+            return 0
+        sync_all(load_state())
+        info("synced; restart affected instances to apply")
+        return 0
     if action in ("models", "usage"):
         pid = args.name or ""
         pkg = load_provider_package(pid)
@@ -8950,6 +9160,48 @@ def plan_order_key(plan: dict):
 
 def sorted_plans(plans) -> list[dict]:
     return sorted(plans, key=plan_order_key)
+
+
+# Which model families are known to accept images. DSH only *blocks* images when a model
+# declares `inputModalities` without "image", so an explicit text-only label on a vision
+# model is worse than no label at all -- it turned "Claude Haiku 5.5" into a model that
+# refused attachments. The heuristic below only ever *adds* the image modality for
+# families we are confident about; everything else keeps whatever the source declared.
+VISION_FAMILIES = re.compile(r"(claude|gemini|gpt-4|gpt-5|\bo3\b|\bo4\b|vision|vl)", re.I)
+
+
+def looks_vision_model(model_id: str) -> bool:
+    return bool(VISION_FAMILIES.search(str(model_id or "")))
+
+
+def auto_vision_modalities(model_id: str) -> list[str] | None:
+    """Modalities we are willing to assert for this model id (None = leave it alone)."""
+    return ["text", "image"] if looks_vision_model(model_id) else None
+
+
+def set_provider_vision(pkg: dict, model_id: str, enabled: bool) -> dict:
+    """Turn image input on/off for one model inside a provider package (mutates pkg)."""
+    for model in pkg.get("models") or []:
+        if str(model.get("id")) != str(model_id):
+            continue
+        if enabled:
+            model["inputModalities"] = ["text", "image"]
+        else:
+            model["inputModalities"] = ["text"]
+        return pkg
+    die(f"no such model in this provider: {model_id}")
+
+
+def auto_provider_vision(pkg: dict) -> list[str]:
+    """Mark known-vision families; returns the ids that changed."""
+    changed = []
+    for model in pkg.get("models") or []:
+        mid = str(model.get("id") or "")
+        wanted = auto_vision_modalities(mid)
+        if wanted and model.get("inputModalities") != wanted:
+            model["inputModalities"] = wanted
+            changed.append(mid)
+    return changed
 
 
 def plan_is_search_capable(plan: dict) -> bool:
@@ -9805,11 +10057,19 @@ def sync_instance_plans(st: dict, name: str) -> dict:
         _default_key = RELAY_PLACEHOLDER if relay else plan_key(default)
         if _default_key:
             credentials.setdefault("DEEPSEEK_API_KEY", _default_key)
-    launch_yaml, llm_block = split_plans_patch(yaml)
-    if llm_block:
+    launch_yaml, llm_block, tail_block = split_plans_patch(yaml)
+    if llm_block or tail_block:
+        combined = llm_block + (("\n" + tail_block) if tail_block else "")
         with contextlib.suppress(Exception):
-            write_profile_llm_block(st, name, llm_block)
+            write_profile_llm_block(st, name, combined.strip() + "\n")
         yaml = launch_yaml
+        # The legacy overlay must stay a real YAML array. Once the model block moved to
+        # the profile patch this file could be left with only its comment header, and
+        # DSH refuses to boot on that ("must be a top-level YAML array"), which took all
+        # eight instances down. An empty list is a valid overlay; comments alone are not.
+        if not re.search(r"(?m)^\s*-\s+id:", yaml):
+            yaml = ("# dsh-mu: model plans live in the profile patch "
+                    "(.dsh/profiles/web/cordis.patch.yml)\n[]\n")
     yaml = yaml + market_patch_yaml(st, name)
     uid = int(inst.get("uid", 0))
     os.makedirs(os.path.dirname(patch_path), exist_ok=True)
@@ -9855,7 +10115,13 @@ def split_plans_patch(yaml: str) -> tuple[str, str]:
         break
     llm_part, tail = rest[:stop], rest[stop:]
     tail = tail.strip()
-    return head.rstrip() + "\n" + (tail + "\n" if tail else ""), llm_part.strip() + "\n"
+    # The caller needs both halves: the legacy launch file keeps head+tail, while the
+    # profile patch DSH actually reads must get llm_part+tail. Before this, the tail
+    # (web-search-deepseek / tool-web) only ever landed in the legacy file, so the
+    # search configuration silently never applied and the harness fell back to its
+    # built-in provider ("DeepSeek search has no API key for DSHMU_WEB_SEARCH_...").
+    return (head.rstrip() + "\n" + (tail + "\n" if tail else ""),
+            llm_part.strip() + "\n", tail)
 
 
 BUNDLED_PLUGINS_DIR = f"{LIB}/plugins"
@@ -9945,8 +10211,15 @@ def models_native_enabled(st: dict, name: str) -> bool:
     return bool(st["config"].get("models_native", False))
 
 
+# Every id the platform writes into the profile patch. The validator rejects a block
+# containing an id it cannot account for, and that rejection is silent apart from one
+# WARNING line: agent-default-model / web-search-deepseek / tool-web were missing here,
+# so the whole patch was refused and the instance kept running its previous config --
+# which is how "web search is not configured" and "the model list ignores my edit"
+# both survived a sync.
 OWN_PATCH_IDS = {"llm-deepseek", "llm-pi-ai", "plugin-market", "ui-plugin-market",
-                 "ui-settings-models", "dsh-mu-models"}
+                 "ui-settings-models", "dsh-mu-models", "agent-default-model",
+                 "web-search-deepseek", "tool-web"}
 
 
 def profile_patch_problem(text: str) -> str:
@@ -12014,6 +12287,42 @@ def doctor_checks(st: dict) -> list[dict]:
     else:
         add("HTTPS", DOCTOR_PASS, "disabled (http only)")
 
+    # The plans and the profile patch must agree. Everything that rewrites one and not the
+    # other produces the same confusing symptom: the model list on screen is not the list
+    # the plans say. Compare the two sets instead of trusting either side.
+    drifted = []
+    for iname, iinst in sorted((load_state().get("instances") or {}).items()):
+        iuser = str(iinst.get("user") or iname)
+        ppath = f"{INSTANCES_DIR}/{iname}/home/.dsh/profiles/web/cordis.patch.yml"
+        if not os.path.exists(ppath):
+            continue
+        expected = set()
+        for plan in plans_for_user(iuser):
+            for route in plan_routes(plan, iuser):
+                expected.update(m["id"] for m in route["models"])
+        raw = read_text(ppath) or ""
+        present = {m.group(1) for m in re.finditer(
+            r"(?m)^\s{8,}- id: \"?([^\"\n]+)\"?\s*$", raw)}
+        if not expected:
+            continue
+        if not present or not expected <= present:
+            missing = sorted(expected - present)
+            drifted.append(f"{iname}({len(missing)} missing)")
+    add("plan ↔ instance patch", DOCTOR_WARN if drifted else DOCTOR_PASS,
+        ("out of sync: " + ", ".join(drifted) + "; run: dsh-muctl sync")
+        if drifted else "every instance patch offers exactly its plans' models")
+    # A patch is read at boot: if the file is newer than the process, the instance is
+    # still serving the previous model list. That mismatch produced a whole afternoon of
+    # "the config is right, curl works, the UI fails".
+    stale = []
+    for iname, iinst in sorted((load_state().get("instances") or {}).items()):
+        ppath = f"{INSTANCES_DIR}/{iname}/home/.dsh/profiles/web/cordis.patch.yml"
+        started = int(iinst.get("started_at") or 0)
+        if started and os.path.exists(ppath) and os.path.getmtime(ppath) > started + 5:
+            stale.append(iname)
+    add("instance patch freshness", DOCTOR_WARN if stale else DOCTOR_PASS,
+        ("stale: " + ", ".join(stale) + "; run: dsh-muctl instance restart <name>")
+        if stale else "every running instance read the current patch")
     tree_here = os.path.isdir("/sys/fs/cgroup/dsh-mu")
     add("instance cgroup tree", DOCTOR_PASS if tree_here else DOCTOR_FAIL,
         "/sys/fs/cgroup/dsh-mu" if tree_here else
@@ -12150,7 +12459,15 @@ def doctor_checks(st: dict) -> list[dict]:
                     "dsh-muctl gateway conf")
         else:
             add("gateway jail config", DOCTOR_PASS, f"{paths['conf']}/nginx.conf + fragments")
+        # A running-up gateway (right after an upgrade, or a restart triggered by the
+        # package hooks) is not broken: probe for a few seconds before declaring failure,
+        # otherwise `apk add` + `doctor` in one line reports a scary FAIL that is wrong.
         health = gateway_health(int(cfg.get("gateway_listen", 80)))
+        for _ in range(8):
+            if health["ok"]:
+                break
+            time.sleep(1)
+            health = gateway_health(int(cfg.get("gateway_listen", 80)))
         add("gateway jail answering", DOCTOR_PASS if health["ok"] else DOCTOR_FAIL,
             f"http://127.0.0.1:{health['port']}/login -> {health['http'] or 'no answer'}",
             "" if health["ok"] else "dsh-muctl gateway start   # or: gateway logs")
@@ -12375,6 +12692,24 @@ def cmd_doctor(args):
         started = reconcile_instances(load_state())
         if started:
             fixes.append("started: " + ", ".join(started))
+        # ③ An installed extension that is merely stopped is exactly the FAIL `--fix`
+        # should clear on its own (the gateway/admin cycle used to leave it down).
+        ext_fixed = []
+        # Deliberately NO ext_reload() here: it restarts every appliance, and a restart
+        # issued while the gateway/admin backend are still settling is exactly what kills
+        # them. `--fix` only has to bring a stopped one up.
+        for attempt in (1, 2):
+            for name in sorted(ext_manifests()):
+                if ext_status(name) == "running":
+                    continue
+                run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "zap"], check=False, capture=True)
+                run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "start"], check=False)
+                time.sleep(0.8)
+                if attempt == 2 or ext_status(name) != "running":
+                    ext_fixed.append(f"{name}={ext_status(name)}")
+            time.sleep(1.5)
+        if ext_fixed:
+            fixes.append("extensions: " + ", ".join(ext_fixed))
         info("doctor --fix applied: " + ", ".join(fixes))
     checks = doctor_checks(st)
     counts = {DOCTOR_PASS: 0, DOCTOR_WARN: 0, DOCTOR_FAIL: 0, DOCTOR_SKIP: 0}
@@ -12486,10 +12821,15 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("name")
     a.add_argument("--purge", action="store_true")
     a.set_defaults(func=cmd_instance_del)
+    a = isub.add_parser("preflight", help="read-only check that instances can be restarted safely")
+    a.add_argument("name", nargs="*")
+    a.set_defaults(func=cmd_instance_preflight)
     a = isub.add_parser("rebuild", help="recreate an instance's jail rootfs, keeping its data")
     a.add_argument("name")
     a.set_defaults(func=cmd_instance_rebuild)
     a = isub.add_parser("logs")
+    a.add_argument("--stderr", dest="stream", action="store_const", const="stderr",
+                   help="read <name>.err.log instead of <name>.log")
     a.add_argument("name")
     a.add_argument("-n", "--lines", type=int, default=100)
     a.add_argument("-f", "--follow", action="store_true")
@@ -12566,7 +12906,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("provider", help="provider catalog: presets, packages and import/export")
     sp.add_argument("action", choices=["list", "show", "add", "set", "rm",
                                        "spec", "validate", "import", "export",
-                                       "models", "usage"])
+                                       "models", "usage", "vision"])
     sp.add_argument("name", nargs="?", help="provider name")
     sp.add_argument("--kind", choices=["pi-ai", "deepseek"], help="pi-ai=OpenAI Chat Completions, deepseek=Anthropic Messages")
     sp.add_argument("--route", help="route id (pi-ai only; defaults to the provider name)")
@@ -12580,6 +12920,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--display-name", dest="display_name")
     sp.add_argument("--headers", help="extra headers as JSON, e.g. '{\"x-foo\":\"bar\"}'")
     sp.add_argument("--from-file", dest="from_file", help="load the definition from a JSON file")
+    sp.add_argument("--auto", dest="vision_auto", action="store_true",
+                    help="vision: mark every known-vision family in this provider")
+    sp.add_argument("--on", dest="vision_on", action="store_true",
+                    help="vision: with --model, allow image input")
+    sp.add_argument("--off", dest="vision_off", action="store_true",
+                    help="vision: with --model, declare text-only")
     sp.add_argument("--file", dest="pkg_file", help="provider package file (validate/import)")
     sp.add_argument("--key", help="credential for models/usage/test (never stored)")
     sp.add_argument("--refresh", action="store_true",

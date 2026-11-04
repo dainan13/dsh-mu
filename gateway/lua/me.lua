@@ -189,7 +189,8 @@ if action == "plan-add" or action == "plan-rename" or action == "plan-delete"
 	or action == "plan-default" or action == "plan-default-clear" then
 	local result, err, status = mu.internal_post("/me/plans", name, {
 		action = action:gsub("^plan%-", ""),
-		id = payload.id, name = payload.name, provider = payload.provider,
+		-- `plan` is what the drawer used to send; accept both so a stale client keeps working
+		id = payload.id or payload.plan, name = payload.name, provider = payload.provider,
 		key = payload.key, models = payload.models, default_model = payload.default_model,
 		model = payload.model, all_available = payload.all_available,
 	})

@@ -243,11 +243,14 @@ end
 --- Shared secret the gateway presents to the loopback admin backend.
 function _M.admin_token()
 	local cached = dict():get("admin_token")
-	if cached then return cached end
+	-- An empty string is truthy in Lua, so caching "not there yet" made the error
+	-- sticky: the token could appear on disk and every request would still answer
+	-- "no admin token" until the worker was restarted. Only cache a real token.
+	if cached and cached ~= "" then return cached end
 	local raw = _M.read_file(ETC .. "/admin.token")
 	if not raw then return "" end
 	local token = (raw:gsub("%s+", ""))
-	dict():set("admin_token", token, 30)
+	if token ~= "" then dict():set("admin_token", token, 30) end
 	return token
 end
 

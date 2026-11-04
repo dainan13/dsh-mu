@@ -1,7 +1,7 @@
 {
   "schema": "dsh-mu.provider/v1",
-  "id": "deepseek",
-  "label": "DeepSeek 官方",
+  "id": "mu-deepseek",
+  "label": "DeepSeek 官方（Anthropic 端点）",
   "docs": "https://api-docs.deepseek.com/",
   "auth": {
     "type": "x-api-key"
