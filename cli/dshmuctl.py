@@ -4486,6 +4486,28 @@ def cmd_instance_create(args):
         start_instance(st, args.name)
 
 
+def start_with_cookie_retry(st: dict, name: str, timeout: float = 300.0) -> bool:
+    """Start an instance, and retry once if the session cookie could not be minted.
+
+    A serve-mode instance hands the user a session cookie at launch. If that cookie is
+    stale the jail starts, prints its launch URL and exits before binding the port --
+    which looks exactly like "the instance is broken" and cost an afternoon once. One
+    clean stop+start re-mints it, so do that automatically instead of leaving a hint.
+    """
+    start_instance(st, name, timeout=timeout)
+    if int((st["instances"].get(name) or {}).get("port") or 0) <= 0:
+        return False
+    if timeout <= 0:
+        return True
+    inst = st["instances"][name]
+    if (inst.get("upstream") or {}).get("cookie"):
+        return True
+    info(f"instance {name}: no session cookie after start; restarting once to re-mint it")
+    stop_instance(st, name, mark=False)
+    start_instance(st, name, timeout=timeout)
+    return bool((st["instances"].get(name) or {}).get("upstream", {}).get("cookie"))
+
+
 def cmd_instance_start(args):
     ensure_root()
     st = load_state()
@@ -4493,8 +4515,10 @@ def cmd_instance_start(args):
     for name in args.names:
         if name not in st["instances"]:
             die(f"no such instance: {name}")
-        start_instance(st, name, timeout=timeout)
-        info(f"instance {name} started (port {st['instances'][name]['port']})")
+        ok = start_with_cookie_retry(st, name, timeout=timeout)
+        info(f"instance {name} started (port {st['instances'][name]['port']})"
+             + ("" if ok else "  [WARNING: no session cookie yet; "
+                              f"retry: dsh-muctl instance refresh-cookie {name}]"))
 
 
 def cmd_instance_stop(args):
@@ -4515,14 +4539,16 @@ def cmd_instance_restart(args):
             die(f"no such instance: {name}")
     for name in args.names:
         stop_instance(st, name, mark=False)
-        start_instance(st, name)
-        info(f"instance {name} restarted (port {st['instances'][name]['port']})")
+        ok = start_with_cookie_retry(st, name, timeout=300.0)
+        info(f"instance {name} restarted (port {st['instances'][name]['port']})"
+             + ("" if ok else "  [WARNING: no session cookie yet; "
+                              f"retry: dsh-muctl instance refresh-cookie {name}]"))
 
 
 def cmd_instance_status(args):
     st = load_state()
     names = args.names or sorted(st["instances"])
-    rows = [("INSTANCE", "USER", "PORT", "UID", "STATE", "SERVICE", "SIZE(MB)")]
+    rows = [("INSTANCE", "USER", "PORT", "UID", "STATE", "LIVE", "SIZE(MB)")]
     missing = []
     for name in names:
         inst = st["instances"].get(name)
@@ -4531,9 +4557,14 @@ def cmd_instance_status(args):
             continue
         base = f"{INSTANCES_DIR}/{name}"
         size = run_out(f"du -sm {base}").split()[0] if os.path.isdir(base) else "-"
+        # STATE is the *service unit's* idea of the world; on real machines that idea goes
+        # stale ("stopped" while the port answers, or "started" while nothing runs), which is
+        # exactly the signal-misalignment that made a working instance look dead. Report both:
+        # STATE = openrc, SERVICE = whether the port actually answers.
+        unit = instance_status(name)
+        live = "listening" if _port_open(int(inst.get("port") or 0)) else "closed"
         rows.append((name, inst.get("user", "-"), str(inst["port"]), str(inst.get("uid", 0)),
-                     instance_status(name),
-                     "ok" if os.path.exists(f"/etc/init.d/dsh-mu-{name}") else "missing", size))
+                     unit, live, size))
     if getattr(args, "json", False):
         keys = [k.lower().replace("(mb)", "_mb") for k in rows[0]]
         print(json.dumps([dict(zip(keys, r)) for r in rows[1:]], indent=2, ensure_ascii=False))
@@ -4604,10 +4635,25 @@ def instance_preflight(st: dict, name: str) -> list[str]:
                 target = f"{nm}/{bundle}"
                 if os.path.islink(target) and not os.path.exists(target):
                     link = os.readlink(target)
-                    # `link:` deps are declared from the jail's view: /home/dsh/X -> <inst>/X
-                    jailish = link.lstrip("./")
-                    host = os.path.normpath(f"{home}/{jailish}")
-                    if not os.path.exists(host):
+                    # `link:` deps are written from the jail's view, and the jail mounts two
+                    # different host directories under /home/dsh:
+                    #   /home/dsh/workspace -> <inst>/workspace      (the live working dir)
+                    #   /home/dsh/.dsh      -> <inst>/home/.dsh      (DSH_HOME)
+                    # Resolving everything against `home` reported healthy links as dangling
+                    # (twice), so map by mount point and skip what we cannot map.
+                    norm = os.path.normpath(os.path.join(os.path.dirname(target), link))
+                    rel = norm.replace(f"{prof}/", "", 1)
+                    if rel.startswith("../../"):
+                        rel = rel[6:]
+                    mapped = None
+                    for prefix, root in (("/home/dsh/workspace", f"{base}/workspace"),
+                                         ("/home/dsh/.dsh", f"{home}/.dsh")):
+                        if rel.startswith(prefix.lstrip("/")) or ("/" + rel).startswith(prefix):
+                            mapped = root + "/" + rel.split(prefix.lstrip("/"), 1)[-1].lstrip("/")
+                            break
+                    if mapped is None:
+                        continue          # cannot judge from the host; leave it alone
+                    if not os.path.exists(mapped):
                         problems.append(f"bundle {bundle} is a dangling link ({link})")
                 elif not os.path.exists(target):
                     problems.append(f"bundle {bundle} is not installed in the profile")
@@ -9167,7 +9213,8 @@ def sorted_plans(plans) -> list[dict]:
 # model is worse than no label at all -- it turned "Claude Haiku 5.5" into a model that
 # refused attachments. The heuristic below only ever *adds* the image modality for
 # families we are confident about; everything else keeps whatever the source declared.
-VISION_FAMILIES = re.compile(r"(claude|gemini|gpt-4|gpt-5|\bo3\b|\bo4\b|vision|vl)", re.I)
+VISION_FAMILIES = re.compile(
+    r"(claude|gemini|gpt-4|gpt-5|\bo3\b|\bo4\b|vision|vl|deepseek)", re.I)
 
 
 def looks_vision_model(model_id: str) -> bool:

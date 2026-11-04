@@ -2,41 +2,49 @@
   "schema": "dsh-mu.provider/v1",
   "id": "mu-deepseek",
   "label": "DeepSeek 官方（Anthropic 端点）",
-  "docs": "https://api-docs.deepseek.com/",
+  "keyless": false,
   "auth": {
     "type": "x-api-key"
   },
+  "headers": {},
   "base_url": "https://api.deepseek.com/anthropic",
   "api": "anthropic-messages",
   "default_model": "deepseek-flash",
   "models": [
     {
       "id": "deepseek-flash",
-      "name": "DeepSeek-V4.1-Flash",
-      "context_window": 1048576,
-      "max_tokens": 393216,
-      "input_modalities": [
+      "api": "anthropic-messages",
+      "base_url": "https://api.deepseek.com/anthropic",
+      "name": "DeepSeek V4.1 Flash",
+      "reasoningEfforts": {
+        "off": "none",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "max": "max"
+      },
+      "inputModalities": [
         "text",
         "image"
       ]
     },
     {
       "id": "deepseek-v4-pro",
-      "name": "DeepSeek-V4-Pro",
-      "context_window": 1048576,
-      "max_tokens": 393216,
-      "input_modalities": [
-        "text"
+      "api": "anthropic-messages",
+      "base_url": "https://api.deepseek.com/anthropic",
+      "name": "DeepSeek V4 Pro",
+      "reasoningEfforts": {
+        "off": "none",
+        "low": "low",
+        "medium": "medium",
+        "high": "high",
+        "max": "max"
+      },
+      "inputModalities": [
+        "text",
+        "image"
       ]
     }
   ],
-  "discover": {
-    "url": "https://api.deepseek.com/models",
-    "api": "openai-completions",
-    "items": "data",
-    "id": "id",
-    "name": "name",
-    "context_window": "context_window",
-    "max_tokens": "max_output_tokens"
-  }
+  "origin": "custom"
 }
