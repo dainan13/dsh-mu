@@ -113,6 +113,15 @@ build_unsigned() {
 		install_file 0644 "$f" "/usr/local/lib/dsh-mu/nginx/$(basename "$f")"
 	done
 	install_file 0644 "$SRC/admin/index.html" /usr/local/lib/dsh-mu/admin/index.html
+	# cockpit 的样式与字体（页面确认过的外观；后端按扩展名白名单静态服务）
+	for f in "$SRC"/admin/*.css; do
+		[ -f "$f" ] && install_file 0644 "$f" "/usr/local/lib/dsh-mu/admin/$(basename "$f")"
+	done
+	if [ -d "$SRC/admin/fonts" ]; then
+		for f in "$SRC"/admin/fonts/*; do
+			[ -f "$f" ] && install_file 0644 "$f" "/usr/local/lib/dsh-mu/admin/fonts/$(basename "$f")"
+		done
+	fi
 	# Operator tools that are not part of the running platform.
 	install_file 0755 "$SRC/tools/purge-dsh-mu.sh" /usr/local/lib/dsh-mu/tools/purge-dsh-mu.sh
 	# Bundled client plugins (preinstalled into every instance by `dsh-muctl sync`).
@@ -127,7 +136,17 @@ build_unsigned() {
 		done
 	fi
 	for f in "$SRC"/gateway/static/*; do
+		[ -f "$f" ] || continue
 		install_file 0644 "$f" "/usr/local/lib/dsh-mu/static/$(basename "$f")"
+	done
+	# 扩展套件：/mu-static/ext-kit/1.css（扩展 iframe 直接引用，版本进 URL）
+	for f in "$SRC"/gateway/static/ext-kit/*; do
+		[ -f "$f" ] || continue
+		install_file 0644 "$f" "/usr/local/lib/dsh-mu/static/ext-kit/$(basename "$f")"
+	done
+	for f in "$SRC"/gateway/static/ext-kit/fonts/*; do
+		[ -f "$f" ] || continue
+		install_file 0644 "$f" "/usr/local/lib/dsh-mu/static/ext-kit/fonts/$(basename "$f")"
 	done
 	# Every test file ships: the python layers (fresh-machine.py, drift-audit.py,
 	# acceptance.sh's helpers, ...) were silently left out before, which would have

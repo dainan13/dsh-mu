@@ -1,0 +1,336 @@
+@charset "utf-8";
+/* ==========================================================================
+   cockpit — Canary UI × DeepSeek Harness
+   --------------------------------------------------------------------------
+   这是 uidesign 里 graphite 之外的第二套风格。它不是"换配色"，而是把两套
+   真实设计系统的不同层拼在一起：
+
+     · 骨架（布局 / 密度 / 组件解剖 / 语义四态）  ← harness/canary
+       packages/core-design-system/design-tokens/components/desktop/base/*.json
+     · 皮相（色板 / 圆角造型 / 字号刻度 / 品牌字） ← @deepseek-ai/dsh-client-ui-theme
+       --dsw-static-* / --dsw-radius-* / --dsw-corner-shape / --dsw-font-family
+
+   所以文件第 1~2 层是**原样搬运的两套底料**，第 3 层才是 cockpit 自己的语义名。
+   组件只允许用第 3 层的名字 —— 以后要改色、改密度，只动第 3 层，别动上面两层。
+
+   契约：uidesign/graphite/SPEC.md（API / 数据 / 耗时 / 产品规矩一字不动）。
+   ========================================================================== */
+
+/* ==========================================================================
+   LAYER 0 — DSH 底料（原样，取自 dsh-client-ui-theme/lib/client.js）
+   ========================================================================== */
+:root {
+  /* 中性色（带蓝调）——DSH 的深色是 bluish 950，不是纯灰 */
+  --dsw-static-neutral-bluish-00: #ffffff;
+  --dsw-static-neutral-bluish-50: #f9fafb;
+  --dsw-static-neutral-bluish-75: #f1f3f5;
+  --dsw-static-neutral-bluish-100: #ebeef2;
+  --dsw-static-neutral-bluish-200: #e1e5ee;
+  --dsw-static-neutral-bluish-300: #cfd3d6;
+  --dsw-static-neutral-bluish-400: #adb2b8;
+  --dsw-static-neutral-bluish-500: #979da6;
+  --dsw-static-neutral-bluish-600: #81858c;
+  --dsw-static-neutral-bluish-700: #61666b;
+  --dsw-static-neutral-bluish-750: #43454a;
+  --dsw-static-neutral-bluish-800: #353638;
+  --dsw-static-neutral-bluish-850: #2c2c2e;
+  --dsw-static-neutral-bluish-875: #232324;
+  --dsw-static-neutral-bluish-900: #1b1b1c;
+  --dsw-static-neutral-bluish-950: #151517;
+  --dsw-static-neutral-bluish-1000: #0f1115;
+
+  /* DeepSeek 蓝：DSH 唯一的交互色 */
+  --dsw-static-deepseek-50: #edf3fe;
+  --dsw-static-deepseek-100: #e4edfd;
+  --dsw-static-deepseek-200: #d3e2ff;
+  --dsw-static-deepseek-300: #b7c8fe;
+  --dsw-static-deepseek-400: #7aaaff;
+  --dsw-static-deepseek-450: #5686fe;
+  --dsw-static-deepseek-500: #4176e6;
+  --dsw-static-deepseek-600: #4868b2;
+
+  /* 几何：DSH 的圆角刻度 + 超椭圆造型（DSH 全站都在用） */
+  --dsw-radius-xs: 4px;
+  --dsw-radius-sm: 8px;
+  --dsw-radius-md: 12px;
+  --dsw-radius-lg: 16px;
+  --dsw-radius-xl: 20px;
+  --dsw-corner-shape: superellipse(1.5);
+  --dsw-elevation-stroke: 0 0 0 .5px #ffffff14;
+
+  /* 字号刻度：11 / 12 / 13 / 14 / 16 / 20 / 24 */
+  --dsw-font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --dsw-font-family-brand: "Montserrat", var(--dsw-font-family);
+  --dsw-font-family-code: "SF Mono", "JetBrains Mono", "Fira Code", Consolas,
+    "Liberation Mono", Menlo, Courier, "PingFang SC", "Microsoft YaHei", monospace;
+}
+
+/* ==========================================================================
+   LAYER 1 — Canary 底料（原样，取自 harness/canary design-tokens）
+   ========================================================================== */
+:root {
+  /* 中性色：Canary 的深色是**藏青**，比 DSH 更冷、更深一档 */
+  --canary-gray-25: #fcfcfc;
+  --canary-gray-300: #bec3ce;
+  --canary-gray-400: #b5bbc7;
+  --canary-gray-500: #989ea8;
+  --canary-gray-600: #848892;
+  --canary-gray-700: #6b7079;
+  --canary-gray-800: #484e5c;
+  --canary-gray-850: #2b354a;
+  --canary-gray-900: #1c2230;
+  --canary-gray-950: #141923;
+  --canary-gray-1000: #0d0f12;
+
+  /* 语义色（Canary 的 secondary 是"深底浅字"的暗色 tint，不是 a12 透明色） */
+  --canary-forest-150: #8df5ad;
+  --canary-forest-400: #00cb6c;
+  --canary-forest-800: #006232;
+  --canary-forest-900: #093521;
+  --canary-yellow-200: #ffc833;
+  --canary-yellow-300: #f8af00;
+  --canary-yellow-800: #904f1c;
+  --canary-yellow-950: #342418;
+  --canary-red-400: #ff8f8f;
+  --canary-red-500: #ff5550;
+  --canary-red-850: #8f2c2b;
+  --canary-red-950: #3d1418;
+  --canary-blue-200: #b5dcfd;
+  --canary-blue-300: #5cbdff;
+  --canary-blue-850: #00517c;
+  --canary-blue-950: #082b40;
+
+  /* 组件几何：Canary 的解剖尺寸（btn / table / badge / input / dialog / card） */
+  --ck-ctl-sm: 28px;      /* btn.size.xs */
+  --ck-ctl-md: 32px;      /* btn.size.sm / input.size.md */
+  --ck-ctl-lg: 36px;      /* btn.size.md */
+  --ck-row: 46px;         /* table.cell.min.normal */
+  --ck-row-compact: 40px; /* table.cell.min.compact */
+  --ck-r-ctl: 6px;        /* rounded.3 —— Canary 控件的签名圆角 */
+  --ck-r-card: 8px;       /* rounded.4 */
+  --ck-r-panel: 12px;     /* rounded.5 */
+  --ck-r-dialog: 12px;
+}
+
+/* ==========================================================================
+   LAYER 2 — cockpit 语义层（组件只碰这一层）
+   ========================================================================== */
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* 表面阶梯：Canary 的藏青四档 */
+  --surface-0: var(--canary-gray-1000);   /* 页面底 / 输入框底 */
+  --surface-1: var(--canary-gray-950);    /* 卡片 / 表格 / 弹层内容 */
+  --surface-2: var(--canary-gray-900);    /* 悬停 / 抬升 / 弹窗 */
+  --surface-3: #242c3c;                   /* 按下 / 选中（900→850 之间） */
+  --surface-code: #0a0b0e;                /* 日志 / 代码块，比页面再深一档 */
+  --surface-hover: #ffffff05;
+
+  /* 描边三档：越靠外越亮 */
+  --line-1: #222a38;        /* 行分隔线 */
+  --line-2: var(--canary-gray-850);  /* 面板 / 卡片外框 */
+  --line-3: #5a6274;        /* 控件外框：对 surface-0 ≥3:1（Canary gray-800 太暗） */
+
+  /* 字色：DSH 的 bluish 四级，和 Canary 的 gray 色阶几乎重合，取前者 */
+  --ink-1: var(--dsw-static-neutral-bluish-50);
+  --ink-2: var(--dsw-static-neutral-bluish-400);
+  --ink-3: var(--dsw-static-neutral-bluish-600);
+  --ink-4: var(--dsw-static-neutral-bluish-700);
+  --ink-inv: var(--canary-gray-1000);
+
+  /* 交互色：唯一强调色，DSH DeepSeek 蓝 */
+  --brand: var(--dsw-static-deepseek-500);        /* #4176e6：链接、焦点、选中 */
+  --brand-hover: var(--dsw-static-deepseek-450);  /* #5686fe */
+  --brand-press: var(--dsw-static-deepseek-600);  /* #4868b2 */
+  /* 实心按钮比链接深一档：#4176e6 上的白字只有 4.23:1，差一点点；#3d70dc 是 4.62:1 */
+  --brand-solid: #3d70dc;
+  --brand-solid-hover: #3767cd;
+  --brand-solid-press: #2f5fc4;
+  --brand-ink: var(--dsw-static-deepseek-400);    /* 深底上的链接字 #7aaaff */
+  --brand-soft: color-mix(in srgb, var(--brand) 16%, transparent);
+  --brand-line: color-mix(in srgb, var(--brand) 38%, transparent);
+  --ring: color-mix(in srgb, var(--brand-hover) 34%, transparent);
+
+  /* 状态四态：Canary 的 set.*.secondary（深底 + 浅字 + 描边） */
+  --ok: var(--canary-forest-150);
+  --ok-strong: var(--canary-forest-400);
+  --ok-bg: var(--canary-forest-900);
+  --ok-line: var(--canary-forest-800);
+  --warn: var(--canary-yellow-200);
+  --warn-strong: var(--canary-yellow-300);
+  --warn-bg: var(--canary-yellow-950);
+  --warn-line: var(--canary-yellow-800);
+  --err: var(--canary-red-400);
+  --err-strong: var(--canary-red-500);
+  --err-solid: #c33035;        /* red.800：白字 5.53:1，比 red.500 更像"停止" */
+  --err-solid-hover: #d22d34;  /* red.700 */
+  --err-bg: var(--canary-red-950);
+  --err-line: var(--canary-red-850);
+  --info: var(--canary-blue-300);
+  --info-bg: var(--canary-blue-950);
+  --info-line: var(--canary-blue-850);
+  --idle: var(--ink-2);
+  --idle-bg: var(--surface-2);
+  --idle-line: var(--line-2);
+
+  /* 字体（DSH 字体栈；品牌字只在标识与数字上出现） */
+  --font-ui: var(--dsw-font-family);
+  --font-brand: var(--dsw-font-family-brand);
+  --font-mono: var(--dsw-font-family-code);
+
+  /* 节奏 */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 20px; --sp-6: 24px; --sp-8: 32px;
+  --rail-w: 248px;
+  --topbar-h: 56px;
+
+  /* 形状：Canary 的 6px + DSH 的超椭圆 = 一眼既像 Canary 又像 DSH */
+  --r-ctl: var(--ck-r-ctl);           /* 6px：Canary 控件签名，DSH 刻度里没有这一档 */
+  --r-card: var(--dsw-radius-sm);     /* 8px = Canary rounded.4 */
+  --r-panel: var(--dsw-radius-md);    /* 12px = Canary rounded.5 */
+  --r-dialog: var(--ck-r-dialog);     /* 12px */
+  --shape: var(--dsw-corner-shape);
+
+  /* 阴影：DSH lv3 + Canary 的大阴影取中间值 */
+  --shadow-1: 0 1px 2px #0000006b, inset 0 1px 0 #ffffff0a;
+  --shadow-2: 0 12px 32px -10px #000000b8, 0 2px 6px #00000059;
+  --shadow-3: 0 24px 64px -16px #000000cc, 0 2px 8px #00000073;
+  /* 组件里需要随主题变的值（以前是写死的十六进制，浅色下会露馅） */
+  --surface-dialog: var(--surface-2);     /* 弹窗 / toast 的底 */
+  --surface-thead: var(--surface-1);      /* 表头 */
+  --control-line-hover: #6b7488;          /* 控件 hover 描边 */
+  --card-inset: inset 0 1px 0 #ffffff08;  /* 卡片顶部高光 */
+  --chip-bg: #ffffff0a;                   /* 计数 chip / 日志脱敏块 */
+  --glyph-bg: #ffffff04;                  /* 空态图标底 / 日志头 */
+  --scroll-thumb: #37425a;
+  --scroll-thumb-hover: #4b5876;
+  --seg-shadow: 0 1px 2px #00000059, inset 0 1px 0 #ffffff0d;
+  --scrim: #04060ab8;
+  --log-msg: #c4cbd6;
+  --log-ln: #3d4759;
+  --log-out: #6f7c92;
+  --log-err-bg: #ff555008;
+  --log-err-msg: #ffd7d7;
+  --rowfail-bg: #ff55500a;
+  --notice-info-fg: #cbe8ff;
+  --notice-warn-fg: #ffdf9a;
+  --notice-danger-fg: #ffc9c9;
+  --notice-ok-fg: #c6f8d8;
+  --mark-bg: linear-gradient(160deg, #232c3c, var(--surface-1));
+  --mark-fg: var(--ink-1);
+  --mark-border: var(--line-2);
+  --mark-inset: inset 0 1px 0 #ffffff0f;
+  --skeleton-a: #ffffff08;
+  --skeleton-b: #ffffff12;
+  --selection-fg: #fff;
+  --canary: #ffc833;                      /* 品牌金丝雀黄：两个主题都是它，不参与状态语义 */
+  --line-dialog: var(--line-3);           /* 弹窗 / toast 外框（浅色下要比控件描边软） */
+
+  --focus: 0 0 0 3px var(--ring);
+}
+
+/* ==========================================================================
+   LAYER 2b — 浅色：同一套语义名，另一组值
+   --------------------------------------------------------------------------
+   浅色不是"深色反过来"：表面靠**白卡片 + 冷灰底 + 描边**分层，而不是加深底色；
+   状态色换成 Canary light 的"浅底深字"（success.secondary / warning.secondary …）。
+
+   两处刻意的偏差，都有理由：
+   · 成功色沿用 dark 的 forest 家族（Canary light 用 lime），否则同一件事在两个
+     主题里是两种绿，用户要重新学一遍。
+   · 控件描边 #b6bdc9 对白底只有 1.9:1（WCAG 1.4.11 想要 3:1）—— 再深就变成重描边。
+     补偿手段是 3px 焦点环与"白底 + 灰底页面"的层次，和 GitHub / Linear 的做法一致。
+   ========================================================================== */
+[data-theme="light"] {
+  color-scheme: light;
+
+  --surface-0: #f6f7f9;
+  --surface-1: #ffffff;
+  --surface-2: #f1f3f6;
+  --surface-3: #e7eaef;
+  --surface-code: #f7f8fa;
+  --surface-dialog: #ffffff;
+  --surface-thead: #fafbfc;
+  --surface-hover: #0f111505;
+
+  --line-1: #eceef2;
+  --line-2: #dfe3e9;
+  --line-3: #b6bdc9;
+  --control-line-hover: #9aa3b0;
+
+  --ink-1: var(--dsw-static-neutral-bluish-1000);  /* #0f1115 */
+  --ink-2: var(--canary-gray-800);                 /* #484e5c */
+  --ink-3: var(--canary-gray-700);                 /* #6b7079 */
+  --ink-4: #8b939d;
+  --ink-inv: #ffffff;
+
+  --brand: var(--dsw-static-deepseek-500);
+  --brand-hover: var(--dsw-static-deepseek-450);
+  --brand-press: var(--dsw-static-deepseek-600);
+  --brand-solid: #3a63cc;        /* 白字 5.47:1 */
+  --brand-solid-hover: #3457c9;
+  --brand-solid-press: #2f4fbf;
+  --brand-ink: #3457c9;          /* 白底链接 6.26:1（#4176e6 只有 4.23） */
+  --brand-soft: color-mix(in srgb, var(--brand) 10%, transparent);
+  --brand-line: color-mix(in srgb, var(--brand) 34%, transparent);
+  --ring: color-mix(in srgb, var(--brand) 22%, transparent);
+
+  --ok: #006232;
+  --ok-strong: #00a35a;
+  --ok-bg: #e3fceb;
+  --ok-line: #8df5ad;
+  --warn: #8a4a12;
+  --warn-strong: #b8790a;
+  --warn-bg: #fff4b9;
+  --warn-line: #fedc64;
+  --err: #b3262e;
+  --err-strong: #d22d34;
+  --err-solid: #c33035;
+  --err-solid-hover: #b3292f;
+  --err-bg: #ffe5e6;
+  --err-line: #ffbabc;
+  --info: #00517c;
+  --info-bg: #e1f3fe;
+  --info-line: #b5dcfd;
+
+  --idle: var(--ink-2);
+  --idle-bg: #f1f3f6;
+  --idle-line: #dfe3e9;
+
+  --card-inset: inset 0 1px 0 #ffffff;
+  --chip-bg: #0f111508;
+  --glyph-bg: #0f111506;
+  --scroll-thumb: #c3cad4;
+  --scroll-thumb-hover: #aab2bf;
+  --seg-shadow: 0 1px 2px #1018281f;
+  --scrim: #10182859;
+  --log-msg: #2a313c;
+  --log-ln: #a8b0bd;
+  --log-out: #5b6675;
+  --log-err-bg: #c330350d;
+  --log-err-msg: #a3232b;
+  --rowfail-bg: #c330350d;
+  --notice-info-fg: #00517c;
+  --notice-warn-fg: #7a4210;
+  --notice-danger-fg: #a3232b;
+  --notice-ok-fg: #00552b;
+  --mark-bg: #0f1115;
+  --mark-fg: #f9fafb;
+  --mark-border: #0f1115;
+  --mark-inset: inset 0 1px 0 #ffffff14;
+  --skeleton-a: #0f11150a;
+  --skeleton-b: #0f111512;
+  --selection-fg: #0b1220;
+  --canary: #ffc833;
+  --line-dialog: #d5dbe4;
+
+  --shadow-1: 0 1px 2px #10182814, inset 0 1px 0 #ffffff;
+  --shadow-2: 0 12px 28px -12px #1018282e, 0 2px 6px #10182814;
+  --shadow-3: 0 24px 64px -20px #1018283d, 0 2px 8px #1018281f;
+}
+
+/* ==========================================================================
+   RESET / BASE
+   ========================================================================== */

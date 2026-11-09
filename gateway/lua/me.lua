@@ -99,6 +99,15 @@ if method == "GET" then
 		must_change = u.must_change and true or false,
 		system_account = mu.is_system_admin(name),
 		instance = instance_payload(),
+		-- 实例自己的最近日志（只读、50 行；F2 控制中心用）。
+		-- 走平台内部的只读接口，浏览器侧拿不到别的实例、也拿不到管理台信息。
+		logs = (function()
+			local inst = u.instance
+			if not inst or inst == "" then return {} end
+			local body = mu.internal_get("/instances/" .. inst .. "/logs?lines=50", name)
+			if type(body) ~= "table" then return {} end
+			return as_array(body.lines or body.log or {})
+		end)(),
 		gateway = { host = cfg.gateway_host or "", version = "1.0.0" },
 		plans = (function()
 			local out = {}

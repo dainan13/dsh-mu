@@ -14,7 +14,6 @@ end
 local function page(next_, error, username)
 	local cfg = mu.config()
 	local title = esc(cfg.gateway_host or "dsh-mu")
-	local err_html = error and ('<p class="err">' .. esc(error) .. '</p>') or ""
 	local csrf = ngx.var["cookie_" .. mu.CSRF_COOKIE]
 	if not csrf or csrf == "" then
 		csrf = mu.random_hex(16)
@@ -26,39 +25,73 @@ local function page(next_, error, username)
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
-<title>]] .. title .. [[ · 登录</title>
-<style>
-:root{color-scheme:dark}
-*{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-background:#0f1115;color:#e6e8eb;font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans SC",sans-serif}
-.card{width:min(92vw,380px);background:#171a21;border:1px solid #262b36;border-radius:14px;padding:28px 26px;
-box-shadow:0 18px 50px rgba(0,0,0,.45)}
-h1{margin:0 0 4px;font-size:20px;letter-spacing:.2px}
-.sub{margin:0 0 20px;color:#8b93a1;font-size:13px}
-label{display:block;margin:14px 0 6px;font-size:13px;color:#aeb6c2}
-input{width:100%;padding:10px 12px;border-radius:9px;border:1px solid #303643;background:#0f1218;color:#e6e8eb;font-size:14px}
-input:focus{outline:none;border-color:#4d7cfe;box-shadow:0 0 0 3px rgba(77,124,254,.18)}
-button{width:100%;margin-top:20px;padding:11px;border:0;border-radius:9px;background:#4d7cfe;color:#fff;font-size:15px;font-weight:600;cursor:pointer}
-button:hover{background:#3f6ce8}
-.err{margin:14px 0 0;padding:9px 11px;border-radius:8px;background:rgba(255,86,86,.12);border:1px solid rgba(255,86,86,.35);color:#ff9c9c;font-size:13px}
-.foot{margin-top:18px;color:#6b7280;font-size:12px;text-align:center}
-</style>
+<title>需要访问许可 · DeepSeek Harness</title>
+<link rel="stylesheet" href="/mu-static/auth.css">
 </head>
 <body>
-<form class="card" method="post" action="/login">
-  <h1>DeepSeek Harness</h1>
-  <p class="sub">]] .. title .. [[ · 多实例网关</p>
-  ]] .. err_html .. [[
-  <input type="hidden" name="next" value="]] .. esc(next_) .. [[">
-  <input type="hidden" name="csrf" value="]] .. esc(csrf) .. [[">
-  <label for="u">用户名</label>
-  <input id="u" name="username" autocomplete="username" autocapitalize="none" autofocus required value="]] .. esc(username or "") .. [[">
-  <label for="p">密码</label>
-  <input id="p" name="password" type="password" autocomplete="current-password" required>
-  <button type="submit">登录</button>
-  <div class="foot">登录后进入你自己的隔离实例</div>
-</form>
+<div class="gate">
+  <div class="corners"><i></i><i></i><i></i><i></i></div>
+
+  <header class="top">
+    <div>
+      <div class="mark">DeepSeek <b>Harness</b><span>Synthesize intelligence · dsh-mu gateway</span></div>
+      <div class="rev">]] .. title .. [[ · web profile · <em id="clock">--:--:--</em></div>
+      <div class="ticks"><i class="on"></i><i class="on"></i><i></i><i></i><i></i><i></i></div>
+    </div>
+    <div class="top-right">
+      <div>Gateway <b>]] .. title .. [[</b></div>
+      <div>Login <b>dsh-mu · host</b></div>
+    </div>
+  </header>
+
+  <main class="stage">
+    <div class="welcome" id="welcome">
+      <div class="w1">WELCOME TO</div>
+      <div class="w2">DEEPSEEK HARNESS</div>
+      <div class="w3">
+        <svg viewBox="0 0 50 50" aria-hidden="true"><path fill="currentColor" d="M48.8354 10.0479C48.3232 9.79199 48.1025 10.2798 47.8032 10.5278C47.7007 10.6079 47.6143 10.7119 47.5273 10.8076C46.7793 11.624 45.9048 12.1597 44.7622 12.0957C43.0923 12 41.666 12.5356 40.4058 13.8398C40.1377 12.2319 39.2476 11.272 37.8926 10.6558C37.1836 10.3359 36.4668 10.0156 35.9702 9.31982C35.6235 8.82373 35.5293 8.27197 35.356 7.72754C35.2456 7.3999 35.1353 7.06396 34.7651 7.00781C34.3633 6.94385 34.2056 7.2876 34.0479 7.57568C33.418 8.75195 33.1733 10.0479 33.1973 11.3599C33.2524 14.312 34.4736 16.6641 36.8999 18.3359C37.1758 18.5278 37.2466 18.7197 37.1597 19C36.9946 19.5757 36.7974 20.1357 36.624 20.7119C36.5137 21.0801 36.3486 21.1597 35.9624 21C34.6309 20.4321 33.481 19.5918 32.4644 18.5757C30.7393 16.8721 29.1792 14.9917 27.2334 13.52C26.7764 13.1758 26.3193 12.856 25.8467 12.5518C23.8618 10.584 26.1069 8.96777 26.627 8.77588C27.1704 8.57568 26.8159 7.8877 25.0591 7.896C23.3022 7.90381 21.6953 8.50391 19.647 9.30371C19.3477 9.42383 19.0322 9.51172 18.7095 9.58398C16.8501 9.22363 14.9199 9.14355 12.9033 9.37598C9.10596 9.80762 6.07275 11.6396 3.84326 14.7681C1.16455 18.5278 0.53418 22.7998 1.30664 27.2559C2.11768 31.9521 4.46582 35.8398 8.07373 38.8799C11.8159 42.0322 16.1255 43.5762 21.041 43.2803C24.0269 43.104 27.3516 42.6963 31.1016 39.4561C32.0469 39.936 33.0396 40.1279 34.686 40.272C35.9546 40.3921 37.1758 40.208 38.1211 40.0078C39.6021 39.688 39.4995 38.2881 38.9639 38.0322C34.623 35.9678 35.5762 36.8081 34.71 36.1279C36.9155 33.4639 40.2402 30.6958 41.54 21.728C41.6426 21.0161 41.5557 20.5679 41.54 19.9917C41.5322 19.6396 41.6108 19.5039 42.0049 19.4639C43.0923 19.3359 44.1479 19.0317 45.1167 18.4878C47.9292 16.9199 49.064 14.3438 49.3315 11.2559C49.3711 10.7837 49.3237 10.2959 48.8354 10.0479Z"/></svg>
+        <span>D E E P S E E K · H A R N E S S</span>
+      </div>
+      <div class="en">Access permission required</div>
+    </div>
+
+    <form class="panel" method="post" action="/login" onsubmit="return pending()">
+      <div class="err]] .. (error and " on" or "") .. [[" id="err">]] .. esc(error or "用户名或密码不正确") .. [[</div>
+      <input type="hidden" name="next" value="]] .. esc(next_) .. [[">
+      <input type="hidden" name="csrf" value="]] .. esc(csrf) .. [[">
+      <div class="field">
+        <label for="u">User / 用户名</label>
+        <input class="input" id="u" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" autofocus required value="]] .. esc(username or "") .. [[">
+      </div>
+      <div class="field">
+        <label for="p">Passphrase / 密码</label>
+        <input class="input" id="p" name="password" type="password" autocomplete="current-password" required placeholder="••••••••">
+      </div>
+      <button class="btn primary block" id="go" type="submit">进入实例 · ENTER</button>
+      <p class="hint">登录后进入你自己的隔离实例 · isolated instance</p>
+    </form>
+  </main>
+
+  <footer class="rails">
+    <div><span class="bars"><i></i><i></i><i></i></span>[ 01 / 03 ] Authentication</div>
+    <div class="c">等待用户授权… <span class="blink"></span></div>
+    <div class="r">Powered by DeepSeek · <b>dsh-mu</b></div>
+  </footer>
+</div>
+<script>
+  const clock = document.getElementById('clock');
+  if (clock) { const tick = () => { clock.textContent = new Date().toTimeString().slice(0, 8); }; tick(); setInterval(tick, 1000); }
+  function pending() {
+    const u = document.getElementById('u'), p = document.getElementById('p');
+    const err = document.getElementById('err'), go = document.getElementById('go');
+    const welcome = document.getElementById('welcome');
+    if (!u.value.trim() || !p.value.trim()) { err.classList.add('on'); if (welcome) welcome.classList.remove('pending'); return false; }
+    err.classList.remove('on');
+    go.disabled = true; go.textContent = '正在验证…';
+    if (welcome) welcome.classList.add('pending');
+    return true;   // 继续原生 POST（校验在网关侧）
+  }
+</script>
 </body>
 </html>
 ]])

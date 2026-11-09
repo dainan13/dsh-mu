@@ -179,24 +179,43 @@ window.__ModuleLoader__.load({
       // `/me` returns `plans` as an ARRAY; reading `.plans.plans` always yielded
       // undefined, so the dropdown was empty for everyone -- team plans included.
       const rawPlans = Array.isArray(me.plans) ? me.plans : ((me.plans || {}).plans || []);
+      // 套餐没声明子集（models/effective_models 都空）= 该 provider 的**全部模型**，
+      // 所以回退到 /me 里 providers[] 的模型列表，否则这些套餐在下拉里会消失。
+      const provs = Array.isArray(me.providers) ? me.providers : [];
+      const provModels = {};
+      provs.forEach((pv) => { provModels[pv.id] = pv.models || []; });
+      const mid = (m) => (typeof m === 'string' ? m
+        : (m && (m.id || m.name)) ? String(m.id || m.name) : '');
+      const modelsOf = (p) => {
+        const raw = (p.effective_models && p.effective_models.length) ? p.effective_models
+          : (p.models && p.models.length) ? p.models
+          : (provModels[p.provider] || []);
+        return raw.map(mid).filter(Boolean);
+      };
       const plans = rawPlans
-        .map((p) => ({ ...p, models: ((p.effective_models && p.effective_models.length)
-          ? p.effective_models : (p.models || [])) }))
+        .map((p) => ({ ...p, models: modelsOf(p) }))
         .filter((p) => (p.models || []).length);
       // `/me` names the user's own pick `my_default` (`default` never existed).
       const current = me.my_default || me.default || {};
       const value = current.plan && current.model ? current.plan + '|' + current.model : '';
       const save = async (raw) => {
-        if (!raw) return;
-        const parts = raw.split('|');
+        // 选"（保持平台默认）"= 清掉我自己的覆盖，必须真的发请求（原来直接 return ✗ 保存不上 ✗）
+        const clear = !raw;
+        const parts = clear ? ['', ''] : raw.split('|');
         try {
           const res = await fetch('/me', { method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ action: 'plan-default', id: parts[0], plan: parts[0],
-                                   model: parts[1] }) });
+            body: JSON.stringify(clear
+              ? { action: 'plan-default-clear' }
+              : { action: 'plan-default', id: parts[0], plan: parts[0], model: parts[1] }) });
           const doc = await res.json().catch(() => ({}));
           const why = (doc && (doc.detail || doc.error)) || res.status;
-          setNote(res.ok ? '已设为默认模型' : '失败：' + why);
+          setNote(res.ok ? (clear ? '已恢复平台默认' : '已设为默认模型') : '失败：' + why);
+          if (res.ok) {
+            // 保存后重新读一次，让下拉反映真实值（否则重开面板才更新）
+            fetch('/me', { headers: { accept: 'application/json' } })
+              .then((r2) => r2.json()).then(setMe).catch(() => {});
+          }
         } catch (e) { setNote('失败：' + e.message); }
       };
       const options = [jsx.jsx('option', { value: '', children: '（保持平台默认）' }, '__none')];
@@ -225,6 +244,7 @@ window.__ModuleLoader__.load({
       const [form, setForm] = useState({ name: '', provider: '', key: '' });
       const [msg, setMsg] = useState('');
       const [busy, setBusy] = useState(false);
+      const [showAdd, setShowAdd] = useState(false);
 
       const load = useCallback(async () => {
         try {
@@ -233,7 +253,7 @@ window.__ModuleLoader__.load({
             loading: false, error: '',
             user: d.user || '',
             providers: d.providers || [],
-            plans: (d.plans || []).filter((p) => p.own),
+            plans: d.plans || [],
           });
           if (!form.provider && (d.providers || []).length) {
             setForm((f) => ({ ...f, provider: d.providers[0].id }));
@@ -302,66 +322,108 @@ window.__ModuleLoader__.load({
         ] });
       }
 
-      return jsx.jsxs('div', { style: { padding: '8px 4px', fontSize: 14, lineHeight: 1.8 }, children: [
-        jsx.jsx('h2', { style: { margin: '0 0 4px' }, children: '模型（dsh-mu）' }),
-        jsx.jsx('p', { style: { margin: '0 0 14px', opacity: 0.7, fontSize: 13 },
-          children: `当前账号：${state.user || '（未知）'}。平台托管的 provider 只能选、不能改；key 保存在平台，实例里不落地。` }),
+      const hint = { margin: '0 0 6px', fontSize: 12.5, color: 'var(--dsw-alias-label-caption, #8b939d)' };
+      const h3 = { fontSize: 13, margin: '18px 0 8px' };
+      const plRow = { display: 'flex', alignItems: 'baseline', gap: 10, padding: '7px 10px',
+                      border: '1px solid var(--dsw-alias-border-l2, #e6e8eb)',
+                      borderRadius: 8, marginBottom: 6, fontSize: 12.5 };
+      const keyRow = { display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px',
+                       border: '1px solid var(--dsw-alias-border-l2, #e6e8eb)',
+                       borderRadius: 8, marginBottom: 6, fontSize: 12.5 };
+      const addBtn = { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
+                       width: '100%', height: 36, border: '1px dashed var(--dsw-alias-border-l2, #e6e8eb)',
+                       borderRadius: 8, background: 'transparent', color: 'inherit',
+                       cursor: 'pointer', font: '12.5px var(--dsw-font-family, system-ui)' };
+      const cap = { color: 'var(--dsw-alias-label-caption, #8b939d)' };
+      const provModels = {};
+      (state.providers || []).forEach((pv) => { provModels[pv.id] = pv.models || []; });
+      const mid = (m) => (typeof m === 'string' ? m
+        : (m && (m.id || m.name)) ? String(m.id || m.name) : '');
+      const modelsOf = (p) => {
+        const raw = (p.effective_models && p.effective_models.length) ? p.effective_models
+          : (p.models && p.models.length) ? p.models
+          : (provModels[p.provider] || []);
+        return raw.map(mid).filter(Boolean);
+      };
 
-        jsx.jsx('h3', { style: { fontSize: 13, margin: '0 0 8px' }, children: '添加我自己的 key' }),
-        row('套餐名', input({ value: form.name, placeholder: '我的 groq',
-                              onChange: (e) => setForm((f) => ({ ...f, name: e.target.value })) })),
-        row('provider', jsx.jsx('select', {
-          value: form.provider,
-          onChange: (e) => setForm((f) => ({ ...f, provider: e.target.value })),
-          style: { flex: 1, padding: '6px 8px', borderRadius: 6, background: 'transparent',
-                   color: 'inherit', fontSize: 13 },
-          children: state.providers.length
-            ? state.providers.map((p) => jsx.jsxs('option', {
-                value: p.id,
-                children: [`${p.id} · ${p.label || ''}（${(p.models || []).length} 模型`,
-                           p.origin === 'dsh' ? ' · DSH' : '', '）'],
-              }, p.id))
-            : jsx.jsx('option', { value: '', children: '（管理员还没有导入可托管的 provider）' }),
-        })),
-        row('API key', input({ type: 'password', value: form.key, placeholder: '只发送到平台，0600 保存',
-                                autoComplete: 'new-password',
-                                onChange: (e) => setForm((f) => ({ ...f, key: e.target.value })) })),
-        jsx.jsx('div', { style: { marginLeft: 84 }, children: jsx.jsx('button', {
-          type: 'button', disabled: busy, onClick: submit,
-          style: { padding: '6px 14px', borderRadius: 6, cursor: 'pointer', fontSize: 13 },
-          children: busy ? '保存中…' : '保存',
+      return jsx.jsxs('div', { style: { padding: '8px 4px', fontSize: 13, lineHeight: 1.6 }, children: [
+        jsx.jsx('h2', { style: { margin: '0 0 4px' }, children: '模型（dsh-mu）' }),
+        jsx.jsx('p', { style: { ...hint, marginBottom: 14 },
+          children: '平台托管的 provider 只能选、不能改；你自己的 key 保存在平台，加密后不回显。'
+            + (state.user ? `（当前账号 ${state.user}）` : '') }),
+
+        jsx.jsx('h3', { style: { ...h3, marginTop: 0 }, children: '我的默认模型' }),
+        jsx.jsx('p', { style: hint, children: '选中即生效；平台套餐和我添加的 key 都在一个列表里' }),
+        jsx.jsx(MuDefaultModel, {}),
+
+        jsx.jsx('h3', { style: h3, children: '平台提供的套餐' }),
+        (() => {
+          const shared = (state.plans || []).filter((p) => !p.own);
+          if (!shared.length) return jsx.jsx('div', { style: { ...cap, fontSize: 12.5 },
+            children: '平台还没有给这个账号分配套餐。' });
+          return shared.map((p) => jsx.jsxs('div', { style: plRow, key: p.id, children: [
+            jsx.jsx('span', { style: { fontWeight: 500 }, children: p.name || p.id }),
+            jsx.jsx('span', { style: { ...cap, fontSize: 12 },
+              children: `${p.provider || ''} · ${modelsOf(p).join(' / ') || '未声明模型'}` }),
+          ] }));
+        })(),
+
+        jsx.jsx('h3', { style: h3, children: '我添加的 key' }),
+        (state.plans || []).filter((p) => p.own).length
+          ? (state.plans || []).filter((p) => p.own).map((p) => jsx.jsxs('div', { style: keyRow, key: p.id, children: [
+              jsx.jsx('span', { style: { fontWeight: 500 }, children: p.name }),
+              jsx.jsx('span', { style: { ...cap, fontSize: 12 },
+                children: `${p.provider} · ${p.has_key ? '加密保存，不回显' : 'key 缺失'}`
+                  + ` · ${(p.effective_models || []).length} 个模型` }),
+              jsx.jsxs('span', { style: { marginLeft: 'auto', display: 'flex', gap: 6 }, children: [
+                jsx.jsx('button', { type: 'button', disabled: busy, onClick: () => act('probe', p.id),
+                                    style: { fontSize: 12 }, children: '检测' }),
+                jsx.jsx('button', { type: 'button', disabled: busy, onClick: () => act('delete', p.id),
+                                    style: { fontSize: 12 }, children: '删除' }),
+              ] }),
+            ] }))
+          : jsx.jsx('div', { style: { ...cap, fontSize: 12.5 }, children: '还没有。' }),
+
+        msg ? jsx.jsx('p', { style: { margin: '10px 0 0', fontSize: 12.5, opacity: 0.85 }, children: msg }) : null,
+
+        jsx.jsx('div', { style: { marginTop: 14 }, children: showAdd ? null : jsx.jsx('button', {
+          type: 'button', style: addBtn, onClick: () => setShowAdd(true),
+          children: '＋ 添加模型提供商',
         }) }),
 
-        msg ? jsx.jsx('p', { style: { margin: '10px 0 0', fontSize: 13, opacity: 0.85 }, children: msg }) : null,
+        showAdd ? jsx.jsxs('div', { style: { marginTop: 8, padding: 10,
+          border: '1px solid var(--dsw-alias-border-l2, #e6e8eb)', borderRadius: 8 }, children: [
+          row('套餐名', input({ value: form.name, placeholder: '我的 groq',
+                                onChange: (e) => setForm((f) => ({ ...f, name: e.target.value })) })),
+          row('provider', jsx.jsx('select', {
+            value: form.provider,
+            onChange: (e) => setForm((f) => ({ ...f, provider: e.target.value })),
+            style: { flex: 1, padding: '6px 8px', borderRadius: 6, background: 'transparent',
+                     color: 'inherit', fontSize: 13 },
+            children: state.providers.length
+              ? state.providers.map((pv) => jsx.jsx('option', { value: pv.id,
+                  children: `${pv.id} · ${pv.label || ''}（${(pv.models || []).length} 模型）` }, pv.id))
+              : jsx.jsx('option', { value: '', children: '（管理员还没有导入可托管的 provider）' }),
+          })),
+          row('API key', input({ type: 'password', value: form.key,
+                                  placeholder: '只发送到平台，加密保存，不回显',
+                                  autoComplete: 'new-password',
+                                  onChange: (e) => setForm((f) => ({ ...f, key: e.target.value })) })),
+          jsx.jsxs('div', { style: { marginLeft: 84, display: 'flex', gap: 8 }, children: [
+            jsx.jsx('button', { type: 'button', onClick: () => setShowAdd(false),
+                                style: { padding: '6px 12px', borderRadius: 8, cursor: 'pointer', fontSize: 12.5 },
+                                children: '取消' }),
+            jsx.jsx('button', { type: 'button', disabled: busy, onClick: submit,
+                                style: { padding: '6px 12px', borderRadius: 8, cursor: 'pointer', fontSize: 12.5,
+                                         background: '#3b82f6', borderColor: '#3b82f6', color: '#fff' },
+                                children: busy ? '保存中…' : '保存' }),
+          ] }),
+        ] }) : null,
 
-        jsx.jsx('h3', { style: { fontSize: 13, margin: '20px 0 8px' }, children: '我添加的' }),
-        state.plans.length
-          ? jsx.jsx('table', { style: { width: '100%', borderCollapse: 'collapse', fontSize: 13 },
-            children: jsx.jsx('tbody', { children: state.plans.map((p) => jsx.jsxs('tr', {
-              children: [
-                jsx.jsx('td', { style: { padding: '6px 8px 6px 0' }, children: jsx.jsx('b', { children: p.name }) }),
-                jsx.jsx('td', { style: { padding: '6px 8px', opacity: 0.75 }, children: p.provider }),
-                jsx.jsx('td', { style: { padding: '6px 8px', opacity: 0.75 },
-                                children: p.has_key ? 'key 已保存' : 'key 缺失' }),
-                jsx.jsx('td', { style: { padding: '6px 0', opacity: 0.75 },
-                                children: `${(p.effective_models || []).length} 个模型` }),
-                jsx.jsx('td', { style: { textAlign: 'right', whiteSpace: 'nowrap' }, children: [
-                  jsx.jsx('button', { type: 'button', disabled: busy, onClick: () => act('probe', p.id),
-                                      style: { marginRight: 6, fontSize: 12 }, children: '检测可用模型' }),
-                  jsx.jsx('button', { type: 'button', disabled: busy, onClick: () => act('delete', p.id),
-                                      style: { fontSize: 12 }, children: '删除' }),
-                ] }),
-              ],
-            }, p.id)) }),
-          })
-          : jsx.jsx('div', { style: { opacity: 0.6, fontSize: 13 }, children: '还没有。' }),
-
-        jsx.jsx('h3', { style: { fontSize: 13, margin: '20px 0 6px' }, children: '我的默认模型' }),
-        jsx.jsx(MuDefaultModel, {}),
-        jsx.jsx('h3', { style: { fontSize: 13, margin: '20px 0 6px' }, children: 'Copilot / Codex' }),
-        jsx.jsx('div', { style: { opacity: 0.7, fontSize: 13 },
-          children: '这两个没有静态 API key，所以不在这里配置：Copilot 由平台代为换取短时令牌'
-            + '（需要账号有 Copilot 权益，正在验证）；Codex 目前未提供入口。' }),
+        jsx.jsx('h3', { style: h3, children: 'Copilot / Codex' }),
+        jsx.jsx('div', { style: { ...cap, fontSize: 12.5 },
+          children: '这两个没有静态 API key，所以不在这里配置：Copilot 由平台代为换取短时令牌；'
+            + 'Codex 目前未提供入口。' }),
       ] });
     }
 
@@ -527,6 +589,13 @@ window.__ModuleLoader__.load({
             .then((r) => r.json()).then(setMe).catch(() => {});
         }, []);
         const inst = (me && me.instance) || {};
+        const plans = (me && me.plans && me.plans.plans) || [];
+        const myPlan = (me && me.my_default && me.my_default.plan) || '';
+        const planName = (plans.find((x) => x.id === myPlan) || {}).name || myPlan || '—';
+        const stateText = inst.live ? '运行中' : (inst.state || '未运行');
+        const instText = inst.name
+          ? `${inst.name}${inst.port ? ' · 端口 ' + inst.port : ''} · ${stateText}`
+          : '—';
         const change = async () => {
           const next = window.prompt('新的登录密码：');
           if (!next) return;
@@ -538,17 +607,47 @@ window.__ModuleLoader__.load({
             setNote(res.ok ? '密码已修改' : '失败：' + ((doc && doc.error) || res.status));
           } catch (e) { setNote('失败：' + (e && e.message || e)); }
         };
-        return muCard('我的账号', [
-          muRow('用户名', (me && me.user) || '—'),
-          muRow('角色', (me && me.role) || '—'),
-          muRow('实例', inst.port ? ':' + inst.port : '未启动'),
-          muRow('套餐', ((me && me.plans && me.plans.plans) || []).length + ' 个'),
-          jsx.jsxs('div', { style: { marginTop: 14, display: 'flex', gap: 8,
-                                     alignItems: 'center' }, children: [
+        // 结构照 dsh-native.html 的「我的账号」：头部（dot+账号+账号·dsh-mu）
+        // + 四项 kv（账号/实例/套餐/上次登录）+ 三个动作（修改密码/关闭/退出登录）
+        const kv = (k, v) => jsx.jsxs('div', {
+          style: { display: 'grid', gridTemplateColumns: '76px 1fr', gap: '6px 12px',
+                   fontSize: 12.5, marginBottom: 6 },
+          children: [
+            jsx.jsx('span', { style: { color: 'var(--dsw-alias-label-caption, #8b939d)' }, children: k }),
+            jsx.jsx('span', { children: v }),
+          ],
+        });
+        return jsx.jsxs('div', {
+          style: {
+            width: 'min(420px, 92vw)', padding: '18px 18px 14px', borderRadius: 14,
+            background: 'var(--dsw-alias-bg-base, #fff)',
+            border: '1px solid var(--dsw-alias-border-l2, #e6e8eb)',
+            color: 'var(--dsw-alias-label-primary, #1b1b1c)',
+            boxShadow: '0 24px 60px rgba(0,0,0,.18)', fontSize: 13, lineHeight: 1.55,
+          },
+          children: [
+          jsx.jsxs('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 },
+            children: [
+              jsx.jsx('span', { style: { width: 8, height: 8, borderRadius: '50%',
+                                         background: '#22c55e', flex: '0 0 auto' } }),
+              jsx.jsx('span', { style: { fontWeight: 600 }, children: (me && me.user) || '—' }),
+              jsx.jsx('span', { style: { fontSize: 11.5,
+                color: 'var(--dsw-alias-label-caption, #8b939d)' }, children: '账号 · dsh-mu' }),
+            ] }),
+          kv('账号', (me && me.user) || '—'),
+          kv('实例', instText),
+          kv('套餐', planName),
+          kv('上次登录', '—'),
+          note ? jsx.jsx('div', { style: { fontSize: 12, marginBottom: 6, opacity: 0.85 },
+                                  children: note }) : null,
+          jsx.jsxs('div', { style: { display: 'flex', gap: 8, marginTop: 12,
+                                     borderTop: '1px solid var(--dsw-alias-border-l2, #e6e8eb)',
+                                     paddingTop: 12 }, children: [
             muBtn('修改密码', change, true),
-            note ? jsx.jsx('span', { style: { fontSize: 12, opacity: 0.8 }, children: note }) : null,
+            muBtn('关闭', () => props.close()),
+            muBtn('退出登录', () => { window.location.href = '/logout'; }),
           ] }),
-        ], props.close);
+        ] });
       }
 
       function MuMoreMenu(props) {
@@ -597,8 +696,12 @@ window.__ModuleLoader__.load({
           // be left completely alone.
           const rows = Array.from(menu.querySelectorAll('[role="menuitem"], button, li, a'));
           const texts = rows.map((el) => (el.textContent || '').trim());
+          // 认"账号菜单"的条件放宽：它一定有原生的「设置」行，且不止一项。
+          // 0.95.x 用「意见反馈」/「Ctrl + Alt + ,」能认出来，换版本这些文案会变 ✗
+          const hasSettings = texts.some((x) => x.startsWith('设置'));
           const isAccountMenu = texts.includes('意见反馈')
-            || menu.textContent.indexOf('Ctrl + Alt + ,') >= 0;
+            || menu.textContent.indexOf('Ctrl + Alt + ,') >= 0
+            || (hasSettings && texts.length >= 2);
           if (!isAccountMenu) continue;
           // a) hide the entries this platform replaces
           for (const el of rows) {
@@ -671,64 +774,8 @@ window.__ModuleLoader__.load({
       // user looks for next to 插件 / 自动化任务. That list is rendered by DSH with no
       // slot, so the row is added to its <nav> and styled like the rows around it --
       // including their hover, and hiding the label when the sidebar is collapsed.
-      const muPanelRow = () => {
-        const nav = document.querySelector('nav[class*="panelList"], nav[class*="panel-list"]');
-        if (!nav || nav.querySelector('[data-dsh-mu-instance-row]')) return !!nav;
-        const row = document.createElement('button');
-        row.type = 'button';
-        row.setAttribute('data-dsh-mu-instance-row', '1');
-        row.style.cssText = 'display:flex;align-items:center;gap:10px;width:100%;'
-          + 'padding:8px 10px;margin:0 0 4px;border:0;border-radius:8px;background:transparent;'
-          + 'color:inherit;font:inherit;font-size:13px;cursor:pointer;text-align:left;'
-          + 'white-space:nowrap;overflow:hidden';
-        row.addEventListener('mouseenter', () => { row.style.background = 'rgba(127,127,127,.12)'; });
-        row.addEventListener('mouseleave', () => { row.style.background = 'transparent'; });
-        row.addEventListener('click', () => muOverlay((close) => jsx.jsx(MuInstancePanel, { close })));
-
-        const dot = document.createElement('span');
-        dot.style.cssText = 'flex:0 0 auto;width:9px;height:9px;border-radius:50%;background:#94a3b8';
-        const label = document.createElement('span');
-        label.style.cssText = 'overflow:hidden;text-overflow:ellipsis';
-        label.textContent = '实例状态';
-        row.appendChild(dot);
-        row.appendChild(label);
-
-        // Collapsed sidebar: DSH narrows the <nav> to icons, so drop the label and centre
-        // the dot instead of letting it overflow.
-        const syncWidth = () => {
-          const narrow = nav.clientWidth > 0 && nav.clientWidth < 90;
-          label.style.display = narrow ? 'none' : '';
-          row.style.justifyContent = narrow ? 'center' : 'flex-start';
-          row.style.padding = narrow ? '8px 0' : '8px 10px';
-        };
-        let observer = null;
-        try {
-          observer = new ResizeObserver(syncWidth);
-          observer.observe(nav);
-        } catch (e) { /* older browser: check on demand instead */ }
-        syncWidth();
-
-        const refresh = () => fetch('/me', { headers: { accept: 'application/json' } })
-          .then((r) => r.json()).then((me) => {
-            const inst = (me && me.instance) || {};
-            const who = (me && me.user) || '';
-            const running = !!inst.live;
-            dot.style.background = running ? '#22c55e' : '#ef4444';
-            label.textContent = who + ' · ' + (running ? '运行中' : '已停止');
-            row.title = who + ' · ' + (running ? '运行中' : '已停止')
-              + (inst.port ? ' · :' + inst.port : '');
-            syncWidth();
-          }).catch(() => {});
-        refresh();
-        setInterval(refresh, 15000);
-        nav.insertBefore(row, nav.firstChild);
-        return true;
-      };
-      try {
-        const panelTimer = setInterval(() => { if (muPanelRow()) clearInterval(panelTimer); }, 400);
-        new MutationObserver(() => muPanelRow())
-          .observe(document.body, { childList: true, subtree: true });
-      } catch (e) { /* cosmetic only */ }
+      // 侧栏「实例状态」那一行已由 /mu-static/mu-shell.js 的实例卡取代（设计稿：
+      // 会话外壳里只保留我们那张卡）。这里不再注入，避免出现两行状态。
 
       // The settings drawer still renders the three account actions this platform has
       // moved into 「更多」. The drawer is being repurposed (a debug/emergency surface with
@@ -754,7 +801,7 @@ window.__ModuleLoader__.load({
         name: 'settings.section',
         id: 'mu-models',
         order: 11,
-        label: () => '模型（mu）',
+        label: () => '模型',
       }, MuModelsSection)), 'dsh-mu: models section');
     }
 

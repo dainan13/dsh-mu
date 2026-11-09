@@ -154,3 +154,43 @@ nginx: [emerg] chown("/var/tmp/nginx/client_body", 100) failed (1: Operation not
 4. 更新受影响的测试（`fresh-rehearsal`、`isolation`、`selftest` 6b、`failure-modes`、`log-rotation`、
    `docker/acceptance` 里对 `nginx -T` 的依赖）；
 5. 再谈第 (3) 项（抽屉 + provider）。
+
+---
+
+## 6. 改网关模板 / Lua 之后怎么让它生效（踩过的坑）
+
+网关不是宿主机的 `openresty`，而是**平台 jail 里的一个 nginx**：
+
+```
+ps 里看到的是：
+  supervisord dsh-mu-gateway -- … dsh-mu-jail --conf /etc/dsh-mu/gateway.conf __gateway \
+        -- nginx -c /etc/dsh-mu-gateway/nginx.conf
+```
+
+于是有两份文件：
+
+| 位置 | 谁写 | 说明 |
+| --- | --- | --- |
+| `/usr/local/lib/dsh-mu/lua/*.lua`、`/usr/local/lib/dsh-mu/nginx/*.conf` | **apk 安装** | 宿主机副本，`dsh-muctl sync` 从这里拷进 jail |
+| `/var/lib/dsh-mu/gateway/usr/local/lib/dsh-mu/…` | **`dsh-muctl sync`**（`render_gateway` → `sync_gateway_etc`） | 网关**实际读**的副本 |
+
+**正确顺序**（漏一步就会"文件是新的、页面是旧的"）：
+
+```sh
+apk add --allow-untrusted --force-overwrite /root/dsh-mu-<ver>.apk
+dsh-muctl sync                       # ① 把 lua/conf 同步进 gateway jail
+rc-service dsh-mu-gateway restart    # ② 重启**网关**（不是 openresty）
+```
+
+反例（今天实际踩到的）：
+
+- 只 `rc-service openresty reload|restart` → 完全没用（那是宿主机的 openresty，不是网关）。
+- 只装包不 `sync` → jail 里还是旧 lua，页面不变。
+- Lua 语法/作用域错误 → 只表现为 **500**，要到 `/var/log/dsh-mu/__gateway.err.log` 看；
+  典型是"函数定义在使用之后"（`gate_shell` 曾因此让未绑定页 500）。
+
+验证一页是否真的换了：
+
+```sh
+curl -s http://127.0.0.1/login | grep -c 'mu-static/auth.css'   # 新登录页应为 1
+```

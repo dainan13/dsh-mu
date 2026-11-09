@@ -20,6 +20,7 @@ import json
 import contextlib
 import shutil
 import os
+import socket
 import re
 import subprocess
 import tempfile
@@ -38,6 +39,9 @@ import dshmuctl as mu  # noqa: E402
 VERSION = mu.VERSION
 STARTED = time.time()
 AUDIT_PATH = f"{mu.LOGS}/audit.log"
+import os as _os
+_os.environ.setdefault("DSH_MU_NO_SELF_RESTART", "1")
+
 WEB_DIR = f"{mu.LIB}/admin"
 # The library's generic state-change records would duplicate the request-level
 # records written below, so turn them off in this process.
@@ -235,8 +239,11 @@ def instance_view(st: dict, name: str) -> dict:
         resources = mu.instance_resources(name)
     except Exception:  # noqa: BLE001 - metrics must never break the instance list
         resources = {}
+    owner = str(inst.get("user") or "")
     return {
         "name": name,
+        # no account (or a stale one): nobody can log in -- surfaced so the UI can badge it
+        "orphan": (not owner) or (owner not in (st.get("users") or {})),
         "resources": resources,
         "user": inst.get("user", ""),
         "port": port,
@@ -247,6 +254,8 @@ def instance_view(st: dict, name: str) -> dict:
         "cookie": bool(inst.get("upstream", {}).get("cookie")),
         "uid": int(inst.get("uid", 0)),
         "limits": {k: inst.get(k) for k in ("cpu_max", "mem_max", "mem_high", "pids_max")},
+        # 弹窗里的"出网策略"预选需要知道当前值（空 = 跟随平台默认）
+        "egress": str(inst.get("egress") or ""),
         "limits_human": mu.human_limits(inst),
         "provider": provider.get("preset", "deepseek"),
         "provider_model": provider.get("model", ""),
@@ -404,7 +413,9 @@ def do_instance_create(st: dict, body: dict) -> tuple[int, dict]:
     name = str(body.get("name", "")).strip()
     if not name:
         return 400, {"error": "name is required"}
-    mu.cmd_instance_create(ns(name=name, user=body.get("user") or name,
+    # `user: ""` means "unbound": allowed, but nobody can log in (see doctor's orphan row)
+    mu.cmd_instance_create(ns(name=name, user=body.get("user") if "user" in body else name,
+                              unbound=not str(body.get("user", name)).strip(),
                               cpu=body.get("cpu_max"), mem=body.get("mem_max"),
                               pids=body.get("pids_max"), port=body.get("port"),
                               cpu_cores=body.get("cpu_cores"), mem_mb=body.get("mem_mb"),
@@ -425,8 +436,12 @@ def do_instance_action(action: str, name: str, body: dict) -> tuple[int, dict]:
     elif action == "refresh-cookie":
         mu.cmd_instance_refresh_cookie(ns(names=[name]))
     elif action == "limits":
-        mu.cmd_instance_limits(ns(name=name, cpu=body.get("cpu_max"),
-                                  mem=body.get("mem_max"), pids=body.get("pids_max")))
+        # 部分更新：没传的项保持当前值（否则 CLI 会用 "None" 覆盖，返回 400）
+        cur = mu.load_state()["instances"].get(name) or {}
+        mu.cmd_instance_limits(ns(name=name,
+                                  cpu=body.get("cpu_max") or cur.get("cpu_max"),
+                                  mem=body.get("mem_max") or cur.get("mem_max"),
+                                  pids=body.get("pids_max") or cur.get("pids_max")))
     return 200, {"instance": instance_view(mu.load_state(), name)}
 
 
@@ -448,12 +463,14 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("POST", re.compile(r"^/api/provider-import$"), "provider_import"),
     ("POST", re.compile(r"^/api/provider-import-all$"), "provider_import_all"),
     ("POST", re.compile(r"^/api/packages/([\w.-]+)/toggle$"), "package_toggle"),
+    ("GET", re.compile(r"^/api/packages/([\w.-]+)/models$"), "package_models"),
     ("GET", re.compile(r"^/api/providers$"), "providers"),
     ("POST", re.compile(r"^/api/providers$"), "provider_save"),
     ("POST", re.compile(r"^/api/provider-test$"), "provider_test"),
     ("POST", re.compile(r"^/api/auth/verify$"), "auth_verify"),
     ("GET", re.compile(r"^/api/auth/status$"), "auth_status"),
     ("POST", re.compile(r"^/api/instances/([\w-]+)/ensure$"), "instance_ensure"),
+    ("POST", re.compile(r"^/api/instances/([\w-]+)/bind-user$"), "instance_bind_user"),
     ("DELETE", re.compile(r"^/api/providers/([\w.-]+)$"), "provider_delete"),
     ("GET", re.compile(r"^/api/provider-spec$"), "provider_spec"),
     ("GET", re.compile(r"^/api/packages$"), "package_list"),
@@ -464,7 +481,9 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("DELETE", re.compile(r"^/api/packages/([\w.-]+)$"), "package_delete"),
     ("GET", re.compile(r"^/api/plugins$"), "plugin_list"),
     ("POST", re.compile(r"^/api/me/instance/restart$"), "me_restart"),
-    ("GET", re.compile(r"^/api/me/plans$"), "me_plans"),
+    ("GET", re.compile(r"^/api/private-models$"), "private_models"),
+    ("GET", re.compile(r"^/api/rail$"), "rail"),
+    ("GET", re.compile(r"^/api/me/plans$"), "me_plans_get"),
     ("POST", re.compile(r"^/api/me/plans$"), "me_plan_action"),
     ("GET", re.compile(r"^/api/plans$"), "plan_list"),
     ("POST", re.compile(r"^/api/plans$"), "plan_add"),
@@ -538,10 +557,127 @@ def apply_plan_change(mu, st, plan=None):
     """
     mu.save_state(st)
     mu.sync_all(st)
-    bounced = []
-    with contextlib.suppress(Exception):
-        bounced = mu.restart_instances_for_plan(st, plan or {"owner": "*", "visible_to": ["*"]})
-    return bounced
+    # 注意：这里**不**动网关。模型清单靠 patch + 实例 F5 生效（已验证）。
+    # 换 key 需要网关注入新的上游凭据，而网关把 relay.json 读进内存不会重读 ——
+    # 临时手段是在 plan_key 分支里重启网关（见 docs/20-设计备忘-模型与key改为查询式.md）。
+    # 不再自动重启实例：一次套餐变更会把 8 个实例全部 bounce（实测 ~5 分钟），
+    # 并把正在对话的人踢下线。patch 只在启动时读，所以这里只把"需要重启才生效"
+    # 这件事如实返回，重启交给操作者（实例页）或下次自然重启。
+    # 实测结论（2026-11-07，lab）：改套餐**不需要重启实例**。
+    # 实例里的模型列表是 relay 动态下发的（DSH 每次打开/刷新页面都会重新取），
+    # 所以新增/删除套餐后用户在实例页 F5 就能选到新模型。
+    # 上一个版本在这里自动重启全部实例，代价是 ~5 分钟和被踢下线 —— 完全不必要。
+    return {"restart_required": False,
+            "note": "套餐改动立即生效：用户在实例页面刷新（F5）后会看到新的模型列表，不需要重启实例。"}
+
+def _scan_model_sources(path, origin):
+    """Report each model provider this file declares, one entry per provider.
+
+    Splitting per provider (instead of per file) matters: a single `cordis.patch.yml`
+    usually carries both the relay rows we wrote and, occasionally, a provider the user
+    added. Judging the whole file as "relayed" would hide that provider; the caller drops
+    the entries whose own baseURL is relayed.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    rows, cur_id = [], None
+    cur_provider, provider_indent = "", None
+    for line in lines:
+        raw = line.rstrip()
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        m = re.match(r"\s*-?\s*id:\s*([\w.@-]+)", raw)
+        if m:
+            cur_id, cur_provider, provider_indent = m.group(1), "", None
+            continue
+        if not cur_id or not cur_id.startswith("llm"):
+            continue
+        m = re.match(r"\s*([\w.@-]+):\s*$", raw)   # a provider key: `  name:`
+        if m and (provider_indent is None or indent > provider_indent):
+            cur_provider, provider_indent = m.group(1), indent
+            continue
+        m = re.search(r"baseURL:\s*[\"']?([^\"'\s]+)", raw)
+        if m:
+            rows.append({"origin": origin, "entries": [cur_id], "provider": cur_provider,
+                         "urls": [m.group(1)], "disabled": False, "relayed": False})
+    disabled_rows, cur = set(), None
+    for line in lines:
+        m = re.match(r"\s*-?\s*id:\s*([\w.@-]+)", line)
+        if m:
+            cur = m.group(1)
+        elif cur and re.search(r"^\s+disabled:\s*true", line):
+            disabled_rows.add(cur)
+    for row in rows:
+        row["disabled"] = row["entries"][0] in disabled_rows
+    return rows
+
+
+def private_models(st):
+    """Each provider in each instance whose baseURL does not go through our relay."""
+    rows = []
+    for name, inst in sorted(st["instances"].items()):
+        base = f"/var/lib/dsh-mu/instances/{name}/home"
+        prof = mu.instance_profile(name) if hasattr(mu, "instance_profile") else "web"
+        pdir = f"{base}/.dsh/profiles/{prof}"
+        found = []
+        for fn in ("cordis.patch.yml", "cordis.yml"):
+            found += _scan_model_sources(f"{pdir}/{fn}", f"配置 {fn}")
+        found += _scan_model_sources(f"{base}/.dsh-mu-provider.yml", "旧 overlay")
+        nm = f"{pdir}/node_modules"
+        try:
+            for pkg in sorted(os.listdir(nm)):
+                subs = ([f"{pkg}/{s}" for s in sorted(os.listdir(f"{nm}/{pkg}"))]
+                        if pkg.startswith("@") else [pkg])
+                for rel in subs:
+                    found += _scan_model_sources(f"{nm}/{rel}/cordis.patch.yml", f"插件 {rel}")
+        except OSError:
+            pass
+        private = [dict(s, relayed=False) for s in found
+                   if not all("/mu-llm/" in u for u in s["urls"])]
+        if private:
+            rows.append({"instance": name, "user": inst.get("user", ""),
+                         "port": inst.get("port"), "sources": private})
+    return {"instances": rows,
+            "count": sum(len(r["sources"]) for r in rows),
+            "note": "只列不改：这些模型来源不经过平台 relay —— 平台不干涉、不代理、不拦截"}
+
+
+def rail(st):
+    """The always-visible rail block: environment, gateway, version, live instance count.
+
+    Deliberately tiny and cheap -- the rail refreshes on its own timer, so it must not drag
+    the full doctor run (or the whole overview payload) along with it.
+    """
+    cfg = st.get("config") or {}
+    rows = list(st["instances"].values())
+
+    def port_up(inst) -> bool:
+        # `live` is not a stored field: the state only records intent, so probe the port.
+        try:
+            port = int(inst.get("port") or 0)
+        except (TypeError, ValueError):
+            return False
+        if not port:
+            return False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+                return True
+        except OSError:
+            return False
+
+    live = sum(1 for i in rows if port_up(i))
+    return {
+        "version": VERSION,
+        "env": cfg.get("environment") or "生产",
+        "gateway": f"{cfg.get('gateway_host') or ''}:{cfg.get('gateway_listen') or ''}",
+        "instances": {"total": len(rows), "live": live,
+                      "running": sum(1 for i in rows if i.get("state") == "running")},
+    }
+
 
 def run_async(fn, actor: str, action: str, target: str, ip: str) -> None:
     """Run a slow platform operation without blocking the HTTP request."""
@@ -705,6 +841,66 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(503, {"error": "admin page missing",
                                             "detail": f"{INDEX_PATH} not installed"})
                 return self._send_html(200, body_bytes.encode())
+            # Static assets that ship next to the page (cockpit's stylesheet + fonts).
+            # Whitelisted extensions only, resolved inside WEB_DIR -- no path traversal.
+            if path.startswith("/") and ".." not in path:
+                rel = path.lstrip("/")
+                if rel.count(".") and rel.rsplit(".", 1)[-1] in ("css", "woff2", "svg", "png", "ico"):
+                    candidate = os.path.normpath(os.path.join(WEB_DIR, rel))
+                    if candidate.startswith(WEB_DIR + os.sep) and os.path.isfile(candidate):
+                        # binary-safe: fonts are woff2, not text
+                        try:
+                            with open(candidate, "rb") as fh:
+                                payload = fh.read()
+                            body = payload
+                        except OSError:
+                            body = None
+                        if body is not None:
+                            ctype = ("text/css; charset=utf-8" if rel.endswith(".css") else
+                                     "font/woff2" if rel.endswith(".woff2") else
+                                     "image/svg+xml" if rel.endswith(".svg") else
+                                     "image/png" if rel.endswith(".png") else
+                                     "image/x-icon")
+                            self.send_response(200)
+                            self.send_header("Content-Type", ctype)
+                            self.send_header("Cache-Control", "public, max-age=300")
+                            self.send_header("Content-Length", str(len(payload)))
+                            self.end_headers()
+                            self.wfile.write(payload)
+                            return
+            # 扩展套件：规范要求 /mu-static/ext-kit/<v>.css（immutable）。
+            # 管理台自己也用同一份，所以两个前缀都映射到 admin/ext-kit.css。
+            for prefix in ("/mu-static/ext-kit/", "/ext-kit/"):
+                if path.startswith(prefix):
+                    rel = path[len(prefix):]
+                    if "/" not in rel and rel.endswith(".css"):
+                        candidate = os.path.join(WEB_DIR, "ext-kit.css")
+                        if os.path.isfile(candidate):
+                            try:
+                                with open(candidate, "rb") as fh:
+                                    payload = fh.read()
+                            except OSError:
+                                payload = None
+                            if payload is not None:
+                                self.send_response(200)
+                                self.send_header("Content-Type", "text/css; charset=utf-8")
+                                self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+                                self.send_header("Content-Length", str(len(payload)))
+                                self.end_headers()
+                                self.wfile.write(payload)
+                                return
+            # ext-ui v1 门户路由：浏览器地址 /admin/ext/<name>/<page>[/<sub>]
+            # 到后端是 /ext/<name>/<page>…；这不是扩展 API（那条走网关的 /ext/<name>/），
+            # 而是 SPA 的页面地址 —— 返回 index.html，前端加载时把它换成 #ext/…  hash。
+            if path.startswith("/ext/") and ".." not in path:
+                accept = self.headers.get("Accept") or ""
+                if "text/html" in accept:
+                    try:
+                        body_bytes = open(INDEX_PATH, encoding="utf-8").read()
+                    except OSError:
+                        body_bytes = None
+                    if body_bytes is not None:
+                        return self._send_html(200, body_bytes.encode())
             if path == "/favicon.ico":
                 return self._send_no_content()
             return self._send(404, {"error": "not found", "path": path})
@@ -843,6 +1039,14 @@ class Handler(BaseHTTPRequestHandler):
             except FileNotFoundError:
                 return 404, {"error": "no such package", "id": groups[0]}
             return 200, {"ok": True, "id": groups[0]}
+        if name == "package_models":
+            # "编辑模型子集"需要具体模型 id；/api/packages 只给数量。
+            pid = groups[0]
+            pkg = mu.load_provider_package(pid) or mu.preset_as_package(pid)
+            if not pkg:
+                return 404, {"error": "unknown provider", "provider": pid}
+            ids = [m["id"] for m in (pkg.get("models") or []) if m.get("id")]
+            return 200, {"id": pid, "count": len(ids), "models": ids}
         if name == "package_toggle":
             payload = body if isinstance(body, dict) else json.loads(body or "{}")
             try:
@@ -875,60 +1079,51 @@ class Handler(BaseHTTPRequestHandler):
             fresh = mu.load_state()
             return 202, {"accepted": True, "instance": inst,
                          "state": (fresh["instances"].get(inst) or {}).get("state", "unknown")}
-        if name in ("me_plans", "me_plan_action"):
+        if name == "me_plans_get":
+            # 实例页的「模型」右栏用：该用户看得到的套餐 + 可托管的 provider + 他的默认模型。
+            # 与管理员接口 /api/plans 同源，只是按用户过滤（own / visible_to / owner）。
+            actor_user = str(actor or "").strip()
+            if not actor_user:
+                return 401, {"error": "no acting user"}
+            st = mu.load_state()
+            users = st.get("users") or {}
+            if actor_user not in users:
+                return 403, {"error": "not a platform account", "user": actor_user}
+            plans = mu.list_plans()
+            rows = []
+            for pid, plan in sorted(plans.items(), key=lambda kv: mu.plan_order_key(kv[1])):
+                owner = plan.get("owner") or "*"
+                vis = plan.get("visible_to") or ["*"]
+                own = owner == actor_user
+                shared = owner == "*" or "*" in vis or actor_user in vis
+                if not (own or shared):
+                    continue
+                rows.append({"id": pid, "name": plan.get("name"),
+                             "provider": plan.get("provider"), "own": own,
+                             "order": plan.get("order"),
+                             "models": plan.get("models") or [],
+                             "effective_models": mu.plan_effective_models(plan),
+                             "has_key": bool(plan.get("has_key")),
+                             "default_model": plan.get("default_model") or ""})
+            provs = []
+            for pid, pkg in sorted((mu.list_provider_packages() or {}).items()):
+                provs.append({"id": pid, "label": (pkg or {}).get("label") or pid,
+                              "models": (pkg or {}).get("models") or [],
+                              "origin": (pkg or {}).get("origin") or "platform"})
+            me_user = users.get(actor_user) or {}
+            # 用户自己的默认模型存在 users[..].default_override（set_user_default_override 写的）
+            # 之前这里读的是 default_plan/default_model（不存在）→ 重新打开下拉永远是空的
+            ov = me_user.get("default_override") or {}
+            return 200, {"plans": rows, "providers": provs,
+                         "my_default": {"plan": str(ov.get("plan") or ""),
+                                        "model": str(ov.get("model") or "")}}
+        if name == "me_plan_action":
             actor_user = str(actor or "").strip()
             if not actor_user:
                 return 401, {"error": "no acting user"}
             st = mu.load_state()
             if actor_user not in (st.get("users") or {}):
                 return 403, {"error": "not a platform account", "user": actor_user}
-            if name == "me_plans":
-                rows = []
-                visible = [pl for pl in mu.plans_for_user(actor_user)]
-                default_id = ""
-                wanted = str((mu.load_config() or {}).get("default_plan") or "")
-                if wanted and any(pl["id"] == wanted for pl in visible):
-                    default_id = wanted
-                elif visible:
-                    default_id = sorted(visible,
-                                        key=lambda p: str(p.get("name") or p["id"]))[0]["id"]
-                for plan in sorted(mu.plans_for_user(actor_user),
-                                   key=mu.plan_order_key):
-                    pid = plan["id"]
-                    own = str(plan.get("owner") or "*") == actor_user
-                    rows.append({"id": pid, "name": plan.get("name"),
-                                 "provider": plan.get("provider"), "own": own,
-                                 "team": not own, "is_default": pid == default_id,
-                                 "enabled": bool(plan.get("enabled", True)),
-                                 "models": plan.get("models") or [],
-                                 "available_models": plan.get("available_models"),
-                                 "last_probe": plan.get("last_probe") or {},
-                                 "effective_models": mu.plan_effective_models(plan),
-                                 "has_key": bool(plan.get("has_key")),
-                                 "default_model": plan.get("default_model") or ""})
-                providers = []
-                for pid, pkg in sorted(mu.list_provider_packages().items()):
-                    if pkg.get("disabled"):
-                        continue
-                    pkg = mu.fill_from_preset(pkg)
-                    providers.append({"id": pid, "label": pkg.get("label") or pid,
-                                      "origin": pkg.get("origin") or "custom",
-                                      "models": [{"id": m["id"], "name": m.get("name") or "",
-                                                  "reasoningEfforts": m.get("reasoningEfforts")}
-                                                 for m in pkg.get("models") or []]})
-                # Providers that only work with an OAuth session: the user configures
-                # them through the harness itself, so they are not plans and the admin
-                # never sees them.
-                native_only = sorted(mu.PROVIDER_NEEDS_USER)
-                # Built-in presets are NOT offered here: an operator imports the
-                # packages they want, and the drawer only lists those (a preset the
-                # user never saw appear out of nowhere was confusing).
-                own_default = mu.user_default_override(st, actor_user)
-                return 200, {"plans": rows, "providers": providers,
-                             "native_only": native_only,
-                             "default": own_default.get("plan") or default_id,
-                             "my_default": own_default,
-                             "team_plans_are_readonly": True}
             action = str(body.get("action") or "")
             if action == "add":
                 name_ = str(body.get("name") or "").strip()
@@ -1001,7 +1196,7 @@ class Handler(BaseHTTPRequestHandler):
                 mu.sync_all(st)
                 bounced = mu.restart_instances_for_plan(st, plan)
                 return 200, {"ok": True, "id": pid, "models": res["models"],
-                             "count": res["count"], "restarted": bounced,
+                             "count": res["count"], **(bounced if isinstance(bounced, dict) else {"restarted": bounced}),
                              "note": ("restarted " + ", ".join(bounced)) if bounced
                                      else "nothing running; the next start uses it"}
             if action == "probe":
@@ -1045,6 +1240,10 @@ class Handler(BaseHTTPRequestHandler):
                                  "override": bool((st_e["instances"][inst] or {}).get("egress")),
                                  "port": int((st_e["instances"][inst] or {}).get("port") or 0)})
                 return 200, {"all_rules": [r["text"] for r in mu.global_egress_allow(st_e)],
+                             # 内置拒绝段（按策略生效）：界面上必须显示真正的 CIDR，
+                             # 不能把"169.254.169.254"当成唯一被拒的目标。
+                             "builtin": {"private4": list(mu.EGRESS_PRIVATE4),
+                                         "private6": list(mu.EGRESS_PRIVATE6)},
                              "policies": ["allowlist", "no-intranet", "open"],
                              "labels": {"allowlist": "全限制", "no-intranet": "禁内网",
                                         "open": "不限制"},
@@ -1131,6 +1330,10 @@ class Handler(BaseHTTPRequestHandler):
                         "port": service.get("port"),
                         "admin_url": (manifest.get("admin") or {}).get("url"),
                         "proxy_path": f"/ext/{ext_name}/",
+                        # UI 确认稿：宿主外壳只认这几个字段决定形态/左轨/tab
+                        "admin_ui": (manifest.get("admin") or {}).get("ui") or None,
+                        "nav": (manifest.get("admin") or {}).get("nav") or None,
+                        "pages": (manifest.get("admin") or {}).get("pages") or [],
                         "egress": (manifest.get("net") or {}).get("egress") or [],
                         "state": mu.ext_status(ext_name),
                         "registered": ext_name in registered,
@@ -1340,12 +1543,25 @@ class Handler(BaseHTTPRequestHandler):
                 key = str(body.get("key") or "").strip()
                 if not key:
                     return 400, {"error": "the credential must not be empty"}
-                plan["key"] = key
+                # save_plan 只有在收到 key= 实参时才写凭据文件；之前这里把 key 塞进 plan
+                # dict 再调用 save_plan(plan)，凭据文件从未更新 —— 所以"换了 key 还能用"。
                 plan["has_key"] = True
-                mu.save_plan(plan)
-                mu.sync_all(mu.load_state())
+                mu.save_plan(plan, key=key)
+                # 托管模式下 key 只在网关（relay.json）里用：必须重写并让网关重载，
+                # 否则换了 key 仍然会拿旧 key 打通 —— 与实例无关，不需要重启实例。
+                st_key = mu.load_state()
+                applied = apply_plan_change(mu, st_key, mu.load_plan(pid))
+                # 临时手段：网关把 relay.json 读进内存，reload 不够，必须 restart 才会用新 key。
+                # 代价是所有实例的模型请求中断约 1–2 秒。长期方案见 docs/20-设计备忘。
+                with contextlib.suppress(Exception):
+                    if os.path.exists("/etc/init.d/openresty"):
+                        subprocess.run(["/sbin/rc-service", "openresty", "restart"],
+                                       check=False, capture_output=True, timeout=120)
+                extra = applied if isinstance(applied, dict) else {"restarted": applied}
+                extra = dict(extra)
+                extra["restart_required"] = False
                 return 200, {"ok": True, "id": pid, "rotated": True,
-                             "tail": key[-4:], "restart_required": True}
+                             "tail": key[-4:], **extra}
             if name == "plan_probe":
                 res = mu.plan_probe_models(plan)
                 if not res.get("ok"):
@@ -1373,7 +1589,14 @@ class Handler(BaseHTTPRequestHandler):
                 return 400, {"error": res.get("error"),
                              "unusable": res.get("unusable") or [],
                              "unknown": res.get("unknown") or []}
-            return 200, {"ok": True, "models": res["models"], "count": res["count"],
+            # 只改 plan 文件不动实例的 patch，实例里的模型清单就还是旧的 —— 这正是
+            # "保存成功但 F5 看不到新模型"的原因。和创建/删除一样走 apply_plan_change。
+            st = mu.load_state()
+            applied = apply_plan_change(mu, st, mu.load_plan(pid))
+            extra = applied if isinstance(applied, dict) else {"restarted": applied}
+            extra = dict(extra)
+            extra["restart_required"] = False   # 与提示一致：改子集只需 F5，不需要重启
+            return 200, {"ok": True, "models": res["models"], "count": res["count"], **extra,
                          "default_model": res.get("default_model") or "",
                          "restart_required": True}
         if name == "plan_list":
@@ -1393,6 +1616,8 @@ class Handler(BaseHTTPRequestHandler):
                              "last_probe": plan.get("last_probe") or {},
                              "effective_models": mu.plan_effective_models(plan),
                              "has_key": bool(plan.get("has_key")),
+                             # 探测（自动检测可用模型）需要 provider 包声明 discover
+                             "discover": bool((mu.plan_package(plan) or {}).get("discover")),
                              "default_model": plan.get("default_model") or ""})
             sp = mu.search_plan(st)
             return 200, {"plans": rows, "default": st["config"].get("default_plan") or "",
@@ -1441,7 +1666,7 @@ class Handler(BaseHTTPRequestHandler):
                 mu.save_config(st["config"])
             bounced = apply_plan_change(mu, st, saved)
             return 200, {"ok": True, "plan": {k: v for k, v in saved.items() if k != "has_key"},
-                         "restarted": bounced}
+                         **(bounced if isinstance(bounced, dict) else {"restarted": bounced})}
         if name == "plan_action":
             st = mu.load_state()
             pid, action = groups
@@ -1459,7 +1684,7 @@ class Handler(BaseHTTPRequestHandler):
                 mu.save_plan(plan)
                 bounced = apply_plan_change(mu, st, plan)
                 return 200, {"ok": True, "id": pid, "hidden": bool(plan.get("hidden")),
-                             "order": plan.get("order"), "restarted": bounced}
+                             "order": plan.get("order"), **(bounced if isinstance(bounced, dict) else {"restarted": bounced})}
             if action == "default":
                 if str(plan.get("owner") or "*") != "*":
                     return 400, {"error": "only team plans can be the platform default"}
@@ -1469,7 +1694,7 @@ class Handler(BaseHTTPRequestHandler):
                 plan["enabled"] = action == "enable"
                 mu.save_plan(plan)
             bounced = apply_plan_change(mu, st, plan)
-            return 200, {"ok": True, "id": pid, "action": action, "restarted": bounced}
+            return 200, {"ok": True, "id": pid, "action": action, **(bounced if isinstance(bounced, dict) else {"restarted": bounced})}
         if name == "plan_delete":
             st = mu.load_state()
             pid = groups[0]
@@ -1487,7 +1712,7 @@ class Handler(BaseHTTPRequestHandler):
                 st["config"].pop("default_plan", None)
                 mu.save_config(st["config"])
             bounced = apply_plan_change(mu, st, gone)
-            return 200, {"ok": True, "id": pid, "restarted": bounced}
+            return 200, {"ok": True, "id": pid, **(bounced if isinstance(bounced, dict) else {"restarted": bounced})}
 
         if name == "health":
             return 200, {"ok": True, "version": VERSION, "uptime_s": int(time.time() - STARTED),
@@ -1507,6 +1732,10 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"user": actor, "role": user.get("role", "user"),
                          "must_change": bool(user.get("must_change")),
                          "instance": user.get("instance") or ""}
+        if name == "rail":
+            return 200, rail(st)
+        if name == "private_models":
+            return 200, private_models(st)
         if name == "overview":
             return 200, overview(st, cfg)
         if name == "users":
@@ -1810,6 +2039,13 @@ class Handler(BaseHTTPRequestHandler):
             mu.cmd_user_del(ns(name=groups[0], with_instance=wants_instance))
             return 200, {"deleted": groups[0], "with_instance": wants_instance,
                          "instance": target or None}
+        if name == "instance_bind_user":
+            target = groups[0]
+            if target not in st["instances"]:
+                return 404, {"error": "no such instance", "instance": target}
+            user = str(body.get("user") or "").strip()
+            mu.cmd_instance_bind_user(ns(name=target, user=user))
+            return 200, {"instance": instance_view(mu.load_state(), target)}
         if name == "instance_create":
             return do_instance_create(st, body)
         if name == "instance_action":

@@ -1,0 +1,26 @@
+  .mu .add { display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%; height: 36px;
+    border: 1px dashed var(--dsw-alias-border-l2, #e6e8eb); border-radius: 8px; background: transparent; color: inherit; cursor: pointer; font: 12.5px var(--dsw-font-family, system-ui); }
+  .mu .add:hover { background: var(--dsw-alias-interactive-bg-hover, #f5f6f7); }
+  .mu .form { margin-top: 8px; padding: 10px; border: 1px solid var(--dsw-alias-border-l2, #e6e8eb); border-radius: 8px; }
+  .mu .form .row { display: flex; gap: 8px; margin-top: 8px; }
+  `;
+
+  /* 一个面板，两个入口：这张侧栏卡、折叠态图标、以及 F2，都只调用下面同一个 openF2()。
+     面板内容/尺寸/状态完全一致，不要拆成两套。 */
+  const cardHTML = `
+    <div class="card" id="card" title="dainan · 运行中 · :3100">
+      <div class="row1"><span class="dot"></span><span class="name">dainan</span><span class="st">运行中</span><span class="port">:3100</span></div>
+      <div class="row2"><span>CPU <b>0.8%</b></span><span>内存 <b>31%</b></span><span>启动 <b>16.4h</b></span></div>
+      <div class="bars"><span class="bar"><i style="width:8%"></i></span><span class="bar"><i style="width:31%"></i></span></div>
+    </div>`;
+  const railHTML = `<div class="rail" id="rail" title="dainan · 运行中 · :3100">
+      <svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+        <rect x="1.9" y="2.6" width="12.2" height="10.8" rx="2.2"></rect>
+        <path d="M4.3 10.9 6.4 7.9l1.9 1.7 3.4-3.8"></path>
+      </svg>
+      <span class="badge"></span>
+    </div>`;
+
+  const host = document.getElementById('muHost');
+  const sh = host.attachShadow({ mode: 'open' });
+  sh.innerHTML = `<style>${CSS}</style><div id="slot">${cardHTML}</div>`;

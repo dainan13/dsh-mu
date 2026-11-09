@@ -1,0 +1,56 @@
+  /* ── 更多菜单（真机菜单壳 + 我们的三项） ─────────────────────────── */
+  const menuLayer = document.getElementById('menuLayer');
+  const setLayer = document.getElementById('setLayer');
+  const TPL_MENU = document.getElementById('tpl-menu').textContent;
+  const TPL_SETTINGS = document.getElementById('tpl-settings').textContent;
+
+  const GEAR = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><circle cx="8" cy="8" r="2.2"></circle><path d="M13 8a5 5 0 0 0-.1-1l1.3-1-1-1.7-1.5.6a5 5 0 0 0-1.7-1L9.7 2H7.3l-.3 1.9a5 5 0 0 0-1.7 1l-1.5-.6-1 1.7 1.3 1a5 5 0 0 0 0 2l-1.3 1 1 1.7 1.5-.6a5 5 0 0 0 1.7 1l.3 1.9h2.4l.3-1.9a5 5 0 0 0 1.7-1l1.5.6 1-1.7-1.3-1c.06-.33.1-.66.1-1Z"></path></svg>';
+  const USER = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><circle cx="8" cy="5.6" r="2.6"></circle><path d="M2.8 13.6c.7-2.3 2.8-3.6 5.2-3.6s4.5 1.3 5.2 3.6"></path></svg>';
+  const OUT = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="M6.5 2.5H3.5v11h3"></path><path d="M9 5l3 3-3 3M12 8H6.5"></path></svg>';
+
+  function menuItem(label, icon, onClick) {
+    const wrap = document.createElement('div');
+    wrap.className = '_itemWrap_4ub78_90';
+    wrap.innerHTML = `<button type="button" role="menuitem" class="_item_4ub78_90">
+      <span class="_itemIcon_4ub78_148">${icon}</span>
+      <span class="_itemLabel_4ub78_190">${label}</span></button>`;
+    wrap.querySelector('button').addEventListener('click', () => { toggleMenu(false); onClick(); });
+    return wrap;
+  }
+
+  function toggleMenu(force) {
+    const on = typeof force === 'boolean' ? force : !menuLayer.dataset.on;
+    if (!on) { menuLayer.innerHTML = ''; delete menuLayer.dataset.on; return; }
+    menuLayer.dataset.on = '1';
+    menuLayer.innerHTML = TPL_MENU;
+    const menu = menuLayer.querySelector('[role=menu]');
+    menu.style.position = 'fixed';
+    menu.style.left = '12px'; menu.style.top = 'auto'; menu.style.bottom = '56px';
+    menu.style.background = 'var(--dsw-alias-bg-layer-1, #fff)';
+    menu.style.border = '1px solid var(--dsw-alias-border-l2, #e6e8eb)';
+    menu.style.borderRadius = '10px';
+    menu.style.boxShadow = '0 12px 32px rgba(0,0,0,.16)';
+    menu.style.padding = '4px';
+    const view = menu.querySelector('.viewport_4ub78_19') || menu.querySelector('[role=presentation]');
+    view.innerHTML = '';
+    view.appendChild(menuItem('设置', GEAR, () => openSettings()));
+    view.appendChild(menuItem('我的账号', USER, () => openAccount()));
+    view.appendChild(menuItem('退出登录', OUT, () => toastish('已退出登录（原型）')));
+    menu.querySelectorAll('._item_4ub78_90').forEach(b => { b.style.border = '0'; b.style.background = 'transparent'; b.style.width = '100%'; b.style.borderRadius = '6px'; });
+    document.addEventListener('click', closeOnOutside, true);
+  }
+  function closeOnOutside(e) {
+    if (!menuLayer.dataset.on) return;
+    if (menuLayer.contains(e.target)) return;
+    toggleMenu(false);
+    document.removeEventListener('click', closeOnOutside, true);
+  }
+
+  function toastish(text) {
+    const el = document.createElement('div');
+    el.textContent = text;
+    el.style.cssText = 'position:fixed;left:50%;bottom:32px;transform:translateX(-50%);z-index:2147483600;' +
+      'padding:8px 14px;border-radius:8px;background:#1b1b1c;color:#fff;font:12.5px system-ui;box-shadow:0 8px 24px rgba(0,0,0,.25)';
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 1600);
+  }
