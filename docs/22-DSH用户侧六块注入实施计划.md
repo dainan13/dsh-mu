@@ -94,7 +94,8 @@
 | 9 | 承载浮层的宿主是 `pointer-events:none` → 面板里所有按钮点不动 | 面板自身必须 `pointer-events:auto` |
 | 10 | 改网关模板后页面不变 | `apk install` → **`dsh-muctl sync`** → **`rc-service dsh-mu-gateway restart`**（不是 openresty） |
 | 11 | 内存/进程数值直接显示 | `/me` 里 `mem_used/mem_max` 是**字节**，要换算 MB |
-| 12 | 想"看起来像设计稿"就自己写样式 ✗ | 先**逐行搬**设计稿的 CSS/结构，再只替换数据绑定；自造类名必然对不上 |
+| 12 | 扩展 iframe 里 DOM 突变刷屏、hover 抖动、按钮点不上（请求面板无异常） | 宿主的 `ready → init` 握手死循环：ready 只回一次 init（docs/21 §7.2.1）；三个探针可定位：iframe load 计数 / init 计数 / DOM 突变计数 |
+| 13 | 想"看起来像设计稿"就自己写样式 ✗ | 先**逐行搬**设计稿的 CSS/结构，再只替换数据绑定；自造类名必然对不上 |
 
 ### 客户机升级的两条操作经验
 

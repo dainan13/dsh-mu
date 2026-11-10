@@ -1,5 +1,30 @@
+# 构建产物
 dist/
-__pycache__/
-*.pyc
 *.apk
 *.tgz
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本地手工脚本 / 一次性提交记录（每次提交完就删 ✓ 不进仓库）
+commit*.sh
+COMMIT_MSG*.txt
+COMMIT_SUBJECT.txt
+
+# 设计参考快照（仓库外 _ref/ 保存；里面是 uidesign 的拷贝 + 六块切片）
+design-ref/
+
+# 临时/编辑器/日志
+.raw/
+tmp/
+*.log
+*.bak
+*.orig
+*.swp
+.DS_Store
+
+# 本机状态库（只在运行机器上）
+state.db
+state.db-wal
+state.db-shm

@@ -144,6 +144,8 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
      "线上 provider 模板库地址（https://… 或 file://…；留空用项目仓库默认）"),
     ("WEB_SEARCH_PLAN", "web_search_plan", "str", "",
      "web_search 工具用哪个套餐（留空=自动挑一个 deepseek 系套餐）"),
+    ("RELAY_SOURCE", "relay_source", "str", "file",
+     "where the relay reads credentials: file (relay.json, default) or db (ask dsh-mud)"),
     ("RELAY_LISTEN", "relay_listen", "int", 8099,
      "代理监听的 loopback 端口（只给本机 jail 用，不对外）"),
     # 24h by default: an unattended browser tab should not stay signed in for a week.
@@ -800,11 +802,16 @@ def render_gateway(st: dict):
         "session_idle_minutes": st["config"].get("session_idle_minutes", 0),
         # Needed by the gateway worker to recognise host administrators.
         "admin_system_users": st["config"].get("admin_system_users", "root"),
+        # relay.lua 读凭据的来源：file（默认，relay.json）| db（问 dsh-mud，带 30s 缓存）
+        "relay_source": st["config"].get("relay_source", "file"),
     }
     atomic_write(f"{GW_DIR}/config.json", json.dumps(public_cfg, sort_keys=True) + "\n",
                  mode=0o640, group=group)
-    with contextlib.suppress(OSError):
-        write_relay_document(st)
+    # relay_source=db 时 relay.json 不再更新（凭据唯一来源 = 库 ✓）；
+    # file 模式（或降级回退）仍照旧写 ✓ 一个配置切回 ✓
+    if str(st["config"].get("relay_source") or "file") != "db":
+        with contextlib.suppress(OSError):
+            write_relay_document(st)
     if str(st["config"].get("gateway_mode") or "jail") == "jail":
         # The gateway jail reads its own copy of these files; refresh it on every
         # state change, otherwise the jail keeps serving a stale cookie/state.
@@ -1281,6 +1288,8 @@ EGRESS_PRIVATE4 = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
                    "100.64.0.0/10", "169.254.0.0/16")
 EGRESS_PRIVATE6 = ("fc00::/7", "fe80::/10")
 RELAY_PORT_FALLBACK = 8099
+RESP_SOCKET_DIR = "/run/dsh-mu"
+RESP_SOCKET_PATH = "/run/dsh-mu/resp.sock"
 
 _EGRESS_HOST_RE = re.compile(r"^[0-9a-fA-F:.]+(/[0-9]{1,3})?$")
 _EGRESS_PORT_RE = re.compile(r"^[0-9]{1,5}$")
@@ -1603,6 +1612,9 @@ def heal_instance_plugin_specs(st: dict) -> list[str]:
 
 def sync_all(st: dict):
     os.makedirs(INST_CONF_DIR, exist_ok=True)
+    # 实例的「终端」依赖 dsh 运行时里的 node-pty 原生模块；缺了就在每次 sync 时补回 ✓
+    with contextlib.suppress(Exception):
+        ensure_dsh_native_modules(quiet=True)
     # /etc/dsh-mu/dsh-mu.conf is the single source of truth: a `config` write must
     # be visible to every render even when the caller still holds an older state
     # snapshot (that mismatch once left a stale TLS block in the nginx fragment).
@@ -3001,6 +3013,10 @@ def write_gateway_jail_conf(cfg: dict, port: int | None = None) -> str:
     if ext_registered():
         os.makedirs("/run/dsh-mu/ext", exist_ok=True)
         mount_list.append("/run/dsh-mu/ext:/run/dsh-mu/ext:rw")
+    # 用量采集（relay → dsh-mud）走 unix socket：网关在独立网络命名空间里连不上宿主
+    # 的 127.0.0.1 ✗，所以把 /run/dsh-mu 里的这个 socket 直接挂进 jail ✓
+    os.makedirs(RESP_SOCKET_DIR, exist_ok=True)
+    mount_list.append(f"{RESP_SOCKET_DIR}:{RESP_SOCKET_DIR}:rw")
     if os.path.isdir(MARKET_DIR):
         # tarballs for the local npm registry; read-only, gateway only
         mount_list.append(f"{MARKET_DIR}:{MARKET_DIR}:ro")
@@ -3070,11 +3086,18 @@ server {{
         set $relay_xkey "";
         set $relay_plan "";
         set $relay_instance "";
+        set $relay_route "";
+        set $relay_endpoint "";
         access_by_lua_file {LIB}/lua/relay.lua;
+        body_filter_by_lua_file {LIB}/lua/relay_usage_filter.lua;
+        log_by_lua_file {LIB}/lua/relay_usage_log.lua;
 
         proxy_pass $relay_target;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
+        # 用量采集要读响应体里的 usage，但网关的 lua 没有 zlib：上游一压缩就什么都读不到 ✗
+        # 让上游用 identity（文本）返回；对用户端没有影响（我们本来也关了 gzip ✓）
+        proxy_set_header Accept-Encoding "";
         proxy_set_header Host $relay_host;
         proxy_set_header Authorization $relay_auth;
         proxy_set_header x-api-key $relay_xkey;
@@ -8074,6 +8097,52 @@ def stale_admin_code() -> bool:
         return False
 
 
+# ------------------------------------------------------------ dsh native modules
+# 共享 dsh 运行时是从 npm 包铺出来的，`node-pty` 的原生模块可能没跟着来 ✗
+# （症状：实例里点「终端」报 Failed to load native module: pty.node ✗）
+# 随包带一份同版本（node-pty 1.2.0-beta.15 / linux-x64）✓ 缺就补 ✓ 幂等 ✓
+VENDOR_PTY = f"{LIB}/vendor/node-pty/pty.node"
+PTY_REL = "node_modules/node-pty/build/Release/pty.node"
+
+
+def dsh_runtime_dirs() -> list[str]:
+    """所有实例实际使用的 dsh 运行时目录（按 conf 里的 DSH_RUNTIME_DIR 去重）。"""
+    dirs: list[str] = []
+    for conf_path in sorted(glob.glob(f"{INST_CONF_DIR}/*.conf")):
+        try:
+            with open(conf_path, encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("DSH_RUNTIME_DIR="):
+                        d = line.split("=", 1)[1].strip().strip('"')
+                        if d and d not in dirs:
+                            dirs.append(d)
+                        break
+        except OSError:
+            continue
+    return dirs
+
+
+def ensure_dsh_native_modules(quiet: bool = True) -> list[str]:
+    """补齐缺失的 pty.node。返回补过的运行时目录（空列表 = 本来就齐）。"""
+    if not os.path.exists(VENDOR_PTY):
+        return []
+    fixed: list[str] = []
+    for rt in dsh_runtime_dirs():
+        target = os.path.join(rt, PTY_REL)
+        if os.path.exists(target):
+            continue
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.copy2(VENDOR_PTY, target)
+            os.chmod(target, 0o755)
+            fixed.append(rt)
+            if not quiet:
+                info(f"restored node-pty native module into {rt}")
+        except OSError as exc:
+            warn(f"could not restore {target}: {exc}")
+    return fixed
+
+
 def restart_admin_if_stale(quiet: bool = False) -> bool:
     if not os.path.exists("/etc/init.d/dsh-mud"):
         return False
@@ -9596,7 +9665,434 @@ def write_relay_document(st: dict) -> str:
     group = nginx_group() if os.geteuid() == 0 else None
     doc = relay_document(st)
     atomic_write(path, json.dumps(doc, sort_keys=True) + "\n", mode=0o640, group=group)
+    # 双写：relay.json 仍是**唯一生效来源**（网关只读它），库只是镜像 + 归集维度。
+    # 这里任何失败都只 WARN，绝不能让"写凭据"因为库的问题失败。
+    try:
+        sync_tokens_to_db(st)
+    except Exception as exc:  # noqa: BLE001 - never break credential writes
+        warn(f"state db mirror skipped: {exc}")
     return path
+
+
+# ---------------------------------------------------------------- state DB
+# 只读起步：库是 relay.json 的**镜像 + 归集维度**，网关仍读 relay.json。
+# 入库绝不写 token 本体到 usage；tokens 表里才有，且另存 token_id（脱敏）。
+STATE_DB = os.environ.get("DSH_MU_STATE_DB", "/var/lib/dsh-mu/state.db")
+SQL_DIR = f"{LIB}/sql"
+
+
+def state_db_connect():
+    import sqlite3
+    os.makedirs(os.path.dirname(STATE_DB), exist_ok=True)
+    db = sqlite3.connect(STATE_DB)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA foreign_keys=ON")
+    schema = os.path.join(SQL_DIR, "001-init.sql")
+    if os.path.exists(schema):
+        with open(schema, encoding="utf-8") as fh:
+            db.executescript(fh.read())
+    # 轻量迁移：CREATE TABLE IF NOT EXISTS 不会给老库补列 ✗（建库后才加的字段靠这里补）
+    _migrate_state_db(db)
+    return db
+
+
+# (表, 列, 列定义) —— 只做加法，幂等
+_DB_ADDITIONS = [
+    ("usage", "request_id", "TEXT NOT NULL DEFAULT ''"),
+    ("usage", "ts_started", "INTEGER NOT NULL DEFAULT 0"),
+    ("usage", "source", "TEXT NOT NULL DEFAULT 'relay'"),
+    ("usage", "aborted", "INTEGER NOT NULL DEFAULT 0"),
+    ("usage", "route", "TEXT NOT NULL DEFAULT ''"),
+    ("usage", "endpoint", "TEXT NOT NULL DEFAULT ''"),
+    ("usage", "client", "TEXT NOT NULL DEFAULT ''"),
+    ("usage", "client_version", "TEXT NOT NULL DEFAULT ''"),
+    ("usage", "upstream_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("usage", "ttft_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("usage", "attempts", "INTEGER NOT NULL DEFAULT 1"),
+    ("usage", "tool_calls", "INTEGER NOT NULL DEFAULT 0"),
+    ("usage", "has_tools", "INTEGER NOT NULL DEFAULT 0"),
+    ("usage", "image_inputs", "INTEGER NOT NULL DEFAULT 0"),
+    ("usage", "stop_reason", "TEXT NOT NULL DEFAULT ''"),
+    ("usage", "token_id", "TEXT NOT NULL DEFAULT ''"),
+    ("usage", "session_id", "TEXT NOT NULL DEFAULT ''"),
+    ("tokens", "id", "TEXT"),
+    ("tokens", "token_hash", "TEXT"),
+    ("tokens", "token_mask", "TEXT NOT NULL DEFAULT ''"),
+    ("tokens", "token_plain", "TEXT"),
+    ("tokens", "revoked_at", "INTEGER"),
+    ("tokens", "legacy", "INTEGER NOT NULL DEFAULT 0"),
+    ("sessions", "active_minutes", "INTEGER NOT NULL DEFAULT 0"),
+    ("sessions", "client_version", "TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "first_model", "TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "token_id", "TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "tokens", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+
+def _migrate_state_db(db) -> None:
+    for table, column, decl in _DB_ADDITIONS:
+        try:
+            cols = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+        except Exception:  # noqa: BLE001 - table might not exist yet
+            continue
+        if not cols or column in cols:
+            continue
+        try:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        except Exception:  # noqa: BLE001 - never block on a migration hiccup
+            pass
+    try:
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS usage_request_id ON usage(request_id)")
+        db.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def install_salt(db) -> str:
+    """安装级随机盐：只生成一次，存 kv 表。变了等于所有 token 重新登记（备份必须包含它）。"""
+    row = db.execute("SELECT v FROM kv WHERE k='install_salt'").fetchone()
+    if row and len(row["v"]) >= 32:
+        return row["v"]
+    salt = secrets.token_hex(32)
+    db.execute("INSERT INTO kv(k, v) VALUES ('install_salt', ?)"
+               " ON CONFLICT(k) DO UPDATE SET v=excluded.v", (salt,))
+    db.commit()
+    return salt
+
+
+def token_hash_for(token: str, plan: str, salt: str) -> str:
+    """同 token + 同套餐 → 永远同一个 hash（→ 同一行 → 同一个 id）。"""
+    import hashlib
+    return hashlib.sha256(("hash\x00" + salt + "\x00" + (plan or "") + "\x00"
+                           + token).encode()).hexdigest()
+
+
+def token_id_for(token: str, plan: str = "", salt: str = "") -> str:
+    """对外/入库的 token_id：**非自增** ✓ 不含时间与顺序 ✓ 与 token_hash 域分离（不同源）✓"""
+    import hashlib
+    seed = ("id\x00" + (salt or "") + "\x00" + (plan or "") + "\x00" + token).encode()
+    return "tk_" + hashlib.sha256(seed).hexdigest()[:16]
+
+
+def token_mask_for(token: str) -> str:
+    token = str(token or "")
+    if len(token) <= 10:
+        return "…"
+    return token[:4] + "…" + token[-4:]
+
+
+def sync_tokens_to_db(st: dict, db=None) -> dict:
+    """把 state 里的 token / 实例 / 套餐镜像进库。返回计数（可重复执行）。"""
+    own = db is None
+    db = db or state_db_connect()
+    counts = {"users": 0, "tokens": 0, "routes": 0, "credentials": 0}
+    try:
+        now = int(time.time())
+        users = st.get("users") or {}
+        instances = st.get("instances") or {}
+        for uname, row in users.items():
+            db.execute("INSERT OR IGNORE INTO users(name, created_at, note) VALUES (?,?,?)",
+                       (uname, int(row.get("created_at") or now), row.get("role") or ""))
+            counts["users"] += 1
+        salt = install_salt(db)
+        for iname, inst in instances.items():
+            token = str(inst.get("relay_token") or "")
+            uname = str(inst.get("user") or "")
+            plan = str(inst.get("default_plan") or (st.get("config") or {}).get("default_plan") or "")
+            if not token:
+                continue
+            tid = token_id_for(token, plan, salt)
+            thash = token_hash_for(token, plan, salt)
+            db.execute(
+                "INSERT INTO tokens(id, token_hash, token_mask, token_plain, user, instance,"
+                " plan, created_at, revoked_at, legacy) VALUES (?,?,?,?,?,?,?,?,NULL,?)"
+                " ON CONFLICT(token_hash) DO UPDATE SET token_plain=excluded.token_plain,"
+                " user=excluded.user, instance=excluded.instance, plan=excluded.plan,"
+                " revoked_at=NULL",
+                (tid, thash, token_mask_for(token), token, uname, iname, plan, now,
+                 0 if uname else 1))
+            counts["tokens"] += 1
+        for pid, plan in (list_plans() or {}).items():
+            provider = str(plan.get("provider") or "")
+            key = plan_key(plan)
+            if provider and key:
+                db.execute(
+                    "INSERT INTO credentials(provider, key_cipher, updated_at) VALUES (?,?,?)"
+                    " ON CONFLICT(provider) DO UPDATE SET key_cipher=excluded.key_cipher,"
+                    " updated_at=excluded.updated_at",
+                    (provider, key, now))
+                counts["credentials"] += 1
+            for iname, inst in instances.items():
+                token = str(inst.get("relay_token") or "")
+                if not token or not provider:
+                    continue
+                # 用**这个实例自己的 plan**算 id，和 tokens 行保持一致（否则 join 不上）
+                inst_plan = str(inst.get("default_plan")
+                                or (st.get("config") or {}).get("default_plan") or "")
+                db.execute(
+                    "INSERT OR REPLACE INTO routes(token, route, provider, upstream) VALUES (?,?,?,?)",
+                    (token_id_for(token, inst_plan, install_salt(db)),
+                     str(plan.get("name") or pid), provider,
+                     f"http://127.0.0.1:{int((st.get('config') or {}).get('relay_listen') or 8099)}/"
+                     f"mu-llm/{token[:8]}"))
+                counts["routes"] += 1
+        db.execute("INSERT INTO kv(k, v) VALUES ('last_sync', ?)"
+                   " ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(now),))
+        db.commit()
+        return counts
+    finally:
+        if own:
+            db.close()
+
+
+USAGE_BEGIN_FIELDS = ("request_id", "ts_started", "token_id", "session_id", "user",
+                        "instance", "plan", "provider", "model", "route", "endpoint",
+                        "surface", "client", "client_version", "stream", "has_tools")
+
+
+def apply_usage_begin(payload: dict, db=None) -> str:
+    """请求到达：只有维度，没有 token 数。幂等（同一 request_id 重复写只补字段）。"""
+    rid = str(payload.get("request_id") or "").strip()
+    if not rid:
+        return "request_id missing"
+    own = db is None
+    db = db or state_db_connect()
+    try:
+        # token 只用于反查：这里换成 token_id / user 之后立刻丢弃（绝不入库 ✗）
+        token = str(payload.get("token") or "")
+        token_id, user = "", ""
+        if token:
+            salt = install_salt(db)
+            for r in db.execute("SELECT id, token_hash, user, plan FROM tokens"
+                                " WHERE token_plain IS NOT NULL AND revoked_at IS NULL"):
+                if r["token_hash"] == token_hash_for(token, r["plan"] or "", salt):
+                    token_id, user = r["id"], r["user"] or ""
+                    break
+        row = {"request_id": rid, "ts_started": int(payload.get("ts_started") or time.time()),
+               "ts": int(payload.get("ts_started") or time.time()), "source": "relay"}
+        for k in USAGE_BEGIN_FIELDS:
+            if k in ("request_id", "ts_started"):
+                continue
+            row[k] = payload.get(k, 0 if k in ("stream", "has_tools") else "")
+        if token_id:
+            row["token_id"] = token_id
+        if user:
+            row["user"] = user
+        if not row.get("provider") and row.get("plan"):
+            try:
+                pv = PlanStore = list_plans().get(str(row["plan"])) or {}
+                if pv.get("provider"):
+                    row["provider"] = str(pv["provider"])
+            except Exception:  # noqa: BLE001
+                pass
+        cols = ", ".join(row)
+        marks = ", ".join("?" for _ in row)
+        upd = ", ".join(f"{k}=excluded.{k}" for k in row
+                        if k not in ("request_id",))
+        db.execute(f"INSERT INTO usage({cols}) VALUES ({marks})"
+                   f" ON CONFLICT(request_id) DO UPDATE SET {upd}", tuple(row.values()))
+        db.commit()
+        return "ok"
+    finally:
+        if own:
+            db.close()
+
+
+def apply_usage_end(payload: dict, db=None) -> str:
+    """请求结束：补 token / 耗时 / 状态；没有 begin 行就自己建一行（source=relay_partial）。"""
+    rid = str(payload.get("request_id") or "").strip()
+    if not rid:
+        return "request_id missing"
+    own = db is None
+    db = db or state_db_connect()
+    try:
+        now = int(payload.get("ts") or time.time())
+        nums = {k: int(payload.get(k) or 0) for k in
+                ("prompt_tokens", "completion_tokens", "cached_tokens", "reasoning_tokens",
+                 "latency_ms", "upstream_ms", "ttft_ms", "attempts", "tool_calls",
+                 "image_inputs", "http_status", "bytes_in", "bytes_out")}
+        text = {k: str(payload.get(k) or "") for k in ("status", "stop_reason", "source")}
+        # provider 一律用 plan 反查（relay 拿不到 ✗）：plan → provider，一次查表 ✓
+        prov_from_plan = ""
+        plan_id = str(payload.get("plan") or "")
+        if plan_id:
+            try:
+                prov_from_plan = str((list_plans().get(plan_id) or {}).get("provider") or "")
+            except Exception:  # noqa: BLE001
+                prov_from_plan = ""
+
+        # token 只用来反查 user / token_id；查完立刻丢弃（绝不入库 ✗）。
+        # 注意：relay 实际只推 **end**（begin 是本地记录 ✓ 不推送），所以反查必须在这里做 ✓
+        token = str(payload.get("token") or "")
+        rid_tok, rid_user = "", ""
+        if token:
+            salt = install_salt(db)
+            for r in db.execute("SELECT id, token_hash, user, plan FROM tokens"
+                                " WHERE token_plain IS NOT NULL AND revoked_at IS NULL"):
+                if r["token_hash"] == token_hash_for(token, r["plan"] or "", salt):
+                    rid_tok, rid_user = r["id"], r["user"] or ""
+                    break
+        exists = db.execute("SELECT 1 FROM usage WHERE request_id=?", (rid,)).fetchone()
+        if not exists:
+            row = {"request_id": rid, "ts_started": now, "ts": now,
+                   "source": text["source"] or "relay_partial",
+                   "token_id": rid_tok or str(payload.get("token_id") or ""),
+                   "session_id": str(payload.get("session_id") or ""),
+                   "user": rid_user or str(payload.get("user") or ""),
+                   "instance": str(payload.get("instance") or ""),
+                   "plan": str(payload.get("plan") or ""),
+                   "provider": prov_from_plan or str(payload.get("provider") or ""),
+                   "model": str(payload.get("model") or ""),
+                   "route": str(payload.get("route") or ""),
+                   "endpoint": str(payload.get("endpoint") or ""),
+                   "surface": str(payload.get("surface") or ""),
+                   "client": str(payload.get("client") or ""),
+                   "client_version": str(payload.get("client_version") or ""),
+                   **nums, "status": text["status"] or "ok",
+                   "stop_reason": text["stop_reason"]}
+            db.execute(f"INSERT INTO usage({', '.join(row)})"
+                       f" VALUES ({', '.join('?' for _ in row)})", tuple(row.values()))
+        else:
+            sets = ", ".join(f"{k}=?" for k in list(nums) + ["status", "stop_reason"])
+            extra, extra_vals = "", []
+            for k in ("route", "endpoint", "model"):
+                if payload.get(k):
+                    extra += f", {k}=?"
+                    extra_vals.append(str(payload.get(k)))
+            prov = prov_from_plan
+            if rid_user:
+                extra, extra_vals = ", user=?, token_id=?", [rid_user, rid_tok]
+            if prov:
+                extra += ", provider=?"
+                extra_vals.append(prov)
+            db.execute(f"UPDATE usage SET ts=?, {sets}{extra} WHERE request_id=?",
+                       (now, *nums.values(), text["status"] or "ok",
+                        text["stop_reason"], *extra_vals, rid))
+        db.commit()
+        return "ok"
+    finally:
+        if own:
+            db.close()
+
+
+def reap_aborted_usage(older_than: int = 600, db=None) -> int:
+    """有 begin 没 end 的行：超过 N 秒标 aborted=1（请求被打断/超时）。"""
+    own = db is None
+    db = db or state_db_connect()
+    try:
+        cutoff = int(time.time()) - older_than
+        cur = db.execute("UPDATE usage SET aborted=1 WHERE aborted=0 AND ts<=?"
+                         " AND status='ok'", (cutoff,))
+        db.commit()
+        return cur.rowcount or 0
+    finally:
+        if own:
+            db.close()
+
+
+def cmd_relay(args) -> int:
+    st = load_state()
+    if args.action == "import":
+        counts = sync_tokens_to_db(st)
+        info(f"imported: {counts}")
+        return 0
+    db = state_db_connect()
+    try:
+        if args.action == "status":
+            rows = {r["k"]: r["v"] for r in db.execute("SELECT k, v FROM kv")}
+            n = db.execute("SELECT COUNT(*) c FROM tokens").fetchone()["c"]
+            print(f"db: {STATE_DB}")
+            print(f"tokens: {n}")
+            for k in ("schema_version", "credential_version", "last_sync"):
+                print(f"{k}: {rows.get(k, '-')}")
+            return 0
+        if args.action == "tokens":
+            q = ("SELECT t.id, t.token_mask, t.user, t.instance, t.plan, t.legacy,"
+                 " (SELECT COUNT(*) FROM routes r WHERE r.token = t.id) routes"
+                 " FROM tokens t ORDER BY t.instance")
+            print(f"{'TOKEN_ID':<20}{'MASK':<14}{'USER':<14}{'INSTANCE':<14}{'ROUTES':<8}PLAN")
+            for r in db.execute(q):
+                print(f"{r['id']:<20}{r['token_mask']:<14}{(r['user'] or '-'):<14}"
+                      f"{r['instance']:<14}{r['routes']:<8}{r['plan'] or '-'}"
+                      + ("  (legacy)" if r["legacy"] else ""))
+            return 0
+        if args.action == "routes":
+            q = "SELECT token, route, provider FROM routes ORDER BY token, route"
+            print(f"{'TOKEN_ID':<20}{'ROUTE':<24}PROVIDER")
+            for r in db.execute(q):
+                print(f"{r['token']:<20}{r['route']:<24}{r['provider']}")
+            return 0
+        if args.action == "usage":
+            view = (getattr(args, "view", None) or "recent").lower()
+            days = int(getattr(args, "days", 7) or 7)
+            now = int(time.time())
+            today0 = now - (now % 86400)
+            if view == "today":
+                row = db.execute(
+                    "SELECT COUNT(*) req, COUNT(DISTINCT user) users,"
+                    " COALESCE(SUM(bytes_in),0) bin, COALESCE(SUM(bytes_out),0) bout,"
+                    " COALESCE(AVG(latency_ms),0) lat,"
+                    " SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) errs"
+                    " FROM usage WHERE ts >= ?", (today0,)).fetchone()
+                print(f"今天（UTC 起算）请求 {row['req']} 次 · 活跃用户 {row['users']} 个 · "
+                      f"平均 {int(row['lat'])} ms · 失败 {row['errs'] or 0} 次")
+                print(f"入 {row['bin'] / 1024 / 1024:.1f} MB · 出 {row['bout'] / 1024 / 1024:.1f} MB")
+                return 0
+            if view == "users":
+                rows = db.execute(
+                    "SELECT user, COUNT(*) req, MAX(ts) last, AVG(latency_ms) lat,"
+                    " SUM(bytes_out) bout, SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) errs"
+                    " FROM usage WHERE ts >= ? GROUP BY user ORDER BY req DESC",
+                    (now - days * 86400,))
+                print(f"{'USER':<16}{'REQ':<7}{'AVG_MS':<9}{'OUT_MB':<9}{'ERR':<6}LAST")
+                for r in rows:
+                    print(f"{(r['user'] or '-'):<16}{r['req']:<7}{int(r['lat'] or 0):<9}"
+                          f"{(r['bout'] or 0) / 1024 / 1024:<9.1f}{r['errs'] or 0:<6}"
+                          f"{time.strftime('%m-%d %H:%M', time.localtime(r['last']))}")
+                return 0
+            if view == "models":
+                rows = db.execute(
+                    "SELECT provider, model, COUNT(*) req, AVG(latency_ms) lat, SUM(bytes_out) bout"
+                    " FROM usage WHERE ts >= ? GROUP BY provider, model ORDER BY req DESC",
+                    (now - days * 86400,))
+                print(f"{'PROVIDER':<16}{'MODEL':<26}{'REQ':<7}{'AVG_MS':<9}OUT_MB")
+                for r in rows:
+                    print(f"{(r['provider'] or '-'):<16}{(r['model'] or '-'):<26}{r['req']:<7}"
+                          f"{int(r['lat'] or 0):<9}{(r['bout'] or 0) / 1024 / 1024:.1f}")
+                return 0
+            if view == "series":
+                rows = db.execute(
+                    "SELECT date(ts, 'unixepoch') d, COUNT(*) req, COUNT(DISTINCT user) users"
+                    " FROM usage WHERE ts >= ? GROUP BY d ORDER BY d",
+                    (now - days * 86400,))
+                print(f"{'DAY':<12}{'REQ':<8}USERS")
+                for r in rows:
+                    print(f"{r['d']:<12}{r['req']:<8}{r['users']}")
+                return 0
+            q = ("SELECT request_id, user, instance, provider, model, status,"
+                 " prompt_tokens, completion_tokens, latency_ms, ts, source, aborted"
+                 " FROM usage ORDER BY id DESC LIMIT 20")
+            print(f"{'REQUEST_ID':<18}{'USER':<12}{'MODEL':<22}{'PROMPT':<7}{'OUT':<7}"
+                  f"{'MS':<7}{'STATUS':<8}SRC")
+            for r in db.execute(q):
+                print(f"{(r['request_id'] or '')[:16]:<18}{(r['user'] or '-'):<12}"
+                      f"{((r['provider'] or '') + '/' + (r['model'] or ''))[:20]:<22}"
+                      f"{r['prompt_tokens']:<7}{r['completion_tokens']:<7}"
+                      f"{r['latency_ms']:<7}{(r['status'] or ''):<8}{r['source']}"
+                      + ("  (aborted)" if r["aborted"] else ""))
+            return 0
+        if args.action == "credential":
+            r = db.execute("SELECT provider, updated_at, length(key_cipher) n FROM credentials"
+                           " WHERE provider=?", (args.provider,)).fetchone()
+            if not r:
+                print(f"no credential for {args.provider}")
+                return 1
+            print(f"{r['provider']}: key stored ({r['n']} bytes), updated {r['updated_at']}")
+            return 0
+    finally:
+        db.close()
+    return 1
 
 
 def plan_available_set(plan: dict) -> set[str] | None:
@@ -12157,6 +12653,22 @@ def doctor_checks(st: dict) -> list[dict]:
                     "patch not applied (stock UI: every row has an edit button)",
                     "dsh-muctl sync   # retries; if the bundle changed, stock behaviour stays")
 
+    # ------------------------------------------------- dsh native modules (pty)
+    try:
+        rts = dsh_runtime_dirs()
+        missing = [rt for rt in rts if not os.path.exists(os.path.join(rt, PTY_REL))]
+        if not rts:
+            add("dsh native modules", DOCTOR_PASS, "没有实例配置，跳过")
+        elif missing:
+            add("dsh native modules", DOCTOR_WARN,
+                f"{len(missing)} 个运行时缺 node-pty 原生模块（终端会报 pty.node 找不到）",
+                "跑一次 `dsh-muctl sync` 会自动补（随包带了同版本 pty.node）")
+        else:
+            add("dsh native modules", DOCTOR_PASS,
+                f"{len(rts)} 个运行时都有 node-pty 原生模块")
+    except Exception as exc:  # noqa: BLE001
+        add("dsh native modules", DOCTOR_WARN, f"检查失败：{exc}"[:120])
+
     # ------------------------------------------------- extension UI (ext-ui v1)
     try:
         manifests = ext_manifests()
@@ -13344,6 +13856,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("sync-state", help="reconcile stored instance state with what is listening")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_sync_state)
+    sp = sub.add_parser("relay", help="state DB mirror of relay credentials (read-only for now)")
+    sp.add_argument("action", nargs="?", default="status",
+                    choices=["status", "tokens", "routes", "credential", "import", "usage"])
+    sp.add_argument("provider", nargs="?", default="", help="provider id (for `credential`)")
+    sp.add_argument("--view", default="recent",
+                    choices=["recent", "today", "users", "models", "series"],
+                    help="usage 视图（配合 action=usage）")
+    sp.add_argument("--days", type=int, default=7, help="usage 视图的时间窗口（天）")
+    sp.set_defaults(func=cmd_relay)
     sp = sub.add_parser("doctor", help="diagnose host prerequisites (run this first on a new machine)")
     sp.add_argument("--json", action="store_true", help="machine-readable report (for the admin backend)")
     sp.add_argument("--fix", action="store_true", help="apply the safe fixes it knows (gateway install, sync, cgroup)")

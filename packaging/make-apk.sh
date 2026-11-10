@@ -144,6 +144,16 @@ build_unsigned() {
 		[ -f "$f" ] || continue
 		install_file 0644 "$f" "/usr/local/lib/dsh-mu/static/ext-kit/$(basename "$f")"
 	done
+	# dsh 运行时的原生模块兜底（node-pty 的 pty.node；缺了实例「终端」打不开）
+	for f in "$SRC"/vendor/node-pty/*; do
+		[ -f "$f" ] || continue
+		install_file 0755 "$f" "/usr/local/lib/dsh-mu/vendor/node-pty/$(basename "$f")"
+	done
+	# 状态库 schema（dsh-muctl relay 建库时读它）
+	for f in "$SRC"/sql/*.sql; do
+		[ -f "$f" ] || continue
+		install_file 0644 "$f" "/usr/local/lib/dsh-mu/sql/$(basename "$f")"
+	done
 	for f in "$SRC"/gateway/static/ext-kit/fonts/*; do
 		[ -f "$f" ] || continue
 		install_file 0644 "$f" "/usr/local/lib/dsh-mu/static/ext-kit/fonts/$(basename "$f")"

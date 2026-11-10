@@ -14,7 +14,7 @@
 #
 # Maintainer: dsh-mu maintainers <maintainers@dsh-mu.invalid>
 pkgname=dsh-mu
-pkgver=1.8.25
+pkgver=1.8.62
 pkgrel=0
 pkgdesc="DeepSeek Harness multi-instance platform (gateway, jail runner, admin API)"
 url="https://github.com/deepseek-ai/dsh"
@@ -88,6 +88,16 @@ package() {
 	for f in "$s"/gateway/static/ext-kit/*; do
 		[ -f "$f" ] || continue
 		install -Dm644 "$f" "$d/usr/local/lib/dsh-mu/static/ext-kit/$(basename "$f")"
+	done
+	# dsh 运行时的原生模块兜底
+	for f in "$s"/vendor/node-pty/*; do
+		[ -f "$f" ] || continue
+		install -Dm755 "$f" "$d/usr/local/lib/dsh-mu/vendor/node-pty/$(basename "$f")"
+	done
+	# 状态库 schema
+	for f in "$s"/sql/*.sql; do
+		[ -f "$f" ] || continue
+		install -Dm644 "$f" "$d/usr/local/lib/dsh-mu/sql/$(basename "$f")"
 	done
 	for f in "$s"/gateway/static/ext-kit/fonts/*; do
 		[ -f "$f" ] || continue

@@ -66,6 +66,7 @@ html.wiring .side-stack .flags { visibility: hidden; }
   <symbol id="i-server" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.6"/><rect x="3" y="14" width="18" height="6" rx="1.6"/><path d="M7 7h.01M7 17h.01"/></symbol>
   <symbol id="i-terminal" viewBox="0 0 24 24"><path d="M4 17 10 11 4 5"/><path d="M12 19h8"/></symbol>
   <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v6M15 2v6"/><path d="M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v5"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 19h16"/><path d="M7 19v-6"/><path d="M12 19V6"/><path d="M17 19v-9"/></symbol>
   <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3l1.9 4.9L19 9.8l-5.1 1.9L12 17l-1.9-5.3L5 9.8l5.1-1.9z"/><path d="M18.5 15.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></symbol>
   <symbol id="i-box" viewBox="0 0 24 24"><path d="M12 2.8 21 7.7v8.6l-9 4.9-9-4.9V7.7z"/><path d="M3 7.7 12 12.6l9-4.9"/><path d="M12 12.6v8.6"/></symbol>
   <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 2.6 2.6 7.2 12 11.8l9.4-4.6z"/><path d="M2.6 12.2 12 16.8l9.4-4.6"/><path d="M2.6 16.8 12 21.4l9.4-4.6"/></symbol>
@@ -130,6 +131,7 @@ html.wiring .side-stack .flags { visibility: hidden; }
     <a class="rail-item" href="#providers" title="模型接入" data-nav="providers"><svg class="i"><use href="#i-plug"/></svg><span class="label">模型接入</span></a>
     <a class="rail-item" href="#plans" title="模型套餐" data-nav="plans"><svg class="i"><use href="#i-list"/></svg><span class="label">模型套餐</span></a>
     <a class="rail-item" href="#private" title="私有模型" data-nav="private"><svg class="i"><use href="#i-spark"/></svg><span class="label">私有模型</span></a>
+    <a class="rail-item" href="#usage" title="用量与花费" data-nav="usage"><svg class="i"><use href="#i-chart"/></svg><span class="label">用量</span></a>
 
     <div class="rail-group">插件与扩展</div>
     <a class="rail-item" href="#plugins" title="插件" data-nav="plugins"><svg class="i"><use href="#i-box"/></svg><span class="label">插件</span><span class="count">4</span></a>
@@ -1045,6 +1047,50 @@ html.wiring .side-stack .flags { visibility: hidden; }
               </section>
 
       <!-- ───────────────────────── 7 私有模型 ───────────────────────── -->
+      <section class="view" id="v-usage" aria-labelledby="t-usage" hidden>
+        <div class="page-head">
+          <div class="titles">
+            <h1 class="page-title" id="t-usage">用量</h1>
+            <p class="page-sub" id="usageSub">最近 7 天的平台调用记录：谁在用、用哪个模型、多快、多大。token 数只在请求能读到 usage 时才有。</p>
+          </div>
+          <div class="page-tools">
+            <button class="btn ghost" onclick="wireUsage()"><svg class="i i-sm"><use href="#i-refresh"/></svg>刷新</button>
+          </div>
+        </div>
+
+        <div class="chips" id="usageKpi" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px"></div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>按用户</h2><span class="sub" id="usageUsersSub">·</span></div>
+          <div class="panel-scroll" style="max-height:320px">
+            <table class="data compact">
+              <thead><tr><th>用户</th><th>实例</th><th class="num">请求</th><th class="num">平均耗时</th><th class="num">出流量</th><th class="num">失败</th><th>最近活跃</th></tr></thead>
+              <tbody id="usageUsersBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:16px">
+          <div class="panel-head"><h2>按模型</h2><span class="sub" id="usageModelsSub">·</span></div>
+          <div class="panel-scroll" style="max-height:320px">
+            <table class="data compact">
+              <thead><tr><th>服务商</th><th>模型</th><th class="num">请求</th><th class="num">平均耗时</th><th class="num">出流量</th><th class="num">失败</th></tr></thead>
+              <tbody id="usageModelsBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:16px">
+          <div class="panel-head"><h2>按日</h2><span class="sub" id="usageSeriesSub">·</span></div>
+          <div class="panel-scroll" style="max-height:280px">
+            <table class="data compact">
+              <thead><tr><th>日期</th><th class="num">请求</th><th class="num">活跃用户</th><th class="num">出流量</th></tr></thead>
+              <tbody id="usageSeriesBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
       <section class="view" id="v-private" aria-labelledby="t-private" hidden>
         <div class="page-head">
           <div class="titles">
@@ -1490,7 +1536,7 @@ applyTheme(document.documentElement.getAttribute('data-theme-mode') || 'system')
 
 const TITLES = {
   overview: '概览', users: '用户', instances: '实例', logs: '实例日志',
-  providers: '模型接入', plans: '模型套餐', private: '私有模型', plugins: '插件',
+  providers: '模型接入', plans: '模型套餐', private: '私有模型', usage: '用量', plugins: '插件',
   extpage: '扩展页面', ext: '扩展管理',
   platform: '平台', doctor: '自检', audit: '审计',
 };
@@ -1794,8 +1840,13 @@ window.addEventListener('message', (e) => {
   if (!extCur) return;
   const m = e.data || {};
   if (m.type === 'dshmu:ready') {
+    const first = !extReady;
     extReady = true; clearTimeout(extTimer); setExtLoading(false);
     if (document.body.dataset.scenario !== 'extdown' && extCur.status === 'running') hideExtFallback();
+    // 只在**这一次页面加载**里回一次 init。
+    // 之前每收到 ready 就回 init ✗ —— 扩展收到 init 又回 ready ✗ → 握手死循环 ✗
+    // 表现就是 iframe 里 DOM 突变刷屏、鼠标 hover 抖动、按钮点不上（而请求面板看不到异常）✗
+    if (!first) return;
     postToExt({ type: 'dshmu:init', kit: 1, theme: extTheme(),
       mode: document.documentElement.getAttribute('data-theme-mode') || 'system',
       ext: { name: extCur.name, version: extCur.version },
@@ -6010,6 +6061,87 @@ html.wiring .side-stack .flags { visibility: hidden; }
   window.wirePlatformDisk = wirePlatformDisk;
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wirePlatformDisk);
   else wirePlatformDisk();
+})();
+</script>
+
+<script>
+/* ==========================================================================
+   用量页（只读）：/api/usage?view=today|users|models|series&days=N
+   ========================================================================== */
+(function () {
+  const esc = (v) => String(v == null ? '' : v)
+    .replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const mb = (n) => ((Number(n) || 0) / 1024 / 1024).toFixed(1) + ' MB';
+  const when = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : '—');
+
+  function kpi(label, value, hint) {
+    return `<div class="card" style="min-width:170px;padding:12px 14px">
+      <div style="font-size:11px;color:var(--ink-3)">${esc(label)}</div>
+      <div style="font-size:22px;font-weight:600;margin-top:2px">${esc(value)}</div>
+      ${hint ? `<div style="font-size:11px;color:var(--ink-3);margin-top:2px">${esc(hint)}</div>` : ''}
+    </div>`;
+  }
+
+  async function api(path) {
+    const r = await fetch(path, { credentials: 'same-origin' });
+    if (!r.ok) throw new Error(r.statusText);
+    return r.json();
+  }
+
+  window.wireUsage = async function () {
+    const kpiBox = document.getElementById('usageKpi');
+    if (!kpiBox) return;
+    try {
+      const [today, users, models, series] = await Promise.all([
+        api('api/usage?view=today'), api('api/usage?view=users&days=7'),
+        api('api/usage?view=models&days=7'), api('api/usage?view=series&days=14'),
+      ]);
+      const all = today.all || {};
+      kpiBox.innerHTML = [
+        kpi('今日请求', today.today ? today.today.req : 0),
+        kpi('累计请求', all.req || 0),
+        kpi('活跃用户', all.users || 0, '有请求的账号数'),
+        kpi('平均耗时', (all.lat ? Math.round(all.lat) : 0) + ' ms'),
+        kpi('累计流量', mb((all.bin || 0) + (all.bout || 0))),
+        kpi('失败', all.errs || 0, '状态非 ok 的请求'),
+      ].join('');
+
+      document.getElementById('usageUsersBody').innerHTML = (users.rows || []).length
+        ? users.rows.map((r) => `<tr>
+            <td>${esc(r.user || '—')}</td><td class="mono">${esc(r.instance || '—')}</td>
+            <td class="num">${r.req}</td><td class="num">${Math.round(r.lat || 0)} ms</td>
+            <td class="num">${mb(r.bout)}</td><td class="num">${r.errs || 0}</td>
+            <td class="mono faint">${esc(when(r.last))}</td></tr>`).join('')
+        : '<tr><td colspan="7" class="faint" style="padding:14px">最近 7 天没有用量记录。</td></tr>';
+
+      document.getElementById('usageModelsBody').innerHTML = (models.rows || []).length
+        ? models.rows.map((r) => `<tr>
+            <td class="mono">${esc(r.provider || '—')}</td><td class="mono">${esc(r.model || '—')}</td>
+            <td class="num">${r.req}</td><td class="num">${Math.round(r.lat || 0)} ms</td>
+            <td class="num">${mb(r.bout)}</td><td class="num">${r.errs || 0}</td></tr>`).join('')
+        : '<tr><td colspan="6" class="faint" style="padding:14px">最近 7 天没有用量记录。</td></tr>';
+
+      document.getElementById('usageSeriesBody').innerHTML = (series.rows || []).length
+        ? series.rows.map((r) => `<tr><td class="mono">${esc(r.day)}</td>
+            <td class="num">${r.req}</td><td class="num">${r.users}</td>
+            <td class="num">${mb(r.bout)}</td></tr>`).join('')
+        : '<tr><td colspan="4" class="faint" style="padding:14px">最近 14 天没有用量记录。</td></tr>';
+
+      const sub = document.getElementById('usageSub');
+      if (sub) sub.textContent = `最近 7 天的平台调用记录。累计 ${all.req || 0} 次请求 · ${all.users || 0} 个账号有请求 · 平均 ${Math.round(all.lat || 0)} ms。`;
+    } catch (e) {
+      kpiBox.innerHTML = `<div class="notice warn"><div class="body">读取用量失败：${esc(e.message)}</div></div>`;
+    }
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+      if (location.hash.indexOf('usage') >= 0) window.wireUsage();
+    });
+  }
+  window.addEventListener('hashchange', () => {
+    if (location.hash.indexOf('usage') >= 0) window.wireUsage();
+  });
 })();
 </script>
 </body>

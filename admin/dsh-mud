@@ -42,6 +42,185 @@ AUDIT_PATH = f"{mu.LOGS}/audit.log"
 import os as _os
 _os.environ.setdefault("DSH_MU_NO_SELF_RESTART", "1")
 
+# ---------------------------------------------------------------- RESP endpoint
+# 网关（openresty + lua-resty-redis）用 **redis 协议** 跟这里说话：
+#   GET cred:<provider>        → 凭据 JSON（Phase A2 才启用读取）
+#   RPUSH usage:begin <json>   → 请求开始（维度，幂等）
+#   RPUSH usage:end <json>     → 请求结束（token/耗时/状态，幂等）
+# 只监听 127.0.0.1；SQLite 仍然只有本进程写。
+RESP_PORT = int(os.environ.get("DSH_MU_RESP_PORT") or 8098)
+
+
+def _resp_bulk(payload: bytes) -> bytes:
+    return b"$" + str(len(payload)).encode() + b"\r\n" + payload + b"\r\n"
+
+
+def _resp_int(n: int) -> bytes:
+    return b":" + str(int(n)).encode() + b"\r\n"
+
+
+def _resp_err(msg: str) -> bytes:
+    return b"-ERR " + msg.encode("utf-8", "replace")[:200] + b"\r\n"
+
+
+def _read_resp_command(rfile):
+    line = rfile.readline()
+    if not line or not line.startswith(b"*"):
+        return None
+    try:
+        n = int(line[1:].strip() or 0)
+    except ValueError:
+        return None
+    args = []
+    for _ in range(n):
+        head = rfile.readline()
+        if not head.startswith(b"$"):
+            return None
+        try:
+            ln = int(head[1:].strip() or 0)
+        except ValueError:
+            return None
+        args.append(rfile.read(ln))
+        rfile.read(2)
+    return args
+
+
+def _handle_resp_command(args):
+    if not args:
+        return _resp_err("empty command")
+    cmd = args[0].decode("utf-8", "replace").upper()
+    if cmd == "PING":
+        return b"+PONG\r\n"
+    if cmd in ("RPUSH", "LPUSH") and len(args) >= 3:
+        queue = args[1].decode("utf-8", "replace")
+        try:
+            body = json.loads(args[2].decode("utf-8", "replace"))
+        except ValueError:
+            return _resp_err("payload must be json")
+        if queue in ("usage:begin", "usage.begin"):
+            res = mu.apply_usage_begin(body)
+        elif queue in ("usage:end", "usage.end"):
+            res = mu.apply_usage_end(body)
+        else:
+            return _resp_err("unknown queue " + queue)
+        return _resp_int(1) if res == "ok" else _resp_err(res)
+    if cmd == "GET" and len(args) == 2:
+        key = args[1].decode("utf-8", "replace")
+        db = mu.state_db_connect()
+        try:
+            if key == "ver":
+                row = db.execute("SELECT v FROM kv WHERE k='credential_version'").fetchone()
+                return _resp_bulk(str(row["v"] if row else "1").encode())
+            if key.startswith("tok:"):
+                token = key[4:]
+                salt = mu.install_salt(db)
+                # 先按 (token, 该 token 行自己的 plan) 找；plan 参与 hash → 需要逐行候选
+                rows = db.execute(
+                    "SELECT id, user, instance, plan, token_plain FROM tokens"
+                    " WHERE token_plain IS NOT NULL AND revoked_at IS NULL").fetchall()
+                hit = None
+                for r in rows:
+                    if mu.token_hash_for(token, r["plan"] or "", salt) == mu.token_hash_for(
+                            r["token_plain"] or "", r["plan"] or "", salt):
+                        hit = r
+                        break
+                if not hit:
+                    return b"$-1\r\n"
+                routes = [{"route": x["route"], "provider": x["provider"]}
+                          for x in db.execute("SELECT route, provider FROM routes WHERE token=?",
+                                              (hit["id"],))]
+                keys = {x["provider"]: x["key_cipher"] for x in
+                        db.execute("SELECT provider, key_cipher FROM credentials")}
+                ver = db.execute("SELECT v FROM kv WHERE k='credential_version'").fetchone()
+                return _resp_bulk(json.dumps({
+                    "id": hit["id"], "user": hit["user"], "instance": hit["instance"],
+                    "plan": hit["plan"], "version": ver["v"] if ver else "1",
+                    "routes": [{**rt, "key": keys.get(rt["provider"], "")} for rt in routes],
+                }).encode())
+            provider = key.split(":", 1)[-1]
+            row = db.execute("SELECT key_cipher FROM credentials WHERE provider=?",
+                             (provider,)).fetchone()
+            if not row:
+                return b"$-1\r\n"
+            return _resp_bulk(json.dumps({"provider": provider,
+                                          "key": row["key_cipher"]}).encode())
+        finally:
+            db.close()
+    return _resp_err("unsupported " + cmd)
+
+
+def _resp_client(conn):
+    rfile = conn.makefile("rb")
+    try:
+        while True:
+            args = _read_resp_command(rfile)
+            if args is None:
+                break
+            conn.sendall(_handle_resp_command(args))
+    except Exception:  # noqa: BLE001 - a bad client must not kill the thread
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def _thread_start(fn, *args):
+    globals()["threading"].Thread(target=fn, args=args, daemon=True).start()
+
+
+def _serve_resp_unix(sock_path: str):
+    """给网关 jail 用的 unix socket（jail 有独立网络命名空间，连不到宿主 127.0.0.1 ✗）。"""
+    import os as _os
+    _os.makedirs(_os.path.dirname(sock_path), exist_ok=True)
+    with contextlib.suppress(OSError):
+        _os.unlink(sock_path)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(sock_path)
+        _os.chmod(sock_path, 0o666)   # jail 里的 nginx 以 root 跑，但仍显式放开
+        srv.listen(64)
+    except OSError as exc:
+        sys.stderr.write(f"[dsh-mud] resp unix socket failed: {exc!r}\n")
+        sys.stderr.flush()
+        return
+    sys.stderr.write(f"[dsh-mud] resp unix listening on {sock_path}\n")
+    sys.stderr.flush()
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            continue
+        _thread_start(_resp_client, conn)
+
+
+def serve_resp():
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # --self-check 会先起一次服务再退出，端口可能还在 TIME_WAIT；重试几次再放弃，
+    # 否则正式进程里这个端口就永远没了（现象：RESP 连不上，但手工起线程又是好的）。
+    for attempt in range(20):
+        try:
+            srv.bind(("127.0.0.1", RESP_PORT))
+            srv.listen(64)
+            break
+        except OSError:
+            time.sleep(0.5)
+    else:
+        sys.stderr.write(f"[dsh-mud] RESP bind failed on 127.0.0.1:{RESP_PORT}\n")
+        sys.stderr.flush()
+        return
+    sys.stderr.write(f"[dsh-mud] RESP listening on 127.0.0.1:{RESP_PORT}\n")
+    sys.stderr.flush()
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            continue
+        threading.Thread(target=_resp_client, args=(conn,), daemon=True).start()
+
+
 WEB_DIR = f"{mu.LIB}/admin"
 # The library's generic state-change records would duplicate the request-level
 # records written below, so turn them off in this process.
@@ -485,6 +664,7 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("GET", re.compile(r"^/api/rail$"), "rail"),
     ("GET", re.compile(r"^/api/me/plans$"), "me_plans_get"),
     ("POST", re.compile(r"^/api/me/plans$"), "me_plan_action"),
+    ("GET", re.compile(r"^/api/usage$"), "usage_view"),
     ("GET", re.compile(r"^/api/plans$"), "plan_list"),
     ("POST", re.compile(r"^/api/plans$"), "plan_add"),
     ("POST", re.compile(r"^/api/plans/([\w.-]+)/(enable|disable|default|hide|show|order)$"),
@@ -1599,6 +1779,52 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"ok": True, "models": res["models"], "count": res["count"], **extra,
                          "default_model": res.get("default_model") or "",
                          "restart_required": True}
+        if name == "usage_view":
+            # 用量视图（只读）：today / users / models / series
+            view = str((query.get("view") or ["today"])[0]).lower()
+            try:
+                days = max(1, min(365, int((query.get("days") or ["7"])[0])))
+            except ValueError:
+                days = 7
+            now = int(time.time())
+            db = mu.state_db_connect()
+            try:
+                if view == "users":
+                    rows = [dict(r) for r in db.execute(
+                        "SELECT user, instance, COUNT(*) req, AVG(latency_ms) lat,"
+                        " SUM(bytes_in) bin, SUM(bytes_out) bout, MAX(ts) last,"
+                        " SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) errs"
+                        " FROM usage WHERE ts >= ? GROUP BY user, instance ORDER BY req DESC",
+                        (now - days * 86400,))]
+                    return 200, {"view": "users", "days": days, "rows": rows}
+                if view == "models":
+                    rows = [dict(r) for r in db.execute(
+                        "SELECT provider, model, COUNT(*) req, AVG(latency_ms) lat,"
+                        " SUM(bytes_out) bout, SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) errs"
+                        " FROM usage WHERE ts >= ? GROUP BY provider, model ORDER BY req DESC",
+                        (now - days * 86400,))]
+                    return 200, {"view": "models", "days": days, "rows": rows}
+                if view == "series":
+                    rows = [dict(r) for r in db.execute(
+                        "SELECT date(ts, 'unixepoch') day, COUNT(*) req,"
+                        " COUNT(DISTINCT user) users, SUM(bytes_out) bout"
+                        " FROM usage WHERE ts >= ? GROUP BY day ORDER BY day",
+                        (now - days * 86400,))]
+                    return 200, {"view": "series", "days": days, "rows": rows}
+                row = db.execute(
+                    "SELECT COUNT(*) req, COUNT(DISTINCT user) users,"
+                    " COALESCE(SUM(bytes_in),0) bin, COALESCE(SUM(bytes_out),0) bout,"
+                    " COALESCE(AVG(latency_ms),0) lat, MAX(ts) last,"
+                    " SUM(CASE WHEN status <> 'ok' THEN 1 ELSE 0 END) errs"
+                    " FROM usage").fetchone()
+                today0 = now - (now % 86400)
+                trow = db.execute("SELECT COUNT(*) req FROM usage WHERE ts >= ?",
+                                  (today0,)).fetchone()
+                return 200, {"view": "today",
+                             "all": dict(row) if row else {},
+                             "today": {"req": trow["req"] if trow else 0}}
+            finally:
+                db.close()
         if name == "plan_list":
             st = mu.load_state()
             plans = mu.list_plans()
@@ -2138,6 +2364,17 @@ def parse_listen(value: str) -> tuple[str, int]:
 
 
 def main(argv=None) -> int:
+    try:
+        _thread_cls = globals()["threading"].Thread
+        _thread_cls(target=serve_resp, daemon=True).start()
+        _thread_cls(target=_serve_resp_unix,
+                    args=(os.environ.get("DSH_MU_RESP_SOCK") or "/run/dsh-mu/resp.sock",),
+                    daemon=True).start()
+        sys.stderr.write(f"[dsh-mud] RESP endpoint starting on 127.0.0.1:{RESP_PORT}\n")
+        sys.stderr.flush()
+    except Exception as exc:  # noqa: BLE001 - RESP is optional
+        sys.stderr.write(f"[dsh-mud] RESP endpoint failed to start: {exc!r}\n")
+        sys.stderr.flush()
     parser = argparse.ArgumentParser(prog="dsh-mud", description=__doc__.splitlines()[0])
     parser.add_argument("--version", action="version", version=f"dsh-mud {VERSION}")
     parser.add_argument("--listen", default=None,

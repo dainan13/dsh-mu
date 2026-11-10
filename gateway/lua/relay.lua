@@ -43,12 +43,78 @@ end
 if not token or not route then
 	return deny(404, "relay path needs /mu-llm/<token>/<route>/<path>")
 end
+-- 用量采集用：把 route/endpoint 放进 nginx 变量（最外层 ✓ 不受内层作用域影响 ✓）
+ngx.var.relay_route = tostring(route)
+ngx.var.relay_endpoint = tostring(path)
 
-local doc, err = load_document()
-if not doc then
-	return deny(503, err or "relay unavailable")
+-- 凭据来源：relay_source=file（默认，读 relay.json）| db（问 dsh-mud，带 30s 内存缓存）
+-- db 模式下任何异常都**回退读 relay.json** ✓ 降级不中断 ✓
+local function load_config()
+	local conf = "/etc/dsh-mu/config.json"
+	local fh = io.open(conf, "rb")
+	if not fh then return {} end
+	local body = fh:read("*a")
+	fh:close()
+	local ok, parsed = pcall(cjson.decode, body)
+	if not ok or type(parsed) ~= "table" then return {} end
+	return parsed
 end
-local entry = (doc.tokens or {})[token]
+
+local function db_lookup(token)
+	local redis = require "resty.redis"
+	local r = redis:new()
+	r:set_timeouts(120, 120, 120)
+	local ok = r:connect("127.0.0.1", 8098)
+	if not ok then return nil end
+	local payload = r:get("tok:" .. token)
+	r:set_keepalive(1000, 16)
+	if not payload or type(payload) ~= "string" then return nil end
+	local decoded_ok, doc2 = pcall(cjson.decode, payload)
+	if not decoded_ok or type(doc2) ~= "table" then return nil end
+	return doc2
+end
+
+local function entry_from_db(doc2)
+	local routes = {}
+	for _, rt in ipairs(doc2.routes or {}) do
+		routes[rt.route] = { provider = rt.provider, key = rt.key, plan = doc2.plan,
+		                     instance = doc2.instance, user = doc2.user,
+		                     token_id = doc2.id }
+	end
+	return { instance = doc2.instance, user = doc2.user, plan = doc2.plan,
+	         routes = routes, source = "db" }
+end
+
+local conf = load_config()
+local doc, err
+local entry
+if (conf.relay_source or "file") == "db" then
+	local cache = ngx.shared.relay_cache
+	local cached = cache and cache:get(token)
+	if cached then
+		local ok2, parsed = pcall(cjson.decode, cached)
+		if ok2 and type(parsed) == "table" then entry = entry_from_db(parsed) end
+	else
+		local d = db_lookup(token)
+		if d then
+			entry = entry_from_db(d)
+			if cache then
+				cache:set(token, cjson.encode(d), 30)
+			end
+		end
+	end
+	if not entry then
+		-- 降级：回退 relay.json（库里查不到 / dsh-mud 挂了）
+		doc, err = load_document()
+		if doc then entry = (doc.tokens or {})[token] end
+	end
+else
+	doc, err = load_document()
+	if not doc then
+		return deny(503, err or "relay unavailable")
+	end
+	entry = (doc.tokens or {})[token]
+end
 if type(entry) ~= "table" then
 	return deny(403, "unknown relay token")
 end
@@ -245,6 +311,7 @@ if route == "__market" then
 
 	return deny(404, "unknown market path")
 end
+local mu_route, mu_path = route, path
 local target = (entry.routes or {})[route]
 if type(target) ~= "table" then
 	return deny(403, "unknown relay route")
@@ -353,3 +420,55 @@ else
 end
 ngx.var.relay_plan = tostring(target.plan or "")
 ngx.var.relay_instance = tostring(entry.instance or "")
+
+-- ------------------------------------------------------------------ usage（旁路）
+-- 只在这里记"维度"；token 数在 body_filter 里扫，最终在 log 阶段异步推给 dsh-mud。
+-- usage_source=off 时整段跳过（出问题一条配置关掉，不影响请求）。
+local usage_ok, usage = pcall(dofile, "/usr/local/lib/dsh-mu/lua/relay_usage.lua")
+if usage_ok and usage then
+	do
+		local sha = require "resty.sha256"
+			and nil   -- 不用哈希库：token_id 由 dsh-mud 侧算（同一算法 ✓）
+		local body_method = ngx.req.get_method()
+		local has_tools, is_stream, body_model = false, false, nil
+		if body_method == "POST" then
+			ngx.req.read_body()
+			local raw = ngx.req.get_body_data()
+			if not raw then
+				-- 大请求体被 nginx 落到临时文件里了（43KB 的 prompt 就会这样 ✗）
+				local tmp = ngx.req.get_body_file()
+				if tmp then
+					local fh = io.open(tmp, "rb")
+					if fh then raw = fh:read(8192); fh:close() end
+				end
+			end
+			if raw then
+				has_tools = raw:find('"tools"', 1, true) ~= nil
+				is_stream = raw:find('"stream"%s*:%s*true', 1) ~= nil
+				local m = raw:match('"model"%s*:%s*"([^"]+)"')
+				if m and m ~= "" then body_model = m end
+			end
+		end
+		usage.begin({
+			request_id = ngx.var.request_id or (ngx.now() .. "-" .. tostring(ngx.var.connection)),
+			user = "",                       -- 由 dsh-mud 按 token 反查（不信任客户端）
+			token = token,                   -- 只给 dsh-mud 查表用 ✓ **任何记录/日志都不写** ✗
+			instance = tostring(entry.instance or ""),
+			plan = tostring(entry.plan or target.plan or ""),
+			provider = tostring(target.pkg or target.provider or ""),
+			model = tostring(target.model or body_model or ""),
+			route = ngx.var.relay_route or "",
+			endpoint = ngx.var.relay_endpoint or "",
+			surface = (ngx.var.http_x_dsh_surface or ""),
+			client = (ngx.var.http_user_agent or ""):sub(1, 40),
+			client_version = (ngx.var.http_x_dsh_version or ""),
+			stream = is_stream
+				or (ngx.req.get_headers()["accept"] or ""):find("event-stream", 1, true) ~= nil,
+			has_tools = has_tools,
+			token_id = "",                   -- 留空：dsh-mud 用 token 反查（不落 token 本体）
+			session_id = ngx.var.cookie_dshmu_session or "",
+		})
+		-- token 只用于反查，绝不写进任何记录：dsh-mud 侧按 tokens 表映射成 token_id
+		ngx.ctx.mu_usage.token = token
+	end
+end
