@@ -3833,7 +3833,28 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modalBu
 
   /* 左轨是常显区域：用自己的轻接口 + 自己的定时刷新，不跟着概览那个重接口走 */
 
-  function wireDoctorBadge(summary) {
+  /* 首页右栏「自检摘要」：数据来自 /api/doctor-summary（与 overview 拆开 ✓ 8s → 先出页面） */
+function fillDoctorCard(d) {
+  const s = (d && d.summary) || {};
+  const sums = document.querySelectorAll('.side-stack .doctor-sums .v');
+  if (sums[0]) sums[0].textContent = s.PASS ?? 0;
+  if (sums[1]) sums[1].textContent = s.WARN ?? 0;
+  if (sums[2]) sums[2].textContent = s.FAIL ?? 0;
+  const link = document.querySelector('.side-stack .card h3 a.faint');
+  if (link) {
+    const total = d.total || ((s.PASS ?? 0) + (s.WARN ?? 0) + (s.FAIL ?? 0));
+    link.textContent = `全部 ${total} 项`;
+  }
+  const flags = document.querySelector('.side-stack .flags');
+  if (flags) {
+    const names = [...(d.warning || []), ...(d.failing || [])];
+    flags.innerHTML = names.length
+      ? names.slice(0, 4).map(n => `<div class="row" style="align-items:flex-start;gap:8px"><span class="dot warn" style="margin-top:6px"></span><span style="font-size:11.5px;line-height:17px;color:var(--ink-2)">${String(n)}</span></div>`).join('')
+      : '<div class="row" style="font-size:11.5px;color:var(--ink-3)">没有告警</div>';
+  }
+}
+
+function wireDoctorBadge(summary) {
     const s = summary || {};
     const warn = s.WARN ?? 0, fail = s.FAIL ?? 0;
     const top = document.getElementById('topDoctor');
@@ -3891,26 +3912,7 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modalBu
     ];
     kv.forEach((el, i) => { if (vals[i] != null) el.textContent = vals[i]; });
 
-    const doc = ov.doctor || {};
-    const s = doc.summary || {};
-    const sums = document.querySelectorAll('.side-stack .doctor-sums .v');
-    if (sums[0]) sums[0].textContent = s.PASS ?? 0;
-    if (sums[1]) sums[1].textContent = s.WARN ?? 0;
-    if (sums[2]) sums[2].textContent = s.FAIL ?? 0;
-    const link = document.querySelector('.side-stack .card h3 a.faint');
-    if (link) {
-      const total = (s.PASS ?? 0) + (s.WARN ?? 0) + (s.FAIL ?? 0);
-      link.textContent = `全部 ${total} 项`;
-    }
-    const flags = document.querySelector('.side-stack .flags');
-    if (flags) {
-      const items = []
-        .concat((doc.failing || []).map(n => ['err', n]))
-        .concat((doc.warning || []).map(n => ['warn', n]));
-      flags.innerHTML = items.length
-        ? items.map(([kind, name]) => `<div class="row" style="align-items:flex-start;gap:8px"><span class="dot ${kind}" style="margin-top:6px"></span><span style="font-size:11.5px;line-height:17px;color:var(--ink-2)">${esc(name)}</span></div>`).join('')
-        : '<div class="row" style="align-items:flex-start;gap:8px"><span class="dot ok" style="margin-top:6px"></span><span style="font-size:11.5px;color:var(--ink-2)">全部通过</span></div>';
-    }
+    // 自检卡（数字 + 告警列表）统一由 fillDoctorCard() 填 ✓ 见 wireAll 里的 /api/doctor-summary
   }
 
 
@@ -4327,7 +4329,8 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modalBu
 
   function wireAll() {
     const done = () => document.documentElement.classList.remove('wiring');
-    Promise.allSettled([
+    // 快的一批：这些一回来就撤掉 .wiring（样例数据隐藏）→ 首屏立即可见 ✓
+    const fast = Promise.allSettled([
       wireRail().catch(e => console.warn('rail:', e.message)),
       wireInstances().catch(e => console.warn('instances:', e.message)),
       wireEgressMounts().catch(e => console.warn('egress/mounts:', e.message)),
@@ -4336,9 +4339,13 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !modalBu
       wireOverview().catch(e => console.warn('overview:', e.message)),
       wirePrivate().catch(e => console.warn('private:', e.message)),
       wireSide().catch(e => console.warn('side:', e.message)),
-      api('overview').then(o => wireDoctorBadge((o.doctor || {}).summary))
-        .catch(e => console.warn('doctor badge:', e.message)),
-    ]).then(done);
+    ]);
+    fast.then(done);
+    // 慢的一批：自检摘要（首次要算 8s+）单独拉 ✓ **不阻塞首屏** ✓
+    api('doctor-summary').then(d => {
+      wireDoctorBadge(d.summary || {});
+      fillDoctorCard(d);
+    }).catch(e => console.warn('doctor summary:', e.message));
   }
   if (document.readyState !== 'loading') wireAll();
   else document.addEventListener('DOMContentLoaded', wireAll);

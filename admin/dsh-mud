@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import concurrent.futures
 import contextlib
 import shutil
 import os
@@ -193,6 +194,16 @@ def _serve_resp_unix(sock_path: str):
         except OSError:
             continue
         _thread_start(_resp_client, conn)
+
+
+def _warm_doctor_cache(interval: float = 60.0) -> None:
+    """后台定时跑一次体检，让 /api/doctor-summary 和首页那条缓存常年是热的 ✓（失败忽略 ✓）"""
+    while True:
+        try:
+            doctor_cached(mu.load_state(), ttl=0.0)   # ttl=0 → 强制重算
+        except Exception:  # noqa: BLE001 - 预热失败不影响服务
+            pass
+        time.sleep(interval)
 
 
 def serve_resp():
@@ -452,12 +463,48 @@ def instance_view(st: dict, name: str) -> dict:
 
 
 def instances_view(st: dict) -> list[dict]:
-    return [instance_view(st, name) for name in sorted(st["instances"])]
+    # 每个实例都要做一次 TCP 探测（连不上时要等超时 ✗）。11 个串行≈0.4s，
+    # 并行之后 ≈ 最慢的那一个 ✓ 顺序仍按名字 ✓
+    names = sorted(st["instances"])
+    if len(names) <= 1:
+        return [instance_view(st, n) for n in names]
+    out: dict[str, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, len(names))) as pool:
+        futures = {pool.submit(instance_view, st, n): n for n in names}
+        for fut in concurrent.futures.as_completed(futures):
+            name = futures[fut]
+            try:
+                out[name] = fut.result()
+            except Exception as exc:  # noqa: BLE001 - one bad instance must not blank the fleet
+                out[name] = {"name": name, "error": str(exc)[:120], "state": "?", "live": False,
+                             "port": int(st["instances"][name].get("port", 0))}
+    return [out[n] for n in names]
 
 
-def overview(st: dict, cfg: dict) -> dict:
+# doctor 是全量体检（70+ 项，含外网与 systemd/openresty 探测，实测 8+ 秒 ✗）。
+# overview 每次请求都同步跑一遍 → 整个首页要 9 秒 ✗。这里加一个短 TTL 缓存：
+# 自检页仍然强制新鲜（它自己调 mu.doctor_checks ✓），首页只取最近一次的结果 ✓
+_DOCTOR_CACHE = {"at": 0.0, "rows": None}
+DOCTOR_CACHE_TTL = 30.0
+
+
+def doctor_cached(st: dict, ttl: float = DOCTOR_CACHE_TTL) -> list:
+    now = time.time()
+    rows = _DOCTOR_CACHE.get("rows")
+    if rows is not None and now - float(_DOCTOR_CACHE.get("at") or 0) < ttl:
+        return rows
+    rows = mu.doctor_checks(st)
+    _DOCTOR_CACHE["rows"] = rows
+    _DOCTOR_CACHE["at"] = now
+    return rows
+
+
+def overview(st: dict, cfg: dict, query: dict | None = None) -> dict:
     instances = instances_view(st)
-    checks = mu.doctor_checks(st)
+    # D：自检摘要是首页最重的一块（实测 8.4s ✗）。默认不再随 overview 返回 ✓
+    # 前端用 /api/doctor-summary 单独拉（先出页面 ✓ 自检卡后到 ✓）；?doctor=1 仍兼容 ✓
+    want_doctor = str((query.get("doctor") or ["0"])[0]).lower() in ("1", "true", "yes")
+    checks = doctor_cached(st) if want_doctor else []
     summary: dict[str, int] = {}
     for check in checks:
         summary[check["status"]] = summary.get(check["status"], 0) + 1
@@ -664,6 +711,7 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("GET", re.compile(r"^/api/rail$"), "rail"),
     ("GET", re.compile(r"^/api/me/plans$"), "me_plans_get"),
     ("POST", re.compile(r"^/api/me/plans$"), "me_plan_action"),
+    ("GET", re.compile(r"^/api/doctor-summary$"), "doctor_summary"),
     ("GET", re.compile(r"^/api/usage$"), "usage_view"),
     ("GET", re.compile(r"^/api/plans$"), "plan_list"),
     ("POST", re.compile(r"^/api/plans$"), "plan_add"),
@@ -1779,6 +1827,18 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"ok": True, "models": res["models"], "count": res["count"], **extra,
                          "default_model": res.get("default_model") or "",
                          "restart_required": True}
+        if name == "doctor_summary":
+            # 这里不能直接用 `st`：dispatch 作用域里它在更靠后的分支才被赋值 ✗
+            # （Python 会因此把它当局部变量 → UnboundLocalError，接口 500）✓
+            checks = doctor_cached(mu.load_state())
+            summary: dict[str, int] = {}
+            for check in checks:
+                summary[check["status"]] = summary.get(check["status"], 0) + 1
+            return 200, {"summary": summary,
+                         "failing": [c["check"] for c in checks if c["status"] == mu.DOCTOR_FAIL],
+                         "warning": [c["check"] for c in checks if c["status"] == mu.DOCTOR_WARN],
+                         "total": len(checks),
+                         "cached_at": int(_DOCTOR_CACHE.get("at") or 0)}
         if name == "usage_view":
             # 用量视图（只读）：today / users / models / series
             view = str((query.get("view") or ["today"])[0]).lower()
@@ -1963,7 +2023,7 @@ class Handler(BaseHTTPRequestHandler):
         if name == "private_models":
             return 200, private_models(st)
         if name == "overview":
-            return 200, overview(st, cfg)
+            return 200, overview(st, cfg, query)
         if name == "users":
             return 200, {"users": users_view(st)}
         if name == "instances":
@@ -2367,6 +2427,7 @@ def main(argv=None) -> int:
     try:
         _thread_cls = globals()["threading"].Thread
         _thread_cls(target=serve_resp, daemon=True).start()
+        _thread_cls(target=_warm_doctor_cache, daemon=True).start()
         _thread_cls(target=_serve_resp_unix,
                     args=(os.environ.get("DSH_MU_RESP_SOCK") or "/run/dsh-mu/resp.sock",),
                     daemon=True).start()
