@@ -1,0 +1,493 @@
+{
+  "schema": "dsh-mu.provider/v1",
+  "id": "mu-uniapi",
+  "label": "UniAPI 中转站",
+  "docs": "https://docs.uniapi.ai/",
+  "auth": {
+    "type": "bearer"
+  },
+  "headers": {},
+  "base_url": "https://api.uniapi.io/v1",
+  "api": "openai-completions",
+  "default_model": "claude-sonnet-5-5",
+  "models": [
+    {
+      "id": "gpt-6-astra",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GPT-6 Astra",
+      "contextWindow": 1050000,
+      "maxTokens": 128000,
+      "inputModalities": [
+        "text",
+        "image"
+      ]
+    },
+    {
+      "id": "gpt-6-sol",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GPT-6 Sol"
+    },
+    {
+      "id": "gpt-6.1-sol",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GPT-6.1 Sol"
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GPT-5.6 Sol"
+    },
+    {
+      "id": "gpt-5.6-terra",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GPT-5.6 Terra"
+    },
+    {
+      "id": "gpt-5.6-luna",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GPT-5.6 Luna"
+    },
+    {
+      "id": "gpt-5.5",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GPT-5.5"
+    },
+    {
+      "id": "gpt-5.4",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GPT-5.4"
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GPT-5.4 Mini"
+    },
+    {
+      "id": "claude-opus-5-5",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Opus 5.5"
+    },
+    {
+      "id": "claude-opus-5",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Opus 5"
+    },
+    {
+      "id": "claude-opus-4-8",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Opus 4.8"
+    },
+    {
+      "id": "claude-opus-4-7",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Opus 4.7"
+    },
+    {
+      "id": "claude-opus-4-6",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Opus 4.6"
+    },
+    {
+      "id": "claude-sonnet-5-5",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Sonnet 5.5"
+    },
+    {
+      "id": "claude-sonnet-5",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Sonnet 5"
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Sonnet 4.6"
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Haiku 5.5"
+    },
+    {
+      "id": "claude-haiku-4-5-20251001",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Haiku 4.5"
+    },
+    {
+      "id": "claude-fable-5-1",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Fable 5.1"
+    },
+    {
+      "id": "claude-fable-5",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Claude Fable 5"
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 3.8 Flash"
+    },
+    {
+      "id": "gemini-3.7-flash",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 3.7 Flash"
+    },
+    {
+      "id": "gemini-3.6-flash",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 3.6 Flash"
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 3.5 Flash"
+    },
+    {
+      "id": "gemini-3.5-flash-lite",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 3.5 Flash Lite"
+    },
+    {
+      "id": "gemini-3.1-flash-lite",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 3.1 Flash Lite"
+    },
+    {
+      "id": "gemini-3.1-pro-preview",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 3.1 Pro Preview"
+    },
+    {
+      "id": "gemini-3-pro-preview",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 3 Pro Preview"
+    },
+    {
+      "id": "gemini-3-flash-preview",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 3 Flash Preview"
+    },
+    {
+      "id": "gemini-2.5-pro",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 2.5 Pro"
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 2.5 Flash"
+    },
+    {
+      "id": "gemini-2.5-flash-lite",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Gemini 2.5 Flash Lite"
+    },
+    {
+      "id": "grok-4.7",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Grok 4.7"
+    },
+    {
+      "id": "grok-4.6",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Grok 4.6"
+    },
+    {
+      "id": "grok-4.5",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Grok 4.5"
+    },
+    {
+      "id": "grok-4.3",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Grok 4.3"
+    },
+    {
+      "id": "grok-4.3-all",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Grok 4.3 All"
+    },
+    {
+      "id": "grok-3-all",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Grok 3 All"
+    },
+    {
+      "id": "grok-420-fast-all",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Grok 4.20 Fast All"
+    },
+    {
+      "id": "grok-4.20-0309-reasoning",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Grok 4.20 Reasoning"
+    },
+    {
+      "id": "grok-4.20-0309-non-reasoning",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Grok 4.20 Non-Reasoning"
+    },
+    {
+      "id": "grok-4.20-multi-agent-0309",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Grok 4.20 Multi-Agent"
+    },
+    {
+      "id": "grok-build-0.1",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Grok Build 0.1"
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "DeepSeek V4 Pro"
+    },
+    {
+      "id": "deepseek-v4-pro-0813",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "DeepSeek V4 Pro (0813)"
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "DeepSeek V4 Flash"
+    },
+    {
+      "id": "deepseek-v4-flash-0731",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "DeepSeek V4 Flash (0731)"
+    },
+    {
+      "id": "deepseek-v4.1-flash",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "DeepSeek V4.1 Flash"
+    },
+    {
+      "id": "deepseek-v3.2",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "DeepSeek V3.2"
+    },
+    {
+      "id": "deepseek-v3.2-azure",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "DeepSeek V3.2 (Azure)"
+    },
+    {
+      "id": "qwen3.8-max",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Qwen3.8 Max"
+    },
+    {
+      "id": "qwen3.7-max",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Qwen3.7 Max"
+    },
+    {
+      "id": "qwen3.7-plus",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Qwen3.7 Plus"
+    },
+    {
+      "id": "qwen3.7-flash",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Qwen3.7 Flash"
+    },
+    {
+      "id": "glm-5.2",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GLM 5.2"
+    },
+    {
+      "id": "glm-5.1",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GLM 5.1"
+    },
+    {
+      "id": "glm-5",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GLM 5"
+    },
+    {
+      "id": "glm-4.7",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "GLM 4.7"
+    },
+    {
+      "id": "kimi-k3",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Kimi K3"
+    },
+    {
+      "id": "MiniMax-M2.5",
+      "api": "anthropic-messages",
+      "base_url": "https://api.uniapi.io/claude",
+      "name": "MiniMax M2.5"
+    },
+    {
+      "id": "MiniMax-M2.5-highspeed",
+      "api": "anthropic-messages",
+      "base_url": "https://api.uniapi.io/claude",
+      "name": "MiniMax M2.5 Highspeed"
+    },
+    {
+      "id": "MiniMax-M2.1",
+      "api": "anthropic-messages",
+      "base_url": "https://api.uniapi.io/claude",
+      "name": "MiniMax M2.1"
+    },
+    {
+      "id": "MiniMax-M2",
+      "api": "openai-responses",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "MiniMax M2"
+    },
+    {
+      "id": "MiniMax-M2-Stable",
+      "api": "openai-responses",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "MiniMax M2 Stable"
+    },
+    {
+      "id": "MiniMax-M1",
+      "api": "openai-responses",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "MiniMax M1"
+    },
+    {
+      "id": "MiniMax-Text-01",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "MiniMax Text 01"
+    },
+    {
+      "id": "doubao-seed-2-1-pro-260915",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Doubao Seed 2.1 Pro (260915)"
+    },
+    {
+      "id": "doubao-seed-2-1-pro-260628",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Doubao Seed 2.1 Pro (260628)"
+    },
+    {
+      "id": "doubao-seed-2-1-turbo-260628",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Doubao Seed 2.1 Turbo (260628)"
+    },
+    {
+      "id": "doubao-seed-2-0-pro-260215",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Doubao Seed 2.0 Pro (260215)"
+    },
+    {
+      "id": "doubao-seed-2-0-mini-260215",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Doubao Seed 2.0 Mini (260215)"
+    },
+    {
+      "id": "doubao-seed-2-0-lite-260215",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Doubao Seed 2.0 Lite (260215)"
+    },
+    {
+      "id": "doubao-seed-2-0-code-preview-260215",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Doubao Seed 2.0 Code Preview (260215)"
+    },
+    {
+      "id": "doubao-seed-1-8-251228",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Doubao Seed 1.8 (251228)"
+    },
+    {
+      "id": "doubao-seed-1-6-vision-250815",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Doubao Seed 1.6 Vision (250815)"
+    },
+    {
+      "id": "doubao-seed-1-6-251015",
+      "api": "openai-completions",
+      "base_url": "https://api.uniapi.io/v1",
+      "name": "Doubao Seed 1.6 (251015)"
+    }
+  ],
+  "discover": {
+    "url": "https://api.uniapi.io/v1/models",
+    "api": "openai-completions",
+    "items": "data",
+    "id": "id",
+    "name": "name",
+    "context_window": "top_provider.context_length",
+    "max_tokens": "top_provider.max_completion_tokens",
+    "input_modalities": "input_modalities"
+  }
+}

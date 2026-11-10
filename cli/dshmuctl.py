@@ -1859,10 +1859,16 @@ def choose_mirrors(cfg: dict, interactive: bool | None = None,
                 "alpine_image_base": "http://download.proxmox.com/images/system"}
     if _MIRROR_DECISION and not force:
         return dict(_MIRROR_DECISION)
-    mirror = str(cfg.get("alpine_mirror") or defaults["alpine_mirror"]).rstrip("/")
-    base = str(cfg.get("alpine_image_base") or defaults["alpine_image_base"]).rstrip("/")
+    # 用户**显式配置**的镜像必须优先 ✓（以前这里会被地区探测覆盖 ✗，而 tuna 一旦 403
+    # 就会让全新安装半途失败：模板建不出来 → 网关没起来 → /admin/... 没人剥前缀 ✗）
+    configured_mirror = str(cfg.get("alpine_mirror") or "").rstrip("/")
+    configured_base = str(cfg.get("alpine_image_base") or "").rstrip("/")
+    mirror = configured_mirror or defaults["alpine_mirror"]
+    base = configured_base or defaults["alpine_image_base"]
     cn = detect_cn_region()
-    if cn is None:
+    if configured_mirror:
+        reason = f"using the configured mirror (region: cn={cn})"
+    elif cn is None:
         reason = "region detection unavailable; keeping the configured mirrors"
     elif cn:
         mirror = "https://mirrors.tuna.tsinghua.edu.cn/alpine"
@@ -2021,6 +2027,38 @@ def download_image(cfg: dict, image: str) -> str:
     die(f"could not download {image} (last error: {last})")
 
 
+def alpine_mirror_ok(mirror: str, timeout: float = 6.0) -> bool:
+    """探测镜像站是否可列目录（tuna 在部分网络里直接 403 ✗）。"""
+    url = mirror.rstrip("/") + "/v3.24/main/x86_64/APKINDEX.tar.gz"
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            return 200 <= int(resp.status) < 400
+    except Exception:  # noqa: BLE001
+        return False
+
+
+MIRROR_FALLBACKS = [
+    "https://mirrors.aliyun.com/alpine",
+    "https://mirrors.ustc.edu.cn/alpine",
+    "https://dl-cdn.alpinelinux.org/alpine",
+]
+
+
+def ensure_mirror_reachable(mirror: str) -> str:
+    """镜像不可用时自动换一个可用的（配置值 → 阿里 → 中科大 → 官方）。"""
+    if alpine_mirror_ok(mirror):
+        return mirror
+    warn(f"alpine mirror unreachable: {mirror}")
+    for cand in MIRROR_FALLBACKS:
+        if cand.rstrip("/") == mirror.rstrip("/"):
+            continue
+        if alpine_mirror_ok(cand):
+            warn(f"falling back to {cand}")
+            return cand
+    return mirror
+
+
 def build_template(st: dict, force: bool = False, interactive: bool | None = None,
                    image: str | None = None, dest: str | None = None,
                    packages: list[str] | None = None):
@@ -2048,6 +2086,17 @@ def build_template(st: dict, force: bool = False, interactive: bool | None = Non
         "version": (re.match(r"alpine-([0-9.]+)-default_", image) or [None, ""])[1]}
     if not pick.get("version"):
         pick["version"] = ""
+    # 镜像 403/不可达会让模板在 "missing usr/bin/node" 处报错 ✗（真发生在新客户机上）
+    # 这里先探测，不可达就换一个能用的 ✓ 并把选择写回 cfg ✓
+    if not image:
+        try:
+            good = ensure_mirror_reachable(str(cfg.get("alpine_mirror") or ""))
+            if good and good.rstrip("/") != str(cfg.get("alpine_mirror") or "").rstrip("/"):
+                cfg = dict(cfg)
+                cfg["alpine_mirror"] = good
+                info(f"alpine mirror switched to {good}")
+        except Exception:  # noqa: BLE001 - 探测失败不阻断构建
+            pass
 
     if force and os.path.exists(dest):
         shutil.rmtree(dest)

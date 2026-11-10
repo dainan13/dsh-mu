@@ -9,11 +9,18 @@
       "models": 2
     },
     {
-      "name": "opencode-go",
+      "name": "mu-opencode-go",
       "label": "OpenCode Go",
       "description": "OpenCode Go 订阅，OpenAI Chat Completions，30 个模型",
       "api": "openai-completions",
       "models": 30
+    },
+    {
+      "name": "mu-uniapi",
+      "label": "UniAPI 中转站",
+      "description": "UniAPI 中转站，OpenAI Chat Completions，77 个模型（含 gpt-6 / claude / gemini 等）",
+      "api": "openai-completions",
+      "models": 77
     }
   ]
 }

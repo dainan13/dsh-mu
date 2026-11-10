@@ -1,6 +1,6 @@
 {
   "schema": "dsh-mu.provider/v1",
-  "id": "opencode-go",
+  "id": "mu-opencode-go",
   "label": "OpenCode Go",
   "docs": "https://opencode.ai/docs/go/",
   "auth": {

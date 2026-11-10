@@ -1012,6 +1012,14 @@ class Handler(BaseHTTPRequestHandler):
         """
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        # 网关会把 /admin/api/... 改写成 /api/...；如果请求来自自建反代/直连 8787，
+        # 前缀没被剥掉，就会得到 "unknown endpoint" ✗（曾经真实发生在新客户身上）。
+        # 这里容忍它：剥掉前缀 + 记一条日志，让配置错误可见但不阻断使用。
+        if path == "/admin" or path.startswith("/admin/"):
+            stripped = path[len("/admin"):] or "/"
+            sys.stderr.write(f"[admin] stripped /admin prefix: {path} -> {stripped}\n")
+            sys.stderr.flush()
+            path = stripped
         parts = path.split("/")
         # ['', 'ext-api', '<name>', '<action>'] -- name may repeat path segments
         if len(parts) < 4 or parts[1] != "ext-api":
@@ -1059,6 +1067,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {"error": why})
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        # 网关会把 /admin/api/... 改写成 /api/...；如果请求来自自建反代/直连 8787，
+        # 前缀没被剥掉，就会得到 "unknown endpoint" ✗（曾经真实发生在新客户身上）。
+        # 这里容忍它：剥掉前缀 + 记一条日志，让配置错误可见但不阻断使用。
+        if path == "/admin" or path.startswith("/admin/"):
+            stripped = path[len("/admin"):] or "/"
+            sys.stderr.write(f"[admin] stripped /admin prefix: {path} -> {stripped}\n")
+            sys.stderr.flush()
+            path = stripped
         query = parse_qs(parsed.query)
         body = self._body() if method in ("POST", "PATCH", "PUT", "DELETE") else {}
         actor = self.headers.get("X-DSH-MU-User") or query.get("actor", [""])[0]
@@ -1163,7 +1179,12 @@ class Handler(BaseHTTPRequestHandler):
             self.log_message("%s %s -> %s (%dms) actor=%s", method, path, status,
                              int((time.time() - started) * 1000), actor or "-")
             return self._send(status, payload)
-        return self._send(404, {"error": "unknown endpoint", "path": path})
+        return self._send(404, {
+            "error": "unknown endpoint",
+            "path": path,
+            "detail": f"no route for {path}; the browser should call /admin/api/... "
+                      f"through the gateway (port 80), which strips the /admin prefix",
+        })
 
     # -------------------------------------------------------------- handlers
     def _run(self, name: str, match: re.Match, body: dict, query: dict,

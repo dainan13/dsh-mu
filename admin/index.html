@@ -3257,7 +3257,17 @@ function confirmImportAll() {
    2) 导入 provider（JSON）：弹窗里贴 JSON，先校验再落盘
    3) 从 DSH 目录添加：真机是 window.prompt 里让人手敲 id，这里换成可搜索的勾选表
    ========================================================================== */
-const TPL_SOURCE = 'https://raw.githubusercontent.com/dainan13/dsh-mu/main/provider-packages';
+let TPL_SOURCE = 'https://raw.githubusercontent.com/dainan13/dsh-mu/main/provider-packages';
+// 地址可改（内网镜像 / 自建仓库都能用）；优先用配置里的 provider_template_base
+(function () {
+  fetch('api/config', { credentials: 'same-origin' })
+    .then(r => r.json())
+    .then(c => {
+      const v = ((c.config || {}).provider_template_base || '').trim();
+      if (v) TPL_SOURCE = v.replace(/\/+$/, '');
+    })
+    .catch(() => {});
+})();
 let TEMPLATES = [
   { name: 'mu-deepseek', label: 'DeepSeek 官方（Anthropic 端点）', api: 'anthropic-messages', models: 2,
     desc: '官方 anthropic 端点，deepseek-flash / deepseek-v4-pro，带 5 档推理等级；同 id 不带 mu- 的是 DSH 目录导入的 OpenAI 兼容版（不支持官方 web_search）',
@@ -3272,11 +3282,15 @@ function openTemplates() {
     title: '线上 provider 模板',
     sub: '从项目仓库的 provider-packages/ 读取；只落 provider 配置文件，不建套餐，也不静默覆盖同名。',
     size: 'wide',
-    body: `<div class="tpl-source">
+    body: `<div class="tpl-source" style="gap:8px">
         <svg class="i i-sm"><use href="#i-cloud"/></svg>
-        <span class="mono">${TPL_SOURCE}</span>
-        <button class="btn icon ghost" title="复制来源地址" onclick="toast('ok','已复制','模板库地址')"><svg class="i i-sm"><use href="#i-copy"/></svg></button>
+        <input class="input sm mono" id="tplSource" value="${TPL_SOURCE}" spellcheck="false"
+               style="flex:1;min-width:320px" placeholder="模板库地址（可填内网镜像）">
+        <button class="btn sm secondary" onclick="loadTemplates()">读取</button>
+        <span class="badge outline sm" id="tplOrigin">—</span>
       </div>
+      <p class="hint" style="margin:6px 0 10px">由**浏览器**直接访问这个地址（不走服务器），
+        所以服务器不能出网也能用；填内网镜像同样有效。</p>
       <div id="tplBody"></div>`,
     foot: `<button class="btn ghost" id="tplReload" onclick="loadTemplates()" disabled>重新读取</button>
            <span class="spacer"></span>
@@ -3295,72 +3309,88 @@ function cancelTplLoad() {
   const rl = $('#tplReload'); if (rl) rl.disabled = false;
 }
 
-function loadTemplates() {
+async function loadTemplates() {
   const body = $('#tplBody');
   if (!body) return;
+  const input = $('#tplSource');
+  const base = String((input && input.value) || TPL_SOURCE || '').trim().replace(/\/+$/, '');
+  if (input) TPL_SOURCE = base || TPL_SOURCE;
   const rl = $('#tplReload'); if (rl) rl.disabled = true;
-  tplElapsed = 0;
-  clearInterval(tplTimer);
-  body.innerHTML = `
-    <div class="tpl-loading">
-      <div class="row" style="gap:8px">
-        <svg class="i i-sm spin" style="color:var(--brand-ink)"><use href="#i-refresh"/></svg>
-        <b style="font-weight:500;color:var(--ink-1)">正在从模板库读取…</b>
-        <span class="faint" id="tplElapsed">已等 0 秒</span>
-        <span class="faint" id="tplStep" style="font-size:11px">连接模板库…</span>
-        <span class="spacer"></span>
-        <span class="badge outline sm">${TPL_SLOW ? '按真机 20.6s 演示' : '真机冷启动 ≈20 秒'}</span>
-        <button class="btn ghost sm" type="button" onclick="cancelTplLoad()">取消</button>
-      </div>
-      <div class="progress" style="margin:12px 0 10px"><i id="tplBar" style="width:6%;transition:width .3s linear"></i></div>
-      <p class="hint">要拉 GitHub 上的模板文件，首次会慢；可以取消或关掉弹窗，页面不会卡住（下次打开会重新拉）。超过 30 秒会给出重试。</p>
-      <p class="hint" id="tplSlowNote" hidden style="color:var(--warn-ink)">已经 25 秒还没回来 —— 真机会在 30 秒时给出「重试 / 看网络」。</p>
-      <div class="stack-sm" style="margin:14px 0 10px;opacity:.55">
-        <div class="skeleton" style="width:46%"></div><div class="skeleton" style="width:88%"></div><div class="skeleton" style="width:72%"></div>
-      </div>
-      <button class="btn sm secondary" type="button" onclick="simulateTplError()">（原型）模拟读取失败</button>
-    </div>`;
-  const total = TPL_SLOW ? 20600 : 2600;
-  tplTimer = setInterval(() => {
-    if (!$('#tplBody')) { clearInterval(tplTimer); return; }
-    tplElapsed += 0.2;
-    const el = $('#tplElapsed'); if (el) el.textContent = '已等 ' + Math.round(tplElapsed) + ' 秒';
-    const bar = $('#tplBar'); if (bar) bar.style.width = Math.min(94, 6 + (tplElapsed * 1000 / total) * 88) + '%';
-    const step = $('#tplStep');
-    if (step) step.textContent = tplElapsed < 3 ? '连接模板库…' : tplElapsed < (TPL_SLOW ? 14 : 1.6) ? '下载 provider-packages/…' : '解析 manifest 并去重…';
-    const slow = $('#tplSlowNote');
-    if (slow) slow.hidden = !(TPL_SLOW && tplElapsed > 25);
-  }, 200);
-  // 真读取：GET /api/provider-templates → 填进 TEMPLATES（表格外观沿用原型）
-  fetch('api/provider-templates', { credentials: 'same-origin' })
-    .then(r => r.text().then(txt => {
-      let b = {}; try { b = txt ? JSON.parse(txt) : {}; } catch (e) {}
-      if (!r.ok) throw new Error(b.detail || b.error || r.statusText);
-      return b;
-    }))
-    .then((d) => {
-      if (!$('#tplBody')) { clearInterval(tplTimer); return; }
-      clearInterval(tplTimer);
-      TEMPLATES = (d.templates || []).map(r => ({
-        name: r.name,
-        label: r.label || r.name,
-        desc: r.summary || r.desc || '',
-        api: (r.apis || []).join(', '),
-        models: (r.models || []).length,
-        imported: !!r.imported,
-      }));
-      renderTemplates();
-      const src = $('#tplSource');
-      if (src && d.source) src.textContent = d.source;
-    })
-    .catch((e) => {
-      clearInterval(tplTimer);
-      const body = $('#tplBody');
-      if (body) body.innerHTML = `<div class="notice warn"><svg class="i"><use href="#i-alert"/></svg><div class="body">
-        <b>读取模板库失败</b><span>${e.message}（离线环境属正常：可直接用「导入 provider（JSON）」）</span></div></div>`;
-      const rl = $('#tplReload'); if (rl) rl.disabled = false;
+  const badge = $('#tplOrigin'); if (badge) { badge.textContent = '读取中…'; badge.className = 'badge outline sm'; }
+  body.innerHTML = `<div class="tpl-loading"><div class="row" style="gap:8px">
+      <svg class="i i-sm spin" style="color:var(--brand-ink)"><use href="#i-refresh"/></svg>
+      <b style="font-weight:500;color:var(--ink-1)">正在读取模板库…</b>
+      <span class="faint mono" style="font-size:11px">${base}/index.json</span>
+      <span class="spacer"></span>
+      <button class="btn ghost sm" type="button" onclick="cancelTplLoad()">取消</button>
+    </div>
+    <p class="hint">优先由浏览器直接取（服务器不需要出网）；浏览器取不到才回退到服务器代理。</p></div>`;
+
+  // 真实"已导入"集合：GET /api/packages 里已有的 provider id
+  let have = new Set();
+  try {
+    const rp = await fetch('api/packages', { credentials: 'same-origin' });
+    if (rp.ok) {
+      const doc = await rp.json();
+      have = new Set((doc.packages || []).map(p => String(p.id || p.provider || '')));
+    }
+  } catch (e) { /* 读不到就当作都没导入 */ }
+  const norm = (doc) => {
+    const rows = (doc && doc.templates) || (Array.isArray(doc) ? doc : []);
+    return rows.filter(r => r && (r.name || r.id)).map(r => {
+      const name = String(r.name || r.id).trim();
+      return {
+        name,
+        label: r.label || name,
+        desc: r.description || '',
+        api: r.api || '',
+        models: Number(r.models || 0),
+        imported: have.has(name),     // ← 只看真实状态 ✓
+      };
     });
+  };
+
+  let origin = '';
+  let rows = null;
+  try {
+    const r = await fetch(base + '/index.json', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    rows = norm(await r.json());
+    origin = '浏览器直连';
+  } catch (e) {
+    try {
+      const r2 = await fetch('api/provider-templates', { credentials: 'same-origin' });
+      if (!r2.ok) throw new Error('HTTP ' + r2.status);
+      rows = norm(await r2.json());
+      origin = '服务器代理';
+    } catch (e2) {
+      if ($('#tplBody')) {
+        $('#tplBody').innerHTML = `<div class="empty" style="padding:16px 0">
+          <div class="glyph"><svg class="i i-lg"><use href="#i-ban"/></svg></div>
+          <div class="t">读取失败</div>
+          <div class="d">浏览器：${String(e.message || e)} · 服务器：${String(e2.message || e2)}<br>
+          检查地址是否正确、服务器/浏览器能否访问这个地址。</div></div>`;
+      }
+      if (badge) { badge.textContent = '失败'; badge.className = 'badge err sm'; }
+      if (rl) rl.disabled = false;
+      return;
+    }
+  }
+  if (!rows || !rows.length) {
+    if ($('#tplBody')) {
+      $('#tplBody').innerHTML = '<div class="empty" style="padding:16px 0"><div class="t">模板库是空的</div>' +
+        '<div class="d">index.json 里没有 templates[]，或者地址指向的目录不对。</div></div>';
+    }
+    if (badge) { badge.textContent = '空'; badge.className = 'badge warn sm'; }
+    if (rl) rl.disabled = false;
+    return;
+  }
+  TEMPLATES = rows;
+  if (badge) { badge.textContent = origin; badge.className = 'badge ok sm'; }
+  if (rl) rl.disabled = false;
+  renderTemplates();
 }
+
 function simulateTplError() {
   clearInterval(tplTimer);
   const body = $('#tplBody'); if (!body) return;
@@ -3402,32 +3432,34 @@ function importTemplate(name) {
   if (!t) return;
   const run = () => new Promise((resolve) => {
     const btn = $(`[data-tpl-btn="${name}"]`);
-    if (btn) { btn.disabled = true; btn.innerHTML = '<svg class="i i-sm spin"><use href="#i-refresh"/></svg>导入中…'; }
-    // 真导入：POST /api/provider-templates {name}
-    fetch('api/provider-templates', {
-      method: 'POST', credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
-    }).then(r => r.text().then(txt => {
-      let b = {}; try { b = txt ? JSON.parse(txt) : {}; } catch (e) {}
-      if (!r.ok) throw new Error(b.detail || b.error || r.statusText);
-      return b;
-    })).then(() => {
-      t.imported = true;
-      if ($('#tplBody')) renderTemplates();
-      if (window.wireModels) window.wireModels().catch(() => {});
-      toast('ok', '已导入 ' + name, '下一步给它建一个套餐');
-      resolve();
-    }).catch(e => {
-      if (btn) { btn.disabled = false; btn.textContent = '重试'; }
-      toast('err', '导入失败', e.message);
-      resolve();
-    });
-    if (false) setTimeout(() => {
-      t.imported = true;
-      if ($('#tplBody')) renderTemplates();
-      toast('ok', '已导入 ' + name, t.models + ' 个模型 · sha256 3f9a…c21b；下一步给它建一个套餐');
-      resolve();
-    }, 1200);
+    const setBtn = (txt, dis) => { if (btn) { btn.disabled = !!dis; btn.textContent = txt; } };
+    setBtn('导入中…', true);
+    const base = String(TPL_SOURCE || '').replace(/\/+$/, '');
+    // **浏览器**取模板 JSON ✓ 然后按"粘贴 JSON"的入口导入 ✓
+    // （原来走 /api/provider-import ✗ 那条是导入 DSH 自带目录的，和线上模板不是一套东西 ✗）
+    fetch(base + '/' + encodeURIComponent(name) + '.json', { cache: 'no-store' })
+      .then(r => { if (!r.ok) throw new Error('模板下载失败：HTTP ' + r.status); return r.text(); })
+      .then(text => fetch('api/packages', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      }).then(r => r.text().then(txt => {
+        let b = {}; try { b = txt ? JSON.parse(txt) : {}; } catch (e) {}
+        if (!r.ok) throw new Error(b.detail || b.error || r.statusText);
+        return b;
+      })))
+      .then((b) => {
+        t.imported = true;
+        if ($('#tplBody')) renderTemplates();
+        if (window.wireModels) window.wireModels().catch(() => {});
+        toast('ok', '已导入 ' + name, (b.id ? b.id + ' · ' : '') + '下一步给它建一个套餐');
+        resolve();
+      })
+      .catch(e => {
+        setBtn('重试', false);
+        toast('err', '导入失败', e.message);
+        resolve();
+      });
   });
   if (!t.imported) return run();
   confirmModal({
@@ -3438,55 +3470,9 @@ function importTemplate(name) {
     body: `<ul class="confirm-list">
       <li><svg class="i i-sm no"><use href="#i-x"/></svg><span>provider 配置（base_url / 协议 / 模型目录）被覆盖</span></li>
       <li><svg class="i i-sm yes"><use href="#i-check"/></svg><span>套餐、key 与已装的实例不受影响</span></li>
-      <li><svg class="i i-sm yes"><use href="#i-check"/></svg><span>重启受影响实例后生效</span></li>
     </ul>`,
-    onOk: run,
+    onOk: () => run(),
   });
-}
-
-/* ── 从 DSH 目录添加：可搜索的勾选表（真机此处是 window.prompt） ── */
-let DSH_PROVIDERS = [
-  { id: 'deepseek', models: 9, apis: 'openai-completions', imported: true },
-  { id: 'opencode-go', models: 31, apis: 'openai-completions', imported: true },
-  { id: 'kilo', models: 112, apis: 'openai-completions', imported: true },
-  { id: 'opencode', models: 18, apis: 'openai-completions', imported: true },
-  { id: 'amazon-bedrock', models: 197, apis: 'bedrock-converse-stream', imported: true, needs: 'region' },
-  { id: 'anthropic', models: 17, apis: 'anthropic-messages' },
-  { id: 'openrouter', models: 388, apis: 'anthropic-messages · openai-completions' },
-  { id: 'google', models: 23, apis: 'google-generative-ai' },
-  { id: 'openai', models: 84, apis: 'openai-responses · openai-completions' },
-  { id: 'groq', models: 7, apis: 'openai-completions' },
-  { id: 'mistral', models: 34, apis: 'mistral-conversations' },
-  { id: 'nvidia', models: 21, apis: 'openai-completions' },
-  { id: 'xai', models: 4, apis: 'openai-responses' },
-  { id: 'together', models: 15, apis: 'openai-completions' },
-  { id: 'cerebras', models: 2, apis: 'openai-completions' },
-  { id: 'zai', models: 7, apis: 'openai-completions' },
-  { id: 'openai-codex', models: 6, apis: 'openai-responses', needsUserConfig: true },
-];
-const dshPicked = new Set();
-let dshFilter = 'all';
-
-async function loadDshCatalog() {
-  // 数据源：GET /api/provider-catalog（真实 41 个）+ /api/packages（判已导入）
-  try {
-    const [cat, pkgs] = await Promise.all([
-      fetch('api/provider-catalog', { credentials: 'same-origin' }).then(r => r.json()),
-      fetch('api/packages', { credentials: 'same-origin' }).then(r => r.json()),
-    ]);
-    const have = new Set((pkgs.packages || []).map(p => p.id));
-    DSH_PROVIDERS = (cat.providers || []).map(p => ({
-      id: p.id || p.provider,
-      models: (p.models || []).length,
-      apis: (p.apis || []).join(' · '),
-      imported: have.has(p.id || p.provider),
-      needs: (p.needs_params || [])[0],
-    }));
-  } catch (e) {
-    // 读取失败就保留原样（至少弹窗能打开）
-    console.warn('catalog:', e.message);
-  }
-  if (typeof renderDshRows === 'function') renderDshRows();
 }
 
 function openDshPicker() {
@@ -6146,10 +6132,27 @@ html.wiring .side-stack .flags { visibility: hidden; }
     }
   };
 
+  function loadIfVisible() {
+    const v = document.getElementById('v-usage');
+    if (v && !v.hidden) window.wireUsage();
+  }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       if (location.hash.indexOf('usage') >= 0) window.wireUsage();
+      observeView();
     });
+  } else {
+    if (location.hash.indexOf('usage') >= 0) window.wireUsage();
+    observeView();
+  }
+  // 页面是用 `go()` 切的（history/pushState 不一定触发 hashchange ✗），
+  // 所以直接盯「视图从 hidden 变成可见」这一个事实 ✓ 最可靠 ✓
+  function observeView() {
+    const v = document.getElementById('v-usage');
+    if (!v) return;
+    new MutationObserver(() => {
+      if (!v.hidden) window.wireUsage();
+    }).observe(v, { attributes: true, attributeFilter: ['hidden', 'class'] });
   }
   window.addEventListener('hashchange', () => {
     if (location.hash.indexOf('usage') >= 0) window.wireUsage();
