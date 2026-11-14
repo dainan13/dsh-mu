@@ -55,6 +55,47 @@ function defined(name, code) {
     || new RegExp(`(const|let|var)\\s+${n}\\s*=`).test(code);
 }
 
+// 0 --------------------------------------------- document integrity (cheap, high value)
+{
+  // 曾经把一段 JS 拼接到了 </html> 之后 ✗ → 浏览器把代码当正文渲染 ✓（整页"花了"）
+  const end = html.lastIndexOf("</html>");
+  const tail = end >= 0 ? html.slice(end + "</html>".length).trim() : "(no </html>)";
+  if (end < 0) bad("index.html has no </html>");
+  else if (tail) bad(`content after </html>: ${tail.slice(0, 60).replace(/\s+/g, " ")}`);
+  else ok("document ends at </html>");
+
+  const opens = (html.match(/<script\b/g) || []).length;
+  const closes = (html.match(/<\/script>/g) || []).length;
+  if (opens !== closes) bad(`unbalanced <script>: ${opens} open vs ${closes} close`);
+  else ok(`${opens} script blocks are balanced`);
+}
+
+// 0b ------------------------------- cross-script helper usage (real bug we hit twice)
+{
+  // apiJ 只在一个 <script> 块里定义 ✓ 其它块里像调用它一样写 `apiJ(` 会在运行时 ReferenceError ✗
+  // （被 try/catch 吞掉后表现为"下拉只剩默认项"✓ 查了很久 ✗）
+  const blocks = [...html.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/g)]
+    .map(m => m[1]);
+  const defined = blocks.map(b => /function apiJ\s*\(/.test(b));
+  const badBlocks = [];
+  blocks.forEach((b, i) => {
+    if (/\bapiJ\s*\(/.test(b) && !defined[i]) badBlocks.push(i);
+  });
+  if (badBlocks.length) bad(`apiJ() used in script block(s) ${badBlocks.join(", ")} but defined elsewhere`);
+  else ok("apiJ() is only used where it is defined");
+}
+
+// 0c ------------------------------- duplicate definitions (real bug: old copy overrode new)
+{
+  const defs = {};
+  for (const m of html.matchAll(/window\.(\w+)\s*=\s*(?:async\s+)?function/g)) {
+    defs[m[1]] = (defs[m[1]] || 0) + 1;
+  }
+  const dups = Object.entries(defs).filter(([, n]) => n > 1).map(([k]) => k);
+  if (dups.length) bad(`duplicate window.X definitions: ${dups.join(", ")}`);
+  else ok("no duplicate window function definitions");
+}
+
 // 1 ------------------------------------------------------- inline HTML handlers
 {
   // Only bare calls count: `foo(` is a handler, `this.form.reset(` is a method.

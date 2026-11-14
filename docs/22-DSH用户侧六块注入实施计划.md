@@ -102,3 +102,154 @@
 1. 实例重启**必须后台跑 + 轮询**（`setsid … &` 再查状态）：同步等会被 SSH 30s 超时掐断，留下中间态。
 2. `instance start` 在"状态记录 stopped 但服务仍在"时会报 already started；用 `instance restart` 更稳，
    判定存活看三件事：`instance status` 行 ✓ `rc-service status` ✓ 端口探测（401 = 活着，要求登录）✓。
+
+## 附 A：实例 jail 的挂载表（照这张表记，别凭记忆）
+
+除 `EXTRA_MOUNTS`（实例 conf 里的 `host:jail[:ro]`）与受保护插件的 ro 自 bind 之外，
+`jail/dsh-mu-jail` 每次都建立这些挂载：
+
+| jail 内路径 | 宿主来源 | 模式 | 说明 |
+| --- | --- | --- | --- |
+| `/`（自身） | 实例 rootfs | rw | 先自 bind 一次，bwrap 要求 `/` 是挂载点 |
+| `/proc` | 新建 proc（失败退回宿主） | rw | |
+| `/proc/sys` | 宿主 | ro | 防改内核参数 |
+| `/sys` | 宿主 | ro | |
+| `/dev` | 宿主 | ro | 防伪造设备 |
+| `/tmp` | tmpfs 256 MB | rw | 每次启动清空 |
+| `/run` | tmpfs 16 MB | rw | |
+| `/etc/resolv.conf`·`/etc/hosts`·`/etc/localtime` | 宿主 | ro | |
+| **`/usr/local/lib/node_modules`** | **runtime 的 `node_modules`** | **ro** | ★ 整棵树（见下） |
+| `/home/dsh` | `instances/<n>/home` | rw | DSH_HOME：会话/凭据/profiles/用户插件 |
+| `/home/dsh/workspace` | `instances/<n>/workspace` | rw | 用户真实工作区（覆盖 home 里的同名目录）|
+| `/home/dsh/.pnpm-store` | `$DSHMU_PNPM_STORE` | rw | 默认**不挂** |
+| 受保护插件（每包一条）| 它自己 | **ro 自 bind** | 内核 EROFS；已 drop CAP_SYS_ADMIN，卸不掉 |
+
+**运行时是"一棵树"，不是一个包**：`@deepseek-ai/dsh` 从**同级** `node_modules` 解析依赖
+（`@deepseek-ai/dsh-app-boot`、`dsh-tool-*` …）。所以挂整个 `node_modules`；
+只挂 `.../@deepseek-ai/dsh` 会报 `Cannot find package '@deepseek-ai/dsh-app-boot'`（踩过）。
+
+## 附 B：备份包含什么（`dsh-muctl backup`）
+
+默认输出 `/var/backups/dsh-mu-<时间戳>.tgz`（0600，含 `manifest.json`）。按组过滤：
+`--only` / `--except`，组名如下：
+
+| 组 | 内容 |
+| --- | --- |
+| `state` | `/etc/dsh-mu/state.json`（用户/实例/端口/配额）|
+| `config` | `dsh-mu.conf`、`.default` |
+| `secrets` | `admin.token`、`secret.key`、`providers.json` |
+| `gateway` | `gateway/{users,upstreams,config}.json` |
+| `providers` | `/var/lib/dsh-mu/providers/`（平台 provider 包，如 `mu-*`）|
+| `plans` | `/var/lib/dsh-mu/plans/` |
+| `tls` | `/etc/dsh-mu/tls/` |
+| **`usage`** | **`/var/lib/dsh-mu/state.db`**（用量 + token 库；用 SQLite 在线备份 API 做一致快照）|
+
+`--with-instances` 额外备份每个实例的两个卷：
+`instances/<n>/home`（DSH_HOME：会话、凭据、profiles、**用户自己装的插件**）与
+`instances/<n>/workspace`（用户文件）。
+
+**不在备份里**：runtime（apk 提供）、jail 模板（可重建）、pnpm store（默认不挂）、
+平台插件 tarball 缓存（`/var/lib/dsh-mu/plugin-cache`，可重新 fetch）。
+
+备份读的是**宿主路径**，不经过 jail —— 所以"jail 里只读/看不见"不影响备份，
+受保护插件也照样被备份到。
+
+## 附 C：运行时（runtime）由 admin 管理
+
+### C.1 形态：一个含 `node_modules` 的目录
+
+平台只认一件事：`dsh_runtime_dir` 指向一个**含 `node_modules/@deepseek-ai/dsh` 的目录**。
+这个目录可以是：
+
+| 形态 | 产生方式 | 磁盘 | 说明 |
+| --- | --- | --- | --- |
+| squashfs 镜像（推荐）| CI（`dsh-mu-runtime`）或 `runtime pack` | ~95–100 MB/版 | `mount -o loop,ro` 到 `runtimes/<id>/`；只读、可校验 |
+| 解压目录 | 无 loop 的机器自动降级 `unsquashfs`；或手工放目录 | ~560 MB/版 | 对 jail 完全等价（`mode=extracted`）|
+| 旧版 npm 树 | 老机器升级上来时已是这种 | 560 MB+ | **迁移输入**：`runtime pack` 一次转成镜像，不做长期维护 |
+
+**不用软链**：配置里存绝对路径，切换 = 改一个配置值。
+（软链在 jail 里追不到目标，踩过；`readlink -f` 只是历史兜底。）
+
+### C.2 版本标识：`<dsh>-<variant>[-r<rev>]-<sha6>`
+
+```
+0.2.2-rc.1-local-50364b      本机（自己 build）   variant=local，指纹 50364b
+0.2.2-rc.2-plain-523bba      CI 构建            variant=plain
+0.2.2-rc.1-vscode-a1b2c3     变体 + 指纹
+```
+* `variant` 段**总是写出来**（`plain` 也写），这样"CI 构建 / 本机构建 / 变体"一眼可分。
+* `sha6` 是**镜像内容指纹**（sha256 前 6 位）。id 自带指纹 ⇒ 同一 DSH 版本可以有任意多个
+  构建，互不覆盖；"清单里的 id"与"装完的 id"完全一致。
+* `rev`（`-rN`）保留给"同内容重新打包"的少数场景；一般靠指纹就够了。
+* 解析顺序：先剥尾部 `-<sha6>`，再看 `-<variant>`，最后 `-<rev>`。旧格式（无 variant/无指纹）仍然可读。
+
+`MANIFEST.json`（schema 1）字段：`id / dsh / variant / rev / arch / libc / source /
+built_at / node_build / node_pty / pty_sha256 / provides[]`。
+
+### C.3 两个清单文件（仓库侧，`dsh-mu-runtime/channels/`）
+
+| 文件 | 内容 | 谁维护 |
+| --- | --- | --- |
+| `channels.json` | **指针**：`default` / `alpha` 各一条（哪个构建算"默认"）| CI（`channel=` 参数）|
+| `runtimes.json` | **历史**：所有构建的 `id / dsh / variant / rev / sha256 / size / url / built_at` | CI 每次发布追加 |
+
+* 二者职责不重叠：通道是指针（一对一），历史是清单（多对多累积，最多 100 条）。
+* 「读取线上版本」**只读 `runtimes.json`**（浏览器直连）：列出全部历史 + 标出哪个是默认。
+* `dsh-muctl runtime install`（不带版本）读 `channels.json` 的 `default`。
+* 内网镜像：把这两个 JSON + `.squashfs` 放到客户可达的位置，改 `runtime_channel_base` 即可，
+  **完全不碰 GitHub**。
+
+### C.4 管理入口（三个，同一套实现）
+
+```
+命令行： dsh-muctl runtime status|list|install|use|pack|prune|channels|verify|ensure-mounted
+admin ： 运行 → 运行时
+   GET    /api/runtimes                  列表（默认/用量/实例分配/指纹）
+   POST   /api/runtimes/download         后台下载任务（直连 + 镜像并发竞速）
+   GET    /api/runtimes/downloads        任务列表（进行中 + 3 小时内历史）
+   GET    /api/runtimes/download/<job>   单任务进度（received/total/state/error）
+   POST   /api/runtimes/upload?id=<id>   裸流上传（页面用 XHR 显示进度/预计剩余/可取消）
+   POST   /api/runtimes/default          设为「实例默认」，并把跟随者重启对齐（幂等）
+   POST   /api/runtimes/assign           给单个实例指定运行时（见 C.6 规则）
+   POST   /api/runtimes/verify           MANIFEST↔id、pty.node、目录可用性
+   DELETE /api/runtimes/<id>             见 C.7 删除规则
+```
+
+### C.5 下载/上传的落地规则（内容寻址）
+
+* 下载：候选源 = **直连 + 镜像前缀**（`runtime_mirrors` 可配，另可给 `runtime_proxy_list`），
+  全部并发，**谁先吐满 1 MB 谁赢**，其余立刻放弃（镜像快慢随客户网络变化，不能写死顺序）。
+* 上传/下载完成后：算 sha256 →
+  * 同一 id 且内容相同 → **幂等**，什么都不做；
+  * 同一 id 但内容不同 → 存成 `<dsh>-<variant>-<sha6>`（**绝不覆盖在用镜像**）。
+* 落盘后**立刻只读挂载**（`mode=mounted`），所以列表里马上能看到大小/模式/node-pty。
+
+### C.6 端口与运行时的一致性规则
+
+```
+实例在运行  → 改端口 / 改运行时后 **立即重启**（应用新值）
+实例已停止  → 只保存配置，**不启动**（何时拉起由运维决定）
+改「实例默认运行时」→ 跟随默认的运行中实例**全部重启对齐**；默认没变时是幂等 no-op ✓
+```
+实现位置（同一份逻辑，不是页面逻辑）：`apply_instance_runtime()` / `change_instance_port()` /
+`set_default_runtime()`，CLI 与 admin 都走它们。
+
+### C.7 删除规则
+
+```
+① 是「实例默认运行时」        → 拒绝
+② 有运行中的实例在用它        → 拒绝（并列出实例名）
+③ 只有已停止的实例在用它      → 允许删除，同时把这些实例回落到「默认」
+```
+`runtime prune`（按数量保留）走同一套判断。
+
+### C.8 已知前提与坑
+
+* squashfs 挂载需要 **loop 设备**；无 loop 自动降级解包（`mode=extracted`）。
+* 开机后 loop 挂载会消失 → `/etc/init.d/dsh-mu-runtimes` 重新挂载；`sync` 也会幂等补挂。
+* `runtime pack` 会校验源树（`node_modules/@deepseek-ai/dsh/package.json` + `node-pty/.../pty.node`）；
+  **它会在网关 rootfs 的 `tmp/` 下留 500–800 MB 临时树**，用完请清（或在有 loop 的机器上别用它）。
+* `runtime migrate-ids` 会改镜像名/挂载/实例 conf：**默认只预演**，必须 `--yes` 才执行
+  （曾把 8 个实例弄挂 15 分钟）。
+* 同一份页面里不要出现两份同名函数：JS 后定义会覆盖先定义，表现为"新功能不生效"。
+  `tests/ui-lint.mjs` 现在会拦（重复定义 / 跨 script 块误用 `apiJ` / `</html>` 之后有内容）。

@@ -278,6 +278,30 @@
       + (state.pids_max ? `<span style="${cap}"> / ${state.pids_max}</span>` : '');
   }
 
+  /* ── 会话过期 → 回登录页 ✓
+     DSH 页面是 SPA：平台会话失效后，页面本身还能显示 ✗
+     它自己的 XHR 只会报错（用户看到一堆接口错误 ✗），不会跳登录 ✗
+     这里统一拦 fetch/XHR 的 401（平台约定：{"error":"unauthorized"} 或 401 ✓） */
+  function watchUnauthorized() {
+    const toLogin = () => {
+      if (/\/login(\?|$)/.test(location.pathname + location.search)) return;
+      location.replace('/login?next=' + encodeURIComponent(location.pathname + location.search));
+    };
+    const origFetch = window.fetch;
+    window.fetch = function () {
+      return origFetch.apply(this, arguments).then((res) => {
+        if (res && res.status === 401) toLogin();
+        return res;
+      });
+    };
+    const origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (m, u) {
+      this.addEventListener('load', () => { if (this.status === 401) toLogin(); });
+      return origOpen.apply(this, arguments);
+    };
+  }
+  watchUnauthorized();
+
   /* ── 挂进宿主的侧栏（展开 after 新会话；折叠 insert 到 panelList 顶部） ── */
   function place() {
     const frame = document.querySelector('.pI_x6G_frame');
@@ -303,7 +327,21 @@
     const anchor = [...root.querySelectorAll('button')]
       .find((b) => /New Session|新建|新会话/i.test(b.textContent || ''));
     if (anchor && anchor.parentElement) {
-      if (host.previousElementSibling !== anchor) anchor.after(host);
+      // DSH 0.2.2-rc.3 起，「新会话」按钮**外面多包了一层**（.hHd-Xa_newSessionRow）✗
+      // 直接 anchor.after(host) 会把我们这块塞进那一行里面 ✗（行内变成了小元素）
+      // → 先认已知容器，再退化成"向上爬到只包着它的最外层"✓
+      let target = anchor;
+      const row = anchor.closest('.hHd-Xa_newSessionRow');
+      if (row && row !== root) {
+        target = row;
+      } else {
+        let p = anchor.parentElement;
+        while (p && p !== root && p.children && p.children.length === 1) {
+          target = p;
+          p = p.parentElement;
+        }
+      }
+      if (host.previousElementSibling !== target) target.after(host);
       return true;
     }
     if (host.parentElement !== root) root.appendChild(host);

@@ -172,9 +172,36 @@ fi
 # The runtime lives in the gateway template on the host, but inside the jail it must
 # appear at the canonical npm path (mounting it at its host path would fabricate a
 # /var/lib/dsh-mu tree inside the jail and leave the real path empty).
+#
+# IMPORTANT: the runtime is a **tree**, not one package. `@deepseek-ai/dsh` resolves
+# its dependencies (`@deepseek-ai/dsh-app-boot`, `dsh-tool-*`, …) from the *sibling*
+# node_modules, so we mount the whole node_modules directory:
+#
+#   host  <runtime>/node_modules           ->  jail  /usr/local/lib/node_modules
+#
+# Mounting the single `@deepseek-ai/dsh` directory instead breaks resolution with
+# "Cannot find package '@deepseek-ai/dsh-app-boot'" (that is exactly how the first
+# 0.2.2 attempt failed). The single-package mount is kept only as a fallback.
 : "${DSH_RUNTIME_IN_JAIL:=/usr/local/lib/node_modules/@deepseek-ai/dsh}"
-if [ -d "$DSH_RUNTIME_DIR" ]; then
-	bind_dir "$DSH_RUNTIME_DIR" "$ROOTFS$DSH_RUNTIME_IN_JAIL" ro || true
+: "${DSH_NODE_MODULES_IN_JAIL:=/usr/local/lib/node_modules}"
+_mounted_tree=0
+if [ -n "${DSH_RUNTIME_DIR:-}" ] && [ -d "$DSH_RUNTIME_DIR" ]; then
+	# <...>/node_modules/@deepseek-ai/dsh -> <...>/node_modules
+	# dsh_runtime_dir 可能指向 .../runtimes/current（软链）✓ 必须解析成真实路径 ✗
+	# 否则 jail 里 bind 源可能是"软链所在目录"而不是镜像挂载点 ✓
+	RT_REAL="$(readlink -f "$DSH_RUNTIME_DIR" 2>/dev/null || echo "$DSH_RUNTIME_DIR")"
+	NM_HOST="$(CDPATH= cd -- "$(dirname -- "$(dirname -- "$RT_REAL")")" 2>/dev/null && pwd)"
+	if [ -n "${NM_HOST:-}" ] && [ -d "$NM_HOST/@deepseek-ai/dsh" ]; then
+		mkdir -p "$ROOTFS$DSH_NODE_MODULES_IN_JAIL" 2>/dev/null || true
+		if bind_dir "$NM_HOST" "$ROOTFS$DSH_NODE_MODULES_IN_JAIL" ro; then
+			_mounted_tree=1
+			echo "[jail] runtime tree (ro): $NM_HOST -> $DSH_NODE_MODULES_IN_JAIL" >&2
+		fi
+	fi
+	if [ "$_mounted_tree" = "0" ]; then
+		echo "[jail] WARNING: falling back to a single-package runtime mount" >&2
+		bind_dir "$DSH_RUNTIME_DIR" "$ROOTFS$DSH_RUNTIME_IN_JAIL" ro || true
+	fi
 fi
 
 # Persistent instance volumes.

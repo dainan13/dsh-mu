@@ -57,7 +57,33 @@ html.wiring .side-stack .flags { visibility: hidden; }
 .row{display:flex;align-items:center;gap:8px}
 .msg{font-size:12.5px;line-height:1.6}
 .muted{color:var(--ink-3)}
+  #instTable .rt-col { min-width: 168px; white-space: nowrap; }
 </style>
+<script>
+/* 全局 401 兜底：admin 会话过期后，任何 API 返回 401 都直接回登录页 ✓
+   （以前页面会停在"没有实例"之类的空状态 ✗ 用户不知道是掉登录了 ✗） */
+(function () {
+  var going = false;
+  function toLogin() {
+    if (going) return;
+    if (/\/login(\?|$)/.test(location.pathname + location.search)) return;
+    going = true;
+    location.replace('/login?next=' + encodeURIComponent(location.pathname + location.search));
+  }
+  var of = window.fetch;
+  window.fetch = function () {
+    return of.apply(this, arguments).then(function (res) {
+      if (res && res.status === 401) toLogin();
+      return res;
+    });
+  };
+  var oo = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (m, u) {
+    this.addEventListener('load', function () { if (this.status === 401) toLogin(); });
+    return oo.apply(this, arguments);
+  };
+})();
+</script>
 </head>
 <body data-view="overview">
 
@@ -73,6 +99,7 @@ html.wiring .side-stack .flags { visibility: hidden; }
   <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 2v6M15 2v6"/><path d="M6 8h12v3a6 6 0 0 1-12 0z"/><path d="M12 17v5"/></symbol>
   <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 19h16"/><path d="M7 19v-6"/><path d="M12 19V6"/><path d="M17 19v-9"/></symbol>
   <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3l1.9 4.9L19 9.8l-5.1 1.9L12 17l-1.9-5.3L5 9.8l5.1-1.9z"/><path d="M18.5 15.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z"/></symbol>
+  <symbol id="i-cog" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/></symbol>
   <symbol id="i-box" viewBox="0 0 24 24"><path d="M12 2.8 21 7.7v8.6l-9 4.9-9-4.9V7.7z"/><path d="M3 7.7 12 12.6l9-4.9"/><path d="M12 12.6v8.6"/></symbol>
   <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 2.6 2.6 7.2 12 11.8l9.4-4.6z"/><path d="M2.6 12.2 12 16.8l9.4-4.6"/><path d="M2.6 16.8 12 21.4l9.4-4.6"/></symbol>
   <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6h3M11 6h9M4 12h9M17 12h3M4 18h1M9 18h11"/><circle cx="9" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="7" cy="18" r="2"/></symbol>
@@ -130,6 +157,7 @@ html.wiring .side-stack .flags { visibility: hidden; }
     <a class="rail-item" href="#overview" title="概览" data-nav="overview"><svg class="i"><use href="#i-grid"/></svg><span class="label">概览</span></a>
     <a class="rail-item" href="#users" title="用户" data-nav="users"><svg class="i"><use href="#i-users"/></svg><span class="label">用户</span><span class="count">9</span></a>
     <a class="rail-item" href="#instances" title="实例" data-nav="instances"><svg class="i"><use href="#i-server"/></svg><span class="label">实例</span><span class="count">8</span></a>
+    <a class="rail-item" href="#runtime" title="运行时版本" data-nav="runtime"><svg class="i"><use href="#i-box"/></svg><span class="label">运行时</span></a>
     <a class="rail-item" href="#logs" title="实例日志" data-nav="logs"><svg class="i"><use href="#i-terminal"/></svg><span class="label">实例日志</span></a>
 
     <div class="rail-group">供给</div>
@@ -553,7 +581,9 @@ html.wiring .side-stack .flags { visibility: hidden; }
           <div class="panel-scroll">
             <table class="data" id="instTable">
               <thead><tr>
-                <th>实例</th><th class="user-col">用户</th><th class="num">端口</th>
+                <th>实例 / 用户</th>
+                <th class="rt-col">运行时</th>
+                <th class="num">端口</th>
                 <th class="col-state">状态<span class="th-sub">openrc</span></th>
                 <th>实时<span class="th-sub">tcp connect</span></th>
                 <th>出网</th><th class="limit-col">限额<span class="th-sub">cpu · mem · pids</span></th>
@@ -1052,6 +1082,53 @@ html.wiring .side-stack .flags { visibility: hidden; }
               </section>
 
       <!-- ───────────────────────── 7 私有模型 ───────────────────────── -->
+      <section class="view" id="v-runtime" aria-labelledby="t-runtime" hidden>
+        <div class="page-head">
+          <div class="titles">
+            <h1 class="page-title" id="t-runtime">运行时</h1>
+            <p class="page-sub" id="rtSub">已安装的 DSH 运行时版本。<b>设为实例默认</b>只影响"实例选默认时用哪个"；线上通道的 default 只影响「读取线上版本」里默认推荐的那一条，两者互不相干。改动都在实例重启后生效。</p>
+          </div>
+          <div class="page-tools">
+            <button class="btn ghost" onclick="wireRuntime()"><svg class="i i-sm"><use href="#i-refresh"/></svg>刷新</button>
+            <button class="btn secondary" onclick="rtBrowseOnline()">读取线上版本</button>
+            <label class="btn secondary" style="cursor:pointer">
+              上传镜像<input type="file" id="rtFile" accept=".squashfs" style="display:none" onchange="rtUpload(this)">
+            </label>
+          </div>
+        </div>
+
+        <div class="chips" id="rtKpi" style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px"></div>
+
+        <div class="panel">
+          <div class="panel-head"><h2>已安装的运行时</h2></div>
+          <div class="panel-scroll" style="max-height:320px">
+            <table class="data compact">
+              <thead><tr>
+                <th>ID</th><th class="mono" title="内容指纹：镜像 sha256 前 6 位；新安装的版本会把它写进 id">指纹</th><th>DSH</th><th>变体</th><th class="num">大小</th><th>模式</th>
+                <th>node-pty</th><th class="num">使用中</th><th>状态</th><th>操作</th>
+              </tr></thead>
+              <tbody id="rtRows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-top:16px">
+          <div class="panel-head">
+            <h2>下载进度与历史</h2>
+            <span class="sub" id="rtJobsSub">关掉窗口也不会丢；失败原因会留在这里</span>
+            <span class="spacer"></span>
+            <button class="btn sm ghost" onclick="rtClearJobs()">清理已结束</button>
+          </div>
+          <div class="panel-scroll" style="max-height:260px">
+            <table class="data compact">
+              <thead><tr><th>ID</th><th>状态</th><th style="width:34%">进度</th><th class="num">大小</th><th>创建时间</th></tr></thead>
+              <tbody id="rtJobs"></tbody>
+            </table>
+          </div>
+        </div>
+
+      </section>
+
       <section class="view" id="v-usage" aria-labelledby="t-usage" hidden>
         <div class="page-head">
           <div class="titles">
@@ -1398,49 +1475,30 @@ html.wiring .side-stack .flags { visibility: hidden; }
         </div>
 
         <div class="doctor-sums" style="margin-bottom:16px">
-          <div class="kpi tone-ok"><div class="k">PASS</div><div class="v" id="doctorPass">0</div><div class="f">全部通过项</div></div>
-          <div class="kpi tone-warn"><div class="k">WARN</div><div class="v" id="doctorWarn">0</div><div class="f">能跑，但不该长期这样</div></div>
-          <div class="kpi"><div class="k">FAIL</div><div class="v" id="doctorFail">0</div><div class="f">会直接影响用户</div></div>
+          <div class="kpi tone-ok"><div class="k">PASS</div><div class="v" id="doctorPass">—</div><div class="f">全部通过项</div></div>
+          <div class="kpi tone-warn"><div class="k">WARN</div><div class="v" id="doctorWarn">—</div><div class="f">能跑，但不该长期这样</div></div>
+          <div class="kpi"><div class="k">FAIL</div><div class="v" id="doctorFail">—</div><div class="f">会直接影响用户</div></div>
         </div>
 
         <div class="panel">
           <div class="panel-head">
-            <h2>检查项</h2><span class="sub">68 项 · 用时 2.1 秒</span>
+            <h2>检查项</h2><span class="sub" id="doctorMeta">检测中…</span>
             <span class="spacer"></span>
             <div class="seg" id="doctorFilter"><button aria-pressed="true">全部</button><button aria-pressed="false">只看问题</button></div>
           </div>
           <table class="data compact" id="doctorTable">
             <thead><tr><th>状态</th><th>检查项</th><th>详情</th><th>修复</th></tr></thead>
             <tbody id="doctorBody">
-              <tr class="row-warn" data-issue="1">
-                <td><span class="badge warn">WARN</span></td>
-                <td class="strong">admin backend</td>
-                <td class="muted">running the previous build (dshmuctl.py changed after it started)</td>
-                <td><div class="fixcmd"><code>dsh-muctl admin restart</code><button class="btn sm ghost" onclick="confirmApplyFix('admin backend','dsh-muctl admin restart')">应用</button></div></td>
-              </tr>
-              <tr class="row-warn" data-issue="1">
-                <td><span class="badge warn">WARN</span></td>
-                <td class="strong">instance patch freshness</td>
-                <td class="muted">1 instance(s) hold an older patch than the platform</td>
-                <td><div class="fixcmd"><code>dsh-muctl sync --restart</code><button class="btn sm ghost" onclick="confirmApplyFix('instance patch freshness','dsh-muctl sync --restart')">应用</button></div></td>
-              </tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">plugin packages</td><td class="muted">5 offline package(s) in /var/lib/dsh-mu/plugin-cache</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">plugin policy</td><td class="muted">2 package(s) downloaded; 2 polic(ies) (预装 2 / 推送 2 / 受保护 0)</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">web search plan</td><td class="muted">d13deepseek (order=None)</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">egress rules</td><td class="muted">policy=no-intranet, 8 instance(s) enforced</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">runtime pty</td><td class="muted">node-pty matches the musl runtime</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">models page</td><td class="muted">closed everywhere (users cannot add their own provider keys)</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">models lock</td><td class="muted">disabled (models_lock=false)</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">market feed</td><td class="muted">disabled (market_enabled=false)</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">supervisors</td><td class="muted">one supervisor per service</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">ext ports</td><td class="muted">1 extension(s), no clashes</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">ext ssh</td><td class="muted">v1.4.1 running on 127.0.0.1:-</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">gateway lua</td><td class="muted">workers are running the installed Lua</td><td class="dim">—</td></tr>
-              <tr data-issue="0"><td><span class="badge pass"><span class="dot ok"></span>PASS</span></td><td class="strong">platform state</td><td class="muted">/etc/dsh-mu/state.json</td><td class="dim">—</td></tr>
+              <tr><td colspan="4" class="faint" style="padding:16px">
+                <span class="row" style="gap:8px;align-items:center">
+                  <svg class="i i-sm spin" style="color:var(--brand-ink)"><use href="#i-refresh"/></svg>
+                  正在自检（1.5–4 秒，网关探测最多 8 秒）…
+                </span>
+              </td></tr>
             </tbody>
           </table>
-          <div class="panel-foot" id="doctorFoot"><svg class="i i-sm"><use href="#i-info"/></svg>FAIL 项会直接影响用户；WARN 项能跑，但拖久了会变成 FAIL。</div>
         </div>
+
       </section>
 
       <!-- ───────────────────────── 11 审计 ───────────────────────── -->
@@ -1541,7 +1599,7 @@ applyTheme(document.documentElement.getAttribute('data-theme-mode') || 'system')
 
 const TITLES = {
   overview: '概览', users: '用户', instances: '实例', logs: '实例日志',
-  providers: '模型接入', plans: '模型套餐', private: '私有模型', usage: '用量', plugins: '插件',
+  providers: '模型接入', plans: '模型套餐', private: '私有模型', runtime: '运行时', usage: '用量', plugins: '插件',
   extpage: '扩展页面', ext: '扩展管理',
   platform: '平台', doctor: '自检', audit: '审计',
 };
@@ -2073,7 +2131,7 @@ let modalBusy = false;
 let modalSeq = 0;
 let failWrites = false;   // 场景「写操作失败」时置 true，用来演示出错处理
 
-function openModal({ title, sub, body, foot, size = '' }) {
+function openModal({ title, sub, body, foot, size = '', locked = false }) {
   closeModal();
   modalSeq += 1;
   const root = $('#modalRoot');
@@ -2094,13 +2152,15 @@ function openModal({ title, sub, body, foot, size = '' }) {
     </div>`;
   const scrim = $('#scrim');
   const close = () => closeModal();
-  $('#mClose').onclick = () => { if (!modalBusy) close(); };
+  const isLocked = () => locked || modalBusy;
+  if (locked) $('#mClose').hidden = true;
+  $('#mClose').onclick = () => { if (!isLocked()) close(); };
   // 只在按下时也落在遮罩上才关（否则选中文字拖到外面会误关）
   let pressedScrim = false;
   scrim.addEventListener('mousedown', (e) => { pressedScrim = (e.target === scrim); });
-  scrim.addEventListener('click', (e) => { if (e.target === scrim && pressedScrim && !modalBusy) close(); pressedScrim = false; });
+  scrim.addEventListener('click', (e) => { if (e.target === scrim && pressedScrim && !isLocked()) close(); pressedScrim = false; });
   modalCleanup = () => { root.innerHTML = ''; modalBusy = false; document.removeEventListener('keydown', onKey); };
-  const onKey = (e) => { if (e.key === 'Escape' && !modalBusy) close(); };
+  const onKey = (e) => { if (e.key === 'Escape' && !isLocked()) close(); };
   document.addEventListener('keydown', onKey);
   const first = $('.modal-body input:not([type=hidden]), .modal-body select, .modal-body textarea');
   const focusTarget = first || $('.modal');
@@ -3984,22 +4044,243 @@ function wireDoctorBadge(summary) {
     return [l.cpu, l.memory, l.pids].filter(Boolean).join(' · ') || '—';
   }
 
+  /* 可用运行时 id 列表（实例页/修改配置都要用；被误删过一次 ✗ 恢复） */
+  async function loadRuntimeIds() {
+    // 这个 script 块里没有 apiJ ✗（跨块作用域）→ 用 fetch ✓
+    try {
+      const res = await fetch('api/runtimes', { credentials: 'same-origin' });
+      const d = res.ok ? await res.json() : {};
+      window.__muRuntimeIds = d.runtime_ids || [];
+    } catch (e) { window.__muRuntimeIds = []; }
+  }
+  window.loadRuntimeIds = loadRuntimeIds;
+
+  /* ── 修改配额：CPU / 内存 / 进程 + 出网策略（都立即生效） ─────────── */
+  window.openInstanceQuotas = async function (name) {
+    const r = (window.__muInstances || []).find(x => x.name === name) || {};
+    const lim = r.limits || {};
+    const coreNow = lim.cpu_max ? Number(String(lim.cpu_max).split(" ")[0]) / 100000 : 0;
+    const memNow = lim.mem_max ? Math.round(Number(String(lim.mem_max).split(" ")[0]) / 1048576) : 0;
+    let cur = {};
+    try {
+      const e = await fetch('api/egress', { credentials: 'same-origin' }).then(x => x.json());
+      cur = (e.instances || []).find(x => x.instance === name) || {};
+    } catch (err) { /* 读不到出网就只显示配额 */ }
+    const policies = [['no-intranet', '禁内网'], ['allowlist', '全限制'], ['open', '不限制']];
+    openModal({
+      title: name + ' · 修改配额',
+      sub: 'CPU / 内存 / 进程数 + 出网策略。保存后**立即生效**，不用重启。',
+      size: 'wide',
+      body: `<div class="form-grid">
+        <label class="field"><span class="label">CPU 核数</span>
+          <input class="input mono" id="qCpu" value="${coreNow ? coreNow.toFixed(1) : ''}" placeholder="例如 1（空=不限）"></label>
+        <label class="field"><span class="label">内存 MB</span>
+          <input class="input mono" id="qMem" value="${memNow || ''}" placeholder="例如 1536（空=不限）"></label>
+        <label class="field"><span class="label">进程数上限</span>
+          <input class="input mono" id="qPids" value="${lim.pids_max || ''}" placeholder="例如 512（空=不限）"></label>
+        <label class="field span-2"><span class="label">出网策略</span>
+          <select class="select" id="qEgress">
+            <option value="">（不改）</option>
+            ${policies.map(([v, label]) => `<option value="${v}"${cur.policy === v ? ' selected' : ''}>${label}</option>`).join('')}
+          </select>
+          <span class="hint">当前：${esc(cur.policy || '—')}${cur.override ? '（实例覆盖）' : '（跟随平台）'}；例外放行规则在实例页下方统一维护</span></label>
+      </div>`,
+      foot: `<button class="btn ghost" onclick="closeModal()">取消</button>
+             <button class="btn primary" onclick="submitInstanceQuotas('${esc(name)}')">保存</button>`,
+    });
+  };
+
+  window.submitInstanceQuotas = async function (name) {
+    const cpu = ($('#qCpu') || {}).value || '';
+    const mem = ($('#qMem') || {}).value || '';
+    const pids = ($('#qPids') || {}).value || '';
+    const pol = ($('#qEgress') || {}).value || '';
+    const body = {};
+    if (cpu) body.cpu_cores = Number(cpu);
+    if (mem) body.mem_mb = Number(mem);
+    if (pids) body.pids_num = Number(pids);
+    try {
+      if (Object.keys(body).length) {
+        await fetch('api/instances/' + encodeURIComponent(name), {
+          method: 'PATCH', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        }).then(async r => {
+          const txt = await r.text(); let b = {}; try { b = JSON.parse(txt); } catch (e) {}
+          if (!r.ok) throw new Error(b.detail || b.error || r.statusText);
+        });
+      }
+      if (pol) {
+        await fetch('api/egress', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ instance: name, policy: pol }),
+        }).then(async r => {
+          const txt = await r.text(); let b = {}; try { b = JSON.parse(txt); } catch (e) {}
+          if (!r.ok) throw new Error(b.detail || b.error || r.statusText);
+        });
+      }
+      closeModal();
+      toast('ok', '配额已更新', name + '；立即生效');
+      if (window.wireInstances) window.wireInstances().catch(() => {});
+    } catch (e) { toast('err', '保存失败', e.message); }
+  };
+
+  /* ── 修改配置：端口 / 运行时（都需要重启） ─────────────────────── */
+  window.openInstanceCfg = async function (name) {
+    const r = (window.__muInstances || []).find(x => x.name === name) || {};
+    // 注意：这段代码所在的 script 作用域里没有 apiJ ✓（它被 try/catch 吞掉了，
+    // 表现就是下拉只剩「默认」一项 ✗）。这里直接用 fetch，并且把失败原因显示出来 ✓
+    let ids = [];
+    let fetchErr = '';
+    try {
+      const res = await fetch('api/runtimes', { credentials: 'same-origin' });
+      const txt = await res.text();
+      let d = {};
+      try { d = txt ? JSON.parse(txt) : {}; } catch (e) { throw new Error('返回不是 JSON（HTTP ' + res.status + '）'); }
+      if (!res.ok) throw new Error(d.detail || d.error || ('HTTP ' + res.status));
+      ids = d.runtime_ids || [];
+      window.__muRuntimeIds = ids;
+    } catch (e) {
+      fetchErr = e.message || String(e);
+      ids = window.__muRuntimeIds || [];
+    }
+    openModal({
+      title: name + ' · 修改配置',
+      sub: '运行中的实例保存后会自动重启；已停止的实例只保存、不会自动启动。',
+      size: 'normal',
+      body: `<div class="form-grid">
+        <label class="field"><span class="label">运行时</span>
+          <select class="select" id="cfgRuntime">
+            <option value=""${r.runtime ? '' : ' selected'}>默认（跟随实例默认运行时）</option>
+            ${ids.map(id => `<option value="${esc(id)}"${r.runtime === id ? ' selected' : ''}>${esc(id)}</option>`).join('')}
+          </select>
+          <span class="hint">当前配置：${esc(r.runtime_next || '—')}${fetchErr ? ` · <span style="color:var(--danger,#c33)">读运行时列表失败：${esc(fetchErr)}</span>` : ''}</span></label>
+        <label class="field"><span class="label">端口</span>
+          <input class="input mono" id="cfgPort" value="${esc(String(r.port || ''))}" placeholder="留空=不改">
+          <span class="hint">当前配置：${esc(String(r.port || '—'))}</span></label>
+      </div>`,
+      foot: `<button class="btn ghost" onclick="closeModal()">取消</button>
+             <button class="btn primary" onclick="submitInstanceCfg('${esc(name)}')">保存并重启</button>`,
+    });
+  };
+
+  window.submitInstanceCfg = async function (name) {
+    const rid = ($('#cfgRuntime') || {}).value || '';
+    const port = ($('#cfgPort') || {}).value || '';
+    const r0 = (window.__muInstances || []).find(x => x.name === name) || {};
+    const wasRunning = String(r0.state || '') === 'running';
+    const changedPort = port && String(port) !== String(r0.port || '');
+
+    // ① 先切到进度弹窗 ✓（不要等请求回来再弹 ✗ 那是"傻等"的根源）
+    const t0 = Date.now();
+    openModal({
+      title: '正在应用配置 · ' + name,
+      sub: (changedPort ? '新端口与' : '') + '运行时：' + (rid || '默认')
+           + (wasRunning ? ' · 实例会重启一次' : ' · 实例当前是停止状态，不会启动'),
+      size: 'normal',
+      locked: true,
+      body: `<div class="row" style="gap:10px;align-items:center;padding:6px 0">
+          <svg class="i i-sm spin" id="cfgSpin" style="color:var(--brand-ink)"><use href="#i-refresh"/></svg>
+          <span class="faint" id="cfgWaiting">保存配置…</span>
+        </div>
+        <div class="faint" id="cfgElapsed" style="font-size:11.5px;margin-top:6px">已用时 0 秒</div>`,
+      foot: `<button class="btn primary" id="cfgDone" hidden>确认</button>`,
+    });
+    const closeBtn2 = document.getElementById('mClose');
+    if (closeBtn2) closeBtn2.hidden = true;
+    const tick = setInterval(() => {
+      const el = document.getElementById('cfgElapsed');
+      if (el) el.textContent = `已用时 ${Math.round((Date.now() - t0) / 1000)} 秒`;
+    }, 1000);
+    const step = (text) => {
+      const w = document.getElementById('cfgWaiting');
+      if (w) w.textContent = text;
+    };
+    const finish = (ok, msg) => {
+      clearInterval(tick);
+      const w = document.getElementById('cfgWaiting');
+      const el = document.getElementById('cfgElapsed');
+      const spin = document.getElementById('cfgSpin');
+      const done = document.getElementById('cfgDone');
+      if (spin) spin.style.display = 'none';
+      if (el) el.style.display = 'none';
+      if (closeBtn2) closeBtn2.hidden = false;
+      if (w) w.textContent = msg;
+      if (done) { done.hidden = false; done.onclick = () => closeModal(); }
+      if (ok) toast('ok', '配置已生效', msg);
+      else toast('err', '配置未生效', msg);
+      if (window.wireInstances) window.wireInstances().catch(() => {});
+    };
+
+    try {
+      step('保存配置…');
+      const ares = await fetch('api/runtimes/assign', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instance: name, id: rid, restart: false }),
+      });
+      if (!ares.ok) {
+        const b = await ares.json().catch(() => ({}));
+        throw new Error(b.detail || b.error || ('assign HTTP ' + ares.status));
+      }
+      if (changedPort) {
+        step('保存端口…');
+        const pres = await fetch('api/instances/' + encodeURIComponent(name), {
+          method: 'PATCH', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ port: Number(port), restart: false }),
+        });
+        if (!pres.ok) {
+          const b = await pres.json().catch(() => ({}));
+          throw new Error(b.detail || b.error || ('port HTTP ' + pres.status));
+        }
+      }
+      if (!wasRunning) { finish(true, '配置已保存（实例是停止状态，未启动）'); return; }
+      step('重启实例…（约 20–40 秒）');
+      const rres = await fetch('api/instances/' + encodeURIComponent(name) + '/restart',
+        { method: 'POST', credentials: 'same-origin' });
+      if (!rres.ok) throw new Error('restart HTTP ' + rres.status);
+      step('等待实例开始监听…');
+      let live = false;
+      for (let i = 0; i < 30; i += 1) {
+        await new Promise((r) => setTimeout(r, 2000));
+        try {
+          const d = await fetch('api/instances/' + encodeURIComponent(name),
+            { credentials: 'same-origin' }).then((x) => x.json());
+          const inst = d.instance || (d.instances || []).find((x) => x.name === name) || {};
+          if (inst.live) { live = true; break; }
+        } catch (e) { /* 重启中短暂失败 ✓ 继续等 */ }
+      }
+      const secs = Math.round((Date.now() - t0) / 1000);
+      finish(true, live ? `已重启并开始监听（用时 ${secs} 秒）`
+                        : `已重启，但 ${secs} 秒内没等到端口监听，请看实例状态`);
+    } catch (e) {
+      finish(false, '失败：' + (e.message || e));
+    }
+  };
+
   async function wireInstances() {
+    if (!window.__muRuntimeIds) { try { await loadRuntimeIds(); } catch (e) { window.__muRuntimeIds = []; } }
     const [ins, cfg] = await Promise.all([api('instances'), api('config')]);
     const rows = ins.instances || [];
     const egress = (cfg.config || {}).instance_egress || '';
     const body = document.getElementById('instBody');
     if (!body) return;
     if (!rows.length) {
-      body.innerHTML = '<tr><td colspan="9" class="muted">还没有实例。</td></tr>';
+      body.innerHTML = '<tr><td colspan="10" class="muted">还没有实例。</td></tr>';
       return;
     }
+    window.__muInstances = rows;
     body.innerHTML = rows.map(r => {
       const busy = !!((r.activity || {}).session_open);
       const live = !!r.live;
       return `<tr data-inst="${esc(r.name)}">
-        <td><div class="cell-main"><span class="strong">${esc(r.name)}</span>${r.orphan ? '<span class="badge err sm">未绑定用户</span>' : ''}${busy ? '<span class="badge warn sm">正在使用</span>' : ''}</div></td>
-        <td class="muted user-col">${esc(r.user)}</td>
+        <td><div class="cell-main"><span class="strong">${esc(r.name)}</span>${r.orphan ? '<span class="badge err sm">未绑定用户</span>' : ''}${busy ? '<span class="badge warn sm">正在使用</span>' : ''}</div>
+            <div class="cell-stack"><span class="s">${esc(r.user)}</span></div></td>
+        <td class="rt-col"><span class="row" style="gap:6px;align-items:center;flex-wrap:nowrap">
+            <span class="mono" style="font-size:12px" title="实例配置里的运行时；改动在重启后生效">${esc(r.runtime_next || r.runtime_effective || '—')}</span>
+            <span class="faint" style="font-size:11px;flex:0 0 auto">${r.runtime ? '指定' : '默认'}</span>
+          </span></td>
         <td class="num mono">${esc(r.port)}</td>
         <td class="col-state">${badge(r.state === 'running' ? 'mono ok' : (r.live ? 'mono warn' : 'mono'), r.state)}${(r.live && r.state !== 'running') ? '<span class="badge warn sm" title="openrc 记录的 state 与端口实测不一致：进程在跑，但 service 没认领（重启一次即可对齐）">仍在监听</span>' : ''}</td>
         <td><div class="live-cell">${dot(live)}${badge(live ? 'mono ok sm' : 'mono sm', live ? 'listening' : 'closed')}</div></td>
@@ -4012,7 +4293,8 @@ function wireDoctorBadge(summary) {
             : `<button class="btn icon ghost" title="启动实例" onclick="startInstance('${esc(r.name)}')"><svg class="i i-sm"><use href="#i-play"/></svg></button>`}
           <button class="btn icon ghost" title="重启（会先确认）" onclick="confirmRestart('${esc(r.name)}',${busy})"><svg class="i i-sm"><use href="#i-restart"/></svg></button>
           <button class="btn icon ghost" title="${r.orphan ? '绑定用户' : '改绑用户'}" onclick="openBindUser('${esc(r.name)}','${esc(r.user || '')}')"><svg class="i i-sm"><use href="#i-users"/></svg></button>
-          <button class="btn icon ghost" title="配置（限额）" onclick="openInstanceConfig('${esc(r.name)}')"><svg class="i i-sm"><use href="#i-sliders"/></svg></button>
+          <button class="btn icon ghost" title="修改配额（CPU/内存/进程/出网，立即生效）" onclick="openInstanceQuotas('${esc(r.name)}')"><svg class="i i-sm"><use href="#i-sliders"/></svg></button>
+          <button class="btn icon ghost" title="修改配置（端口/运行时，需重启）" onclick="openInstanceCfg('${esc(r.name)}')"><svg class="i i-sm"><use href="#i-cog"/></svg></button>
           <button class="btn icon ghost" title="重建登录态 cookie" onclick="confirmRefreshCookie('${esc(r.name)}')"><svg class="i i-sm"><use href="#i-key"/></svg></button>
           <button class="btn icon ghost" title="日志" onclick="go('logs')"><svg class="i i-sm"><use href="#i-terminal"/></svg></button>
           <button class="btn icon danger" title="删除实例" onclick="confirmDeleteInstance('${esc(r.name)}')"><svg class="i i-sm"><use href="#i-trash"/></svg></button>
@@ -4403,7 +4685,7 @@ function wireDoctorBadge(summary) {
         .catch(e => toast('err', '删除失败', e.message)),
     });
   };
-  window.openModelPicker = function (id) { toast('info', '模型子集编辑还没接线', id); };
+  ;
   window.probePlan = function (id) {
     openModal({
       title: '检测 ' + id + ' 的可用模型',
@@ -4464,9 +4746,9 @@ function wireDoctorBadge(summary) {
       })
       .catch(e => { setModalBusy(false); showModalError(e.message); });
   };
-  window.openCreatePlan = function () { toast('info', '创建套餐还没接线', '下一轮补上'); };
-  window.openPlanOrder = function () { toast('info', '顺序调整还没接线', '下一轮补上'); };
-  window.openChainEditor = function () { toast('info', '默认模型编辑还没接线', '下一轮补上'); };
+  ;
+  ;
+  ;
 
   window.wireModels = async function () {
     const [pk, pl, ch] = await Promise.all([api('packages'), api('plans'), api('default-chain')]);
@@ -5116,7 +5398,8 @@ function wireDoctorBadge(summary) {
       top.innerHTML = `<svg class="i"><use href="#i-alert"/></svg>` +
         ((s.FAIL || 0) ? `自检 FAIL ${s.FAIL}` : bad ? `自检 WARN ${bad}` : '自检通过');
     }
-    const sub = document.querySelector('#v-doctor .sec .sub');
+    const sub = document.getElementById('doctorMeta')
+      || document.querySelector('#v-doctor .sec .sub');
     if (sub) sub.textContent = `${state.checks.length} 项 · 用时 ${state.since ? (state.since / 1000).toFixed(1) : '?'} 秒`;
   }
 
@@ -6157,6 +6440,445 @@ html.wiring .side-stack .flags { visibility: hidden; }
   window.addEventListener('hashchange', () => {
     if (location.hash.indexOf('usage') >= 0) window.wireUsage();
   });
+})();
+</script>
+
+<script>
+/* ==========================================================================
+   运行时页：/api/runtimes（列表/安装/激活/校验/删除/上传）
+   ========================================================================== */
+(function () {
+  const esc = (v) => String(v == null ? '' : v)
+    .replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  let RT = { runtimes: [], current: '', instances: [] };
+
+  async function apiJ(path, opts) {
+    const r = await fetch(path, Object.assign({ credentials: 'same-origin' }, opts || {}));
+    const txt = await r.text();
+    let b = {}; try { b = txt ? JSON.parse(txt) : {}; } catch (e) {}
+    if (!r.ok) throw new Error(b.detail || b.error || r.statusText);
+    return b;
+  }
+
+  function kpi(label, value, hint) {
+    return `<div class="card" style="min-width:150px;padding:12px 14px">
+      <div style="font-size:11px;color:var(--ink-3)">${esc(label)}</div>
+      <div style="font-size:20px;font-weight:600;margin-top:2px">${esc(value)}</div>
+      ${hint ? `<div style="font-size:11px;color:var(--ink-3);margin-top:2px">${esc(hint)}</div>` : ''}
+    </div>`;
+  }
+
+  window.wireRuntime = async function () {
+    const rows = document.getElementById('rtRows');
+    if (!rows) return;
+    try {
+      RT = await apiJ('api/runtimes');
+    } catch (e) {
+      rows.innerHTML = `<tr><td colspan="9" class="faint" style="padding:14px">读取失败：${esc(e.message)}</td></tr>`;
+      return;
+    }
+    const def = RT.default || '';
+    const chDef = (RT.channel_default && (RT.channel_default.id || RT.channel_default.dsh)) || '未设置';
+    const chState = RT.channels_state || {};
+    // 默认通道：服务器缓存 → 浏览器上次读取（localStorage）→ 未设置 ✓
+    // 说明：服务器不一定能访问 GitHub ✗ 但**浏览器**通常可以 ✓ 所以这里允许用浏览器的结果 ✓
+    let chRow = RT.channel_default || {};
+    let chSource = 'server';
+    if (!chRow.id) {
+      try {
+        const local = JSON.parse(localStorage.getItem('mu.channels') || 'null');
+        if (local && local.doc && local.doc.default && local.doc.default.id) {
+          chRow = local.doc.default;
+          chSource = 'browser';
+          chState.fetched_at = Math.floor((local.at || 0) / 1000);
+        }
+      } catch (e) { /* ignore */ }
+    }
+    const chSha = String(chRow.sha256 || '').slice(0, 6).toLowerCase();
+    const chVar = chRow.variant || 'plain';
+    // 直接用字段**重建**规范 id ✓ 不要在已有字符串上判断"要不要补" ✗
+    // （那会把 0.2.2-rc.2-plain-523bba 叠成 …-plain-523bba-plain-523bba ✗ 真踩过）
+    const chDsh = String(chRow.dsh || '');
+    const chRev = Number(chRow.rev || 0);
+    const chFull = chRow.id
+      ? (chDsh
+          ? `${chDsh}-${chVar}${chRev ? '-' + chRev : ''}${chSha ? '-' + chSha : ''}`
+          : String(chRow.id))
+      : '未设置';
+    const fetched = chState.fetched_at
+      ? new Date(chState.fetched_at * 1000).toLocaleString('zh-CN', { hour12: false })
+      : '—';
+    document.getElementById('rtKpi').innerHTML = [
+      kpi('实例默认运行时', def || '未设置', def ? '' : '新建实例 / 实例选「默认」时用它'),
+      kpi('已安装', String(RT.runtimes.length), '个版本'),
+      kpi('默认通道', chFull,
+          chRow.id
+            ? `${chSource === 'browser' ? '浏览器读取' : '服务端读取'} · 更新于 ${fetched}`
+            : '尚未读取 · 点「读取线上版本」'),
+    ].join('');
+    if (window.rtJobsTick) window.rtJobsTick();
+    rows.innerHTML = RT.runtimes.length ? RT.runtimes.map(r => `<tr>
+      <td class="mono">${esc(r.id)}</td>
+      <td class="mono faint">${esc(r.fingerprint || '—')}</td>
+      <td class="mono">${esc(r.dsh)}</td>
+      <td>${esc(r.variant)}</td>
+      <td class="num">${r.size_mb} MB</td>
+      <td>${esc(r.mode)}</td>
+      <td class="mono">${esc(r.node_pty || '-')}${r.has_pty ? '' : ' ⚠'}</td>
+      <td class="num">${r.used_by || 0}</td>
+      <td>${r.is_default ? '<span class="badge ok">默认</span>' : '<span class="badge outline">可用</span>'}</td>
+      <td>
+        ${r.is_default ? '' : `<button class="btn sm secondary" onclick="rtSetDefault('${esc(r.id)}')" title="设为实例默认（与线上通道的 default 无关）">设为实例默认</button>`}
+        <button class="btn sm ghost" onclick="rtVerify('${esc(r.id)}')">校验</button>
+        ${r.is_default ? '' : `<button class="btn sm ghost danger" onclick="rtDelete('${esc(r.id)}')">删除</button>`}
+      </td></tr>`).join('')
+      : '<tr><td colspan="9" class="faint" style="padding:14px">还没有安装任何运行时。</td></tr>';
+
+  };
+
+  window.rtSetDefault = async function (id) {
+    try {
+      await apiJ('api/runtimes/default', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+      toast('ok', '已设为实例默认', id + '；实例选「默认」时用它（重启后生效）');
+      window.wireRuntime();
+    } catch (e) { toast('err', '设置失败', e.message); }
+  };
+  window.rtAssign = async function (name, id) {
+    try {
+      const r = await apiJ('api/runtimes/assign', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ instance: name, id }) });
+      toast('ok', '已分配', `${name} → ${r.effective || '(未设置)'}；重启后生效`);
+      window.wireRuntime();
+    } catch (e) { toast('err', '分配失败', e.message); }
+  };
+
+  window.rtActivate = async function (id) {
+    if (!confirm(`切换到 ${id}？
+
+磁盘上的当前运行时会改；实例在重启后生效。`)) return;
+    try {
+      await apiJ('api/runtimes/activate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+      toast('ok', '已切换', id + '；重启实例后生效');
+      window.wireRuntime();
+    } catch (e) { toast('err', '切换失败', e.message); }
+  };
+  window.rtVerify = async function (id) {
+    try {
+      const r = await apiJ('api/runtimes/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+      if (r.ok) toast('ok', '校验通过', `${id} · ${r.mode} · node-pty 就位`);
+      else toast('warn', '校验有问题', (r.issues || []).join('；'));
+    } catch (e) { toast('err', '校验失败', e.message); }
+  };
+  window.rtDelete = async function (id) {
+    if (!confirm(`删除运行时 ${id}？（镜像与挂载点都删）`)) return;
+    try {
+      await apiJ('api/runtimes/' + encodeURIComponent(id), { method: 'DELETE' });
+      toast('ok', '已删除', id);
+      window.wireRuntime();
+    } catch (e) { toast('err', '删除失败', e.message); }
+  };
+  /* 「读取线上版本」：浏览器直连 channels.json（和 provider 模板同一套做法 ✓）
+     服务器不需要出网 ✓ 内网镜像也只要换个地址 ✓ */
+  window.__muChannelUrl = '';
+  window.rtBrowseOnline = function () {
+    const rawBase = String((RT && RT.channel_base) || window.__muChannelUrl || '').trim();
+    const cleanBase = /^(none|null|nil)$/i.test(rawBase) ? '' : rawBase;
+    const base = cleanBase.replace(/channels\.json$/, 'runtimes.json');
+    openModal({
+      title: '线上运行时',
+      sub: '浏览器直接读取 runtimes.json（不走服务器）；下载由服务器在后台完成，可看进度。',
+      size: 'wide',
+      body: `<div class="stack-sm" style="margin-bottom:10px">
+          <div class="input-wrap" style="width:100%">
+            <svg class="i i-sm"><use href="#i-cloud"/></svg>
+            <input class="input sm mono" id="rtChanUrl" spellcheck="false"
+                   value="${esc(base || window.__muChannelUrl || '')}"
+                   placeholder="runtimes.json 地址">
+          </div>
+          <div class="row" style="gap:8px">
+            <button class="btn sm secondary" onclick="rtLoadChannel()">读取</button>
+            <span class="badge outline sm" id="rtChanState">—</span>
+            <span class="spacer"></span>
+            <span class="faint" id="rtChanHint"></span>
+          </div>
+        </div>
+        <div id="rtOnlineBody"></div>`,
+      foot: `<button class="btn ghost" onclick="closeModal()">关闭</button>`,
+    });
+    rtLoadChannel();
+  };
+
+  window.rtLoadChannel = async function () {
+    const body = document.getElementById('rtOnlineBody');
+    const state = document.getElementById('rtChanState');
+    const hint = document.getElementById('rtChanHint');
+    const input = document.getElementById('rtChanUrl');
+    const url = String((input && input.value) || '').trim();
+    if (!body) return;
+    window.__muChannelUrl = url;
+    if (state) { state.textContent = '读取中…'; state.className = 'badge outline sm'; }
+    if (hint) hint.textContent = '';
+    body.innerHTML = `<div class="row" style="gap:8px;padding:10px 0">
+        <svg class="i i-sm spin" style="color:var(--brand-ink)"><use href="#i-refresh"/></svg>
+        <span class="faint">正在读取 ${esc(url || '(未填地址)')} …</span></div>`;
+    let doc = null;
+    try {
+      if (!url) throw new Error('没有地址；可在上面填 runtimes.json 的 URL');
+      const r = await fetch(url, { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      doc = await r.json();
+    } catch (e) {
+      if (state) { state.textContent = '读取失败'; state.className = 'badge err sm'; }
+      body.innerHTML = `<div class="empty" style="padding:14px 0">
+          <div class="glyph"><svg class="i i-lg"><use href="#i-ban"/></svg></div>
+          <div class="t">读不到清单</div><div class="d">${esc(e.message)}</div></div>`;
+      return;
+    }
+    let rows = Array.isArray(doc && doc.runtimes) ? doc.runtimes : [];
+    if (!rows.length) {
+      if (state) { state.textContent = '空'; state.className = 'badge warn sm'; }
+      body.innerHTML = '<div class="faint" style="padding:12px 0">这份清单里没有 runtimes 数组（是不是填成了 channels.json？）</div>';
+      return;
+    }
+    if (state) { state.textContent = `读到 ${rows.length} 条`; state.className = 'badge ok sm'; }
+    if (hint) hint.textContent = '默认版本会标出来；下载在后台，可在下方表格看进度';
+
+    // "已安装"只看本机真正装了什么 ✓（之前把通道清单也当已安装 ✗ 错得离谱）
+    const installed = new Set(((RT && RT.runtimes) || []).map(r => r.id));
+    const defaultId = (RT && RT.default) || '';
+    const fmt = (s) => {
+      if (!s) return '—';
+      const d = new Date(s);
+      if (isNaN(d.getTime())) return String(s);
+      return d.toLocaleString('zh-CN', { hour12: false });
+    };
+    body.innerHTML = `<table class="data compact">
+      <thead><tr>
+        <th>ID</th><th>构建时间</th><th class="num">大小</th><th style="width:36%">操作</th>
+      </tr></thead>
+      <tbody>${rows.map(row => {
+        const id = row.id || row.dsh || '';
+        const known = installed.has(id);
+        const isDef = defaultId && id === defaultId;
+        const sizeMB = row.size ? (Number(row.size) / 1048576).toFixed(1) + ' MB' : '—';
+        const payload = esc(JSON.stringify({
+          id, dsh: row.dsh || id, rev: row.rev || 0, variant: row.variant || 'plain',
+          url: row.url || '', sha256: row.sha256 || '',
+        }));
+        return `<tr><td class="mono">${esc(id)}${isDef ? ' <span class="badge ok sm">默认</span>' : ''}</td>
+          <td class="faint">${esc(fmt(row.built_at))}</td>
+          <td class="num">${sizeMB}</td>
+          <td>${known ? '<span class="badge outline">已安装</span>'
+            : `<button class="btn sm primary" data-payload="${payload}" onclick="rtStartDownload(this.dataset.payload)">下载并安装</button>`}</td></tr>`;
+      }).join('')}</tbody></table>`;
+  };
+
+
+  /* 「读取线上版本」：浏览器直连 channels.json（和 provider 模板同一套做法 ✓）
+     服务器不需要出网 ✓ 内网镜像也只要换个地址 ✓ */
+  /* 声明曾经在"被删掉的重复块"里 ✗ → 我用去重脚本删掉后这里就 ReferenceError 了 ✗
+     声明必须和唯一的那份实现放在一起 ✓ */
+  let rtJobsTimer = null;
+
+  window.rtJobsTick = async function () {
+    const tb = document.getElementById('rtJobs');
+    if (!tb) { if (rtJobsTimer) { clearTimeout(rtJobsTimer); rtJobsTimer = null; } return; }
+    let jobs = [];
+    try {
+      const d = await apiJ('api/runtimes/downloads');
+      jobs = d.jobs || [];
+    } catch (e) { tb.innerHTML = `<tr><td colspan="5" class="faint" style="padding:12px">读取下载任务失败：${esc(e.message)}</td></tr>`; return; }
+    const active = jobs.filter(j => ['starting', 'downloading', 'installing'].includes(j.state));
+    const mb = (n) => ((Number(n) || 0) / 1048576).toFixed(1);
+    const zh = { starting: '准备中', downloading: '下载中', installing: '安装中', done: '完成', error: '失败', interrupted: '中断' };
+    tb.innerHTML = jobs.length ? jobs.map(j => {
+      const total = Number(j.total) || 0, got = Number(j.received) || 0;
+      const pct = j.state === 'done' ? 100 : (total ? Math.min(99, Math.round(got * 100 / total)) : 0);
+      const badgeCls = j.state === 'done' ? 'ok' : (j.state === 'error' ? 'err' : (j.state === 'interrupted' ? 'warn' : 'outline'));
+      const size = total ? `${mb(got)} / ${mb(total)} MB` : (got ? `${mb(got)} MB` : '—');
+      const when = (() => {
+        if (!j.updated_at) return '—';
+        const d = new Date(j.updated_at * 1000);
+        const now = new Date();
+        const hhmm = d.toTimeString().slice(0, 8);
+        return d.toDateString() === now.toDateString()
+          ? hhmm : `${d.getMonth() + 1}-${String(d.getDate()).padStart(2, '0')} ${hhmm}`;
+      })();
+      const detail = j.state === 'error' ? `<div class="faint" style="font-size:11px;margin-top:3px">${esc(j.error || '')}</div>`
+        : (j.state === 'interrupted' ? `<div class="faint" style="font-size:11px;margin-top:3px">${esc(j.error || '')}</div>` : '');
+      return `<tr><td class="mono">${esc(j.id || '')}</td>
+        <td><span class="badge ${badgeCls}">${esc(zh[j.state] || j.state || '?')}</span></td>
+        <td>${['starting','downloading','installing'].includes(j.state) || j.state === 'done'
+          ? `<div class="progress"><i style="width:${pct}%"></i></div><div class="faint" style="font-size:11px;margin-top:3px">${pct}%</div>`
+          : ''}${detail}</td>
+        <td class="num">${esc(size)}</td><td class="faint mono">${esc(when)}</td></tr>`;
+    }).join('') : '<tr><td colspan="5" class="faint" style="padding:12px">没有下载任务。</td></tr>';
+    if (rtJobsTimer) { clearTimeout(rtJobsTimer); rtJobsTimer = null; }
+    if (active.length && document.getElementById('v-runtime') && !document.getElementById('v-runtime').hidden) {
+      rtJobsTimer = setTimeout(window.rtJobsTick, 1200);
+    }
+    if (active.length === 0 && window.wireRuntime) { /* 完成后刷新版本表 */ }
+  };
+
+  window.rtClearJobs = async function () {
+    try {
+      await apiJ('api/runtimes/downloads', { method: 'DELETE' });
+      toast('ok', '已清理', '只保留进行中的任务');
+      if (window.rtJobsTick) window.rtJobsTick();
+    } catch (e) { toast('err', '清理失败', e.message); }
+  };
+
+  window.rtStartDownload = async function (payloadJson) {
+    let row = {};
+    try { row = JSON.parse(payloadJson); } catch (e) { toast('err', '参数错误', e.message); return; }
+    // 历史版本没有内联 sha ✓ 点下载时再去取该 release 的 SHA256SUMS（几 KB ✓）
+    if (!row.sha256 && row.sumsUrl) {
+      try {
+        const txt = await fetch(row.sumsUrl, { cache: 'no-store' }).then(r => r.ok ? r.text() : '');
+        const fn = String(row.url).split('/').pop();
+        for (const line of txt.split('\n')) {
+          const [sha, name] = line.trim().split(/\s+/);
+          if (name === fn && /^[0-9a-f]{64}$/i.test(sha || '')) { row.sha256 = sha.toLowerCase(); break; }
+        }
+        if (!row.sha256) toast('info', '没找到校验和', '将跳过 sha256 校验（仍会用 magic 与大小检查）');
+      } catch (e) { /* 取不到就跳过校验 */ }
+    }
+    const box = document.querySelector(`[data-progress="${CSS.escape(row.id)}"]`);
+    const label = document.querySelector(`[data-label="${CSS.escape(row.id)}"]`);
+    if (box) box.hidden = false;
+    try {
+      const start = await apiJ('api/runtimes/download', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(Object.assign({ activate: false }, row)),
+      });
+      const job = start.job;
+      closeModal();
+      if (window.rtJobsTick) window.rtJobsTick();
+      const tick = async () => {
+        let st = {};
+        try { st = await apiJ('api/runtimes/download/' + encodeURIComponent(job)); }
+        catch (e) { if (label) label.textContent = '状态查询失败：' + e.message; return; }
+        const total = st.total || 0, got = st.received || 0;
+        const pct = total ? Math.min(99, Math.round(got * 100 / total)) : (st.state === 'done' ? 100 : 8);
+        const bar = box && box.querySelector('.progress > i');
+        if (bar) bar.style.width = pct + '%';
+        if (label) {
+          const mb = (n) => (n / 1048576).toFixed(1);
+          label.textContent = st.state === 'downloading'
+            ? `下载中 ${mb(got)} / ${total ? mb(total) : '?'} MB（${pct}%）`
+            : st.state === 'installing' ? '下载完成，正在安装…'
+            : st.state === 'done' ? '完成 ✓（未切换默认；要用它请点「设为实例默认」）'
+            : st.state === 'error' ? '失败：' + (st.error || '') : (st.state || '…');
+        }
+        if (st.state === 'done' || st.state === 'error') {
+          if (st.state === 'done') {
+            toast('ok', '已安装', row.id);
+            window.rtLoadChannel();
+            window.wireRuntime();
+          }
+          return;
+        }
+        setTimeout(tick, 700);
+      };
+      tick();
+    } catch (e) {
+      if (label) label.textContent = '失败：' + e.message;
+      toast('err', '下载失败', e.message);
+    }
+  };
+
+  window.rtRestart = async function (name) {
+    try {
+      await apiJ('api/instances/' + encodeURIComponent(name) + '/restart', { method: 'POST' });
+      toast('ok', '已重启', name);
+    } catch (e) { toast('err', '重启失败', e.message); }
+  };
+  /* 上传镜像：**弹窗** ✓（上传期间不该让用户去操作别的页面 ✓）
+     进度 / 速度 / 预计剩余 / 取消 / 失败确认；上传中禁用关闭 ✓ */
+  window.rtUpload = function (input) {
+    const f = input && input.files && input.files[0];
+    if (!f) return;
+    const m = (f.name || '').match(/^dsh-(.+)\.squashfs$/);
+    if (!m) {
+      toast('err', '文件名不对', '应为 dsh-<id>.squashfs，例如 dsh-0.2.2-rc.1-plain-abc123.squashfs');
+      input.value = '';
+      return;
+    }
+    input.value = '';
+    const id = m[1];
+    const mb = (n) => (n / 1048576).toFixed(1);
+    openModal({
+      title: '上传镜像 · ' + id,
+      sub: mb(f.size) + ' MB · 上传期间请不要关闭此窗口',
+      size: 'normal',
+      locked: true,
+      body: `<div class="progress" style="height:8px"><i id="rtUpBar" style="width:0%"></i></div>
+        <div class="row" style="gap:10px;margin-top:12px;align-items:center">
+          <span class="badge outline" id="rtUpState">上传中</span>
+          <span class="faint" id="rtUpStat" style="font-size:12px">准备中…</span>
+        </div>`,
+      foot: `<button class="btn ghost" id="rtUpCancel">取消上传</button>
+             <button class="btn primary" id="rtUpOk" hidden>确认</button>`,
+    });
+    const bar = $('#rtUpBar'), stat = $('#rtUpStat'), stateEl = $('#rtUpState');
+    const btnCancel = $('#rtUpCancel'), btnOk = $('#rtUpOk');
+    const closeBtn = document.getElementById('mClose');
+    if (closeBtn) closeBtn.hidden = true;      // 上传中不给关 ✗
+
+    const started = Date.now();
+    const done = (kind, text, okId) => {
+      if (btnCancel) btnCancel.hidden = true;
+      if (btnOk) btnOk.hidden = false;
+      if (closeBtn) closeBtn.hidden = false;
+      try { window.__muModalUnlocked = true; } catch (e) {}
+      if (kind === 'done') { stateEl.textContent = '完成'; stateEl.className = 'badge ok'; if (bar) bar.style.width = '100%'; }
+      else if (kind === 'cancelled') { stateEl.textContent = '已取消'; stateEl.className = 'badge warn'; }
+      else { stateEl.textContent = 'Oops'; stateEl.className = 'badge err'; }
+      if (stat) stat.textContent = text;
+      if (btnOk) btnOk.onclick = () => { closeModal(); };
+      if (kind === 'done') { toast('ok', '上传成功', okId || id); window.wireRuntime(); }
+      if (kind === 'error') { toast('err', '上传失败', text); }
+    };
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', 'api/runtimes/upload?id=' + encodeURIComponent(id));
+    xhr.withCredentials = true;
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const pct = Math.min(99, Math.round(e.loaded * 100 / e.total));
+      if (bar) bar.style.width = pct + '%';
+      const secs = Math.max(0.2, (Date.now() - started) / 1000);
+      const speed = e.loaded / secs;
+      const left = Math.max(0, (e.total - e.loaded) / Math.max(1, speed));
+      const eta = left < 1 ? '即将完成'
+        : (left < 60 ? `约 ${Math.round(left)} 秒` : `约 ${Math.ceil(left / 60)} 分钟`);
+      if (stat) stat.textContent = `${pct}% · ${mb(e.loaded)} / ${mb(e.total)} MB · ${(speed / 1048576).toFixed(1)} MB/s · 剩余 ${eta}`;
+    };
+    xhr.onload = () => {
+      let b = {};
+      try { b = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const real = b.id_real || b.id || id;
+        done('done', b.same ? `已存在同一份镜像，未改动（${real}）` : `已安装 ${real}`, real);
+      } else {
+        done('error', 'Oops：' + (b.detail || b.error || ('HTTP ' + xhr.status)));
+      }
+    };
+    xhr.onerror = () => done('error', 'Oops：网络中断或服务端不可达');
+    xhr.onabort = () => done('cancelled', '已取消（服务端已收到的部分会被丢弃）');
+    if (btnCancel) btnCancel.onclick = () => { try { xhr.abort(); } catch (e) {} };
+    xhr.send(f);
+  };
+
+  function observe() {
+    const v = document.getElementById('v-runtime');
+    if (!v) return;
+    new MutationObserver(() => { if (!v.hidden) window.wireRuntime(); })
+      .observe(v, { attributes: true, attributeFilter: ['hidden', 'class'] });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => { observe(); if (location.hash.indexOf('runtime') >= 0) window.wireRuntime(); });
+  } else { observe(); if (location.hash.indexOf('runtime') >= 0) window.wireRuntime(); }
 })();
 </script>
 </body>

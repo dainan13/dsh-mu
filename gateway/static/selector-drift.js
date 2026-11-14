@@ -25,13 +25,17 @@
       why: '展开态把卡片插在「新会话」之后（找不到会退化成追加到 root）' },
 
     // ---- 设置弹窗（我们只填右栏）
+    // 只在**设置弹窗打开时**才在 DOM 里；关着时记 SKIP ✓ 不是改名 ✓
     { group: '设置', name: '设置面板壳 .VOzbGW_panel', sel: '.VOzbGW_panel', need: false,
+      requires: '打开「设置」弹窗',
       why: '宿主设置弹窗的壳；我们注册 settings.section，壳改名会影响布局' },
     { group: '设置', name: '设置导航项 .VOzbGW_navCell', sel: '.VOzbGW_navCell', need: false,
+      requires: '打开「设置」弹窗',
       why: '设置左侧导航；我们的页签「模型」挂在这里' },
 
     // ---- 账号菜单（我们在里面注入三项）
     { group: '更多', name: '[role="menu"]', sel: '[role="menu"]', need: false,
+      requires: '点开「更多」菜单',
       why: '账号菜单容器；三项注入靠它（需要先把菜单点开再跑本脚本）' },
 
     // ---- 我们自己的注入
@@ -67,7 +71,12 @@
     for (const c of CHECKS) {
       const host = document.querySelector(c.sel);
       if (!host) {
-        add(c.group, c.name, c.need ? 'FAIL' : 'WARN', `找不到 → ${c.why}`);
+        if (c.requires) {
+          // 这类节点"关着就不在 DOM 里"✓ 记 SKIP 并告诉怎么开 ✓ 免得每次升级都被误报 ✗
+          add(c.group, c.name, 'SKIP', `需要先${c.requires}，再跑本脚本`);
+        } else {
+          add(c.group, c.name, c.need ? 'FAIL' : 'WARN', `找不到 → ${c.why}`);
+        }
         continue;
       }
       if (c.shadow) {
@@ -93,10 +102,31 @@
     }
 
     // ③ 令牌
-    const cs = getComputedStyle(document.documentElement);
-    const missing = TOKENS.filter((k) => !cs.getPropertyValue(k).trim());
+    // DSH 的主题变量不一定挂在 :root ✗（实测 0.2.2 挂在应用外壳上 ✓）
+    // 所以在 :root 取不到时，退到"应用外壳/侧栏根/body"上各取一次 ✓
+    const tokenSources = [
+      document.documentElement,
+      document.body,
+      document.querySelector('.pI_x6G_frame'),
+      document.querySelector('.hHd-Xa_root'),
+      document.querySelector('#root'),
+    ].filter(Boolean);
+    const resolved = {};
+    for (const node of tokenSources) {
+      let cs = null;
+      try { cs = getComputedStyle(node); } catch (e) { cs = null; }
+      if (!cs) continue;
+      for (const k of TOKENS) {
+        if (resolved[k]) continue;
+        const v = cs.getPropertyValue(k).trim();
+        if (v) resolved[k] = v;
+      }
+    }
+    const missing = TOKENS.filter((k) => !resolved[k]);
     add('令牌', `${TOKENS.length} 个 --dsw-* 令牌`, missing.length ? 'WARN' : 'PASS',
-      missing.length ? '缺失：' + missing.join(', ') : '全部存在');
+      missing.length
+        ? '缺失：' + missing.join(', ')
+        : `全部存在（在 ${tokenSources.length} 个候选节点上合并取到）`);
 
     // ④ 我们自己的注入是否完整（卡片三行结构）
     const cardHost = document.querySelector('#mu-shell-host');

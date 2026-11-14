@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -72,6 +73,20 @@ SELF = "/usr/local/sbin/dsh-muctl"
 DSH_RUNTIME = "/usr/local/lib/node_modules/@deepseek-ai/dsh"
 
 
+def dsh_runtime_dir_for_instance(cfg: dict, name: str) -> str:
+    """实例用哪份运行时：实例指定 > 默认 > 内置（legacy）。"""
+    try:
+        inst = load_state()["instances"].get(name) or {}
+    except Exception:  # noqa: BLE001
+        inst = {}
+    rid = str(inst.get("runtime") or "").strip()
+    if not parse_runtime_id(rid):
+        rid = str(cfg.get("dsh_runtime_default") or cfg.get("dsh_runtime_id") or "").strip()
+    if parse_runtime_id(rid):
+        return f"{VAR}/runtimes/{rid}/node_modules/@deepseek-ai/dsh"
+    return dsh_runtime_dir(cfg)
+
+
 def dsh_runtime_dir(cfg: dict | None = None) -> str:
     """Host path of the shared DSH runtime.
 
@@ -80,6 +95,16 @@ def dsh_runtime_dir(cfg: dict | None = None) -> str:
     legacy host-nginx mode still uses the host's global npm directory.
     """
     cfg = cfg if cfg is not None else load_config()
+    # `dsh_runtime_dir`：指向安装好的 dsh-mu-runtime 根（里面有 node_modules/）✓
+    # 这样 0.2.2 这类"整棵依赖树"可以整体启用/回滚，而**不用**搬动任何目录 ✗
+    # （单独搬 dsh 包会断掉同级依赖解析 ✗ 踩过 ✓）
+    chosen = _clean_opt(cfg.get("dsh_runtime_dir")).rstrip("/")
+    if chosen:
+        if chosen.endswith("/node_modules"):
+            return f"{chosen}/@deepseek-ai/dsh"
+        if chosen.endswith("/@deepseek-ai/dsh"):
+            return chosen
+        return f"{chosen}/node_modules/@deepseek-ai/dsh"
     if str(cfg.get("gateway_mode") or "jail") != "jail":
         return DSH_RUNTIME
     return f"{VAR}/gateway/rootfs{DSH_RUNTIME}"
@@ -178,6 +203,13 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
      "追加到 `dsh web` 的应用参数（原样拼接）"),
     ("DSH_VERSION", "dsh_version", "str", "0.2.1-rc.5",
      "全局安装的 @deepseek-ai/dsh 版本（latest 表示跟随最新）"),
+    ("RUNTIME_CHANNEL_BASE", "runtime_channel_base", "str",
+     "https://raw.githubusercontent.com/dainan13/dsh-mu-runtime/main/channels/channels.json",
+     "运行时通道清单（dsh-muctl runtime install 不带版本时读它的 default；"
+     "可指向内网镜像）"),
+    ("DSH_RUNTIME_DIR", "dsh_runtime_dir", "str", "",
+     "指向一个安装好的 dsh-mu-runtime 根目录（留空 = 用内置运行时）。"
+     "用它切换/回滚 DSH 版本，例如 /usr/local/lib/dsh-mu-runtime"),
     ("ALPINE_MIRROR", "alpine_mirror", "str", "https://mirrors.tuna.tsinghua.edu.cn/alpine",
      "构建 jail 模板使用的 Alpine 镜像根地址"),
     ("ALPINE_VERSION", "alpine_version", "str", "auto",
@@ -195,6 +227,14 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
       "ca-certificates", "curl", "bubblewrap", "nodejs", "npm", "pnpm", "procps"],
      "jail 模板内安装的 apk 包（node/npm/pnpm 是实例自己的，DSH 全局包从宿主只读绑定；"
      "ripgrep 是 harness 的 glob/grep 工具需要的，procps 提供 ps）"),
+    ("DSH_RUNTIME_DEFAULT", "dsh_runtime_default", "optstr", None,
+     "实例默认运行时 id（<dsh>[-variant]-<sha6>；空 = 按 dsh_runtime_dir 反推）"),
+    ("DSH_RUNTIME_DIR", "dsh_runtime_dir", "optstr", None,
+     "默认运行时目录（绝对路径，指向 node_modules/@deepseek-ai/dsh；不用软链）"),
+    ("RUNTIME_MIRRORS", "runtime_mirrors", "optstr", None,
+     "运行时下载加速镜像（空格分隔；直连优先，8 秒无字节就换下一个）"),
+    ("RUNTIME_PROXY_LIST", "runtime_proxy_list", "optstr", None,
+     "可选的代理清单 URL（JSON 数组或每行一个前缀；取不到就忽略）"),
     ("NPM_REGISTRY", "npm_registry", "optstr", None,
      "npm registry（空=官方；国内可填 https://registry.npmmirror.com）"),
     ("MODEL_API_KEY", "model_api_key", "optstr", None,
@@ -402,6 +442,13 @@ class CliError(SystemExit):
 def die(msg: str, code: int = 1):
     print(f"dsh-muctl: {msg}", file=sys.stderr)
     raise CliError(msg, code)
+
+
+def warn(msg: str):
+    """警告输出（黄色/直接 stderr）。以前代码里到处调用它，但**从未定义** ✗
+    → NameError 被 except 吞掉，好几处降级逻辑一直是哑的 ✓ 现在补上 ✓"""
+    print(f"{C_WARN if 'C_WARN' in globals() else ''}{msg}{C_OFF if 'C_OFF' in globals() else ''}",
+          file=sys.stderr)
 
 
 def info(msg: str):
@@ -934,7 +981,7 @@ def render_instance_conf(st: dict, name: str):
         f"DSH_HOST=127.0.0.1",
         f"DSH_HOME_IN_JAIL=/home/dsh/.dsh",
         f"DSH_WORK_IN_JAIL=/home/dsh/workspace",
-        f"DSH_RUNTIME_DIR={dsh_runtime_dir(st['config'])}",
+        f"DSH_RUNTIME_DIR={dsh_runtime_dir_for_instance(st['config'], name)}",
         f"DSH_EXTRA_ARGS=\"{st['config'].get('dsh_extra_args', '')}\"",
         # Always load the patch: it also carries the sandbox-policy entry.
         "DSH_LAUNCH_ARGS=\"--patch /home/dsh/.dsh-mu-provider.yml\"",
@@ -1069,6 +1116,31 @@ def ensure_cgroup2_mounted() -> tuple[bool, str]:
     return False, detail or "mount -t cgroup2 failed"
 
 
+RUNTIMES_INIT = """#!/sbin/openrc-run
+# 运行时镜像是 loop 挂载的：开机后必须按 current 重新挂上，否则实例起不来。
+description="dsh-mu runtime images (squashfs mounts)"
+
+depend() {
+	need localmount
+	before dsh-mu-gateway
+}
+
+start() {
+	ebegin "Mounting the current dsh-mu runtime image"
+	dsh-muctl runtime ensure-mounted || true
+	eend 0
+}
+"""
+
+
+def render_runtimes_service(register: bool = True) -> None:
+    """写入 /etc/init.d/dsh-mu-runtimes 并登记到 default runlevel（幂等）。"""
+    atomic_write("/etc/init.d/dsh-mu-runtimes", RUNTIMES_INIT, mode=0o755)
+    if register:
+        run(["/sbin/rc-update", "add", "dsh-mu-runtimes", "default"], check=False,
+            capture=True)
+
+
 def render_cgroup_service(register: bool = True):
     mounted, why = ensure_cgroup2_mounted()
     if not mounted:
@@ -1181,6 +1253,8 @@ def ensure_cgroup_service():
     without cgroup delegation after a reboot.
     """
     render_cgroup_service(register=True)
+    with contextlib.suppress(Exception):
+        render_runtimes_service(register=True)
 
 
 def reconcile_instances(st: dict) -> list[str]:
@@ -1615,6 +1689,9 @@ def sync_all(st: dict):
     # 实例的「终端」依赖 dsh 运行时里的 node-pty 原生模块；缺了就在每次 sync 时补回 ✓
     with contextlib.suppress(Exception):
         ensure_dsh_native_modules(quiet=True)
+    # 运行时镜像是 loop 挂载的 ✗ 重启后会消失 ✓ 每次 sync 顺手补挂（幂等 ✓）
+    with contextlib.suppress(Exception):
+        runtime_ensure_mounted(quiet=True)
     # /etc/dsh-mu/dsh-mu.conf is the single source of truth: a `config` write must
     # be visible to every render even when the caller still holds an older state
     # snapshot (that mismatch once left a stale TLS block in the nginx fragment).
@@ -1674,13 +1751,28 @@ def sync_all(st: dict):
     with contextlib.suppress(Exception):
         ext_reload(quiet=True)
     with contextlib.suppress(Exception):
-        restart_admin_if_stale()
+        if stale_admin_code():
+            info("admin backend: code changed → restarting dsh-mud")
+            run(["/sbin/rc-service", "dsh-mud", "restart"], check=False)
+            mark_admin_restarted()
+        else:
+            restart_admin_if_stale()
     ensure_instance_autostart(st)
     apply_egress(st)
     render_gateway(st)
+    # 无论走哪条路径，sync 之后 lua 都已经是"当前版本"✓ 记录时间戳 ✓
+    # （以前只在执行了 reload 时才记 ✗ 于是 doctor 永远报 stale ✗）
+    with contextlib.suppress(Exception):
+        mark_lua_reloaded()
     if str(st["config"].get("gateway_mode") or "host") == "jail":
         with contextlib.suppress(OSError):
             sync_gateway_etc()
+        # 升级后 lua 变了但网关还在跑旧 bytecode ✗ → reload + 记录时间戳 ✓
+        # （只重启"看起来旧"的时候，不做无谓重启 ✓）
+        with contextlib.suppress(Exception):
+            if reload_gateway_if_stale(quiet=True):
+                info("gateway: reloaded after upgrade")
+            mark_lua_reloaded()
 
 
 # ------------------------------------------------------------- template / rootfs
@@ -4325,7 +4417,25 @@ def cmd_install(args):
     info(f"log rotation: {rot}" if rot else
          "log rotation: logrotate not present; schedule `dsh-muctl logs rotate` yourself "
          "(apk add logrotate for the daily drop-in)")
+    # 新装/升级后强制落一次 egress 表 ✓ 否则 doctor 会一直 WARN
+    # "policy=no-intranet but no nft table is loaded" ✗（新手会以为装坏了 ✗）
+    with contextlib.suppress(Exception):
+        apply_egress(load_state())
     install_admin(st["config"])
+    # 运行时收尾：告诉运维"现在跑在哪个运行时上"，以及没有镜像时怎么变成镜像 ✓
+    try:
+        rid_now = runtime_current_id()
+        if rid_now:
+            info(f"runtime: {rid_now} -> {runtime_dir(rid_now)}")
+        else:
+            info("runtime: 未配置运行时镜像（当前走 bootstrap/npm 树）")
+            info("  推荐把它固化成镜像，之后升级/回滚都秒级：")
+            info("    dsh-muctl runtime pack " + str(st["config"].get("dsh_version") or "<dsh-version>"))
+            info("  或者从 admin「供给 → 运行时」页上传/安装镜像 ✓")
+        with contextlib.suppress(Exception):
+            render_runtimes_service(register=True)
+    except Exception as exc:  # noqa: BLE001
+        info(f"runtime: 检查失败 {exc}")
     with contextlib.suppress(Exception):
         ext_reload(quiet=True)
     for entry in ensure_system_admins(load_state()):
@@ -4440,6 +4550,8 @@ def cmd_user_add(args):
     # against one only says "实例凭据未就绪" (the user then has to mint it by hand).
     if created and name in st["instances"] and not getattr(args, "no_start", False):
         start_instance(st, name)
+    with contextlib.suppress(Exception):
+        apply_egress(load_state())
     info(f"user {name} created (role={args.role}, instance={st['users'][name]['instance'] or '-'})")
 
 
@@ -4594,6 +4706,9 @@ def create_instance(st: dict, name: str, user: str, cpu, mem, pids, port,
     sync_all(st)
     run(["/sbin/rc-update", "add", f"dsh-mu-{name}", "default"], check=False)
     size = run_out(f"du -sm {base}").split()[0]
+    # 新实例要立刻有自己的 nft 链 ✓ 否则 doctor 会报 "egress rules: no chain for <name>" ✗
+    with contextlib.suppress(Exception):
+        apply_egress(load_state())
     info(f"instance {name} created: port={iport} uid={uid} disk={size}MB")
     return inst
 
@@ -4659,6 +4774,34 @@ def cmd_instance_stop(args):
             die(f"no such instance: {name}")
         stop_instance(st, name)
         info(f"instance {name} stopped")
+
+
+def cmd_instance_runtime(args):
+    """给单个实例指定运行时（default = 跟随默认）。"""
+    ensure_root()
+    names = list(getattr(args, "names", []) or [])
+    want = ""
+    if names and parse_runtime_id(names[-1]) or (names and names[-1] in ("default", "none", "-")):
+        want = names.pop()
+    if not names:
+        die("usage: dsh-muctl instance runtime <name> [<runtime-id>|default]")
+    st = load_state()
+    for name in names:
+        if name not in st["instances"]:
+            die(f"no such instance: {name}")
+        if not want:
+            die("usage: dsh-muctl instance runtime <name> [<runtime-id>|default]")
+        rid = "" if want in ("default", "none", "-") else want
+        try:
+            res = apply_instance_runtime(name, rid)
+        except KeyError:
+            die(f"no such instance: {name}")
+        except ValueError as exc:
+            die(str(exc))
+        info(f"{name}: runtime = {want} -> {res['effective'] or '(none)'}"
+             + ("  [was running: restarted]" if res["restarted"]
+                else "  [was stopped: saved, not started]"))
+    return 0
 
 
 def cmd_instance_restart(args):
@@ -6556,7 +6699,11 @@ def patch_opencode_session() -> str:
     path = (f"{rootfs}/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/"
             f"@deepseek-ai/dsh-llm-pi-ai/lib/index.js")
     if not os.path.exists(path):
-        return "runtime not installed"
+        # 两种完全不同的情况，别混成一句话 ✗
+        if not dsh_runtime_dir(load_config()):
+            return "runtime not installed"
+        # 打包镜像里依赖是扁平 hoist 的 ✗ 这个嵌套路径通常不存在 ✓
+        return "skipped: patch target not found (packaged runtime lays deps flat)"
     try:
         text = read_text(path) or ""
     except OSError:
@@ -6682,6 +6829,15 @@ def node_pty_is_glibc(rootfs: str) -> bool:
     import subprocess as _sp
     pre = f"{node_pty_dir(rootfs)}/prebuilds/linux-x64/pty.node"
     built = f"{node_pty_dir(rootfs)}/build/Release/pty.node"
+    # 镜像运行时优先（真正在用的那份 ✓）；否则退回 rootfs 内置树 ✓
+    try:
+        rid = runtime_current_id()
+        if rid:
+            cand = f"{runtime_dir(rid)}/node_modules/node-pty/build/Release/pty.node"
+            if os.path.exists(cand):
+                built = cand
+    except Exception:  # noqa: BLE001
+        pass
     target = built if os.path.exists(built) else pre
     if not os.path.exists(target):
         return False
@@ -6780,68 +6936,1259 @@ def cmd_upgrade(args):
     return 0
 
 
+RUNTIMES = f"{VAR}/runtimes"
+RUNTIME_DSH_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-_](?:rc|beta|alpha)[._-]?[0-9]+)?$")
+RUNTIME_REV_RE = re.compile(r"-r(?P<rev>[0-9]+)$")
+
+
+def parse_runtime_id(rid: str) -> dict:
+    """把 runtime id 拆开：<dsh>[-<variant>][-r<rev>]。
+
+    先剥尾部 `-rN`（否则 `-r1` 会被当成 variant ✗ 踩过），再看剩下的是否 `-<variant>`。
+    例：0.2.2-rc.1 / 0.2.2-rc.1-vscode / 0.2.2-rc.1-vscode-r2 / 0.2.2-rc.1-r1
+    """
+    raw = str(rid or "").strip()
+    if not raw:
+        return {}
+    rev = 0
+    m = RUNTIME_REV_RE.search(raw)
+    if m:
+        rev = int(m.group("rev"))
+        raw = raw[:m.start()]
+    # 内容指纹后缀：0.2.2-rc.1-570ca1 / 0.2.2-rc.1-vscode-570ca1
+    # 只认 [0-9a-f]{6} 且**至少含一个数字**（variant 都是纯字母，不会误判 ✓）
+    fingerprint = ""
+    m_fp = re.search(r"-([0-9a-f]{6,12})$", raw)
+    if m_fp and re.search(r"[0-9]", m_fp.group(1)):
+        fingerprint = m_fp.group(1)
+        raw = raw[:m_fp.start()]
+    variant = "plain"
+    parts = raw.rsplit("-", 1)
+    if len(parts) == 2 and re.fullmatch(r"[a-z][a-z0-9]*", parts[1]) \
+            and not RUNTIME_DSH_RE.match(raw):
+        # 只有当整体不是合法 DSH 版本时，最后一段才算 variant ✓
+        variant, raw = parts[1], parts[0]
+    if not RUNTIME_DSH_RE.match(raw):
+        return {}
+    return {"id": str(rid).strip(), "dsh": raw, "variant": variant, "rev": rev,
+            "fingerprint": fingerprint}
+
+
+def runtime_dir(rid: str) -> str:
+    return f"{RUNTIMES}/{rid}"
+
+
+def runtime_image(rid: str) -> str:
+    return f"{RUNTIMES}/dsh-{rid}.squashfs"
+
+
+def runtime_manifest(rid: str) -> dict:
+    for cand in (f"{RUNTIMES}/dsh-{rid}.manifest.json", f"{runtime_dir(rid)}/MANIFEST.json"):
+        try:
+            with open(cand, encoding="utf-8") as fh:
+                return json.load(fh) or {}
+        except Exception:  # noqa: BLE001
+            continue
+    return {}
+
+
+def runtime_ids() -> list[str]:
+    """镜像或目录存在的 runtime id（镜像优先，两者都算"已安装"）。"""
+    seen: list[str] = []
+    try:
+        for name in sorted(os.listdir(RUNTIMES)):
+            if name.startswith("dsh-") and name.endswith(".squashfs"):
+                seen.append(name[len("dsh-"):-len(".squashfs")])
+            elif name.startswith("dsh-") and name.endswith(".manifest.json"):
+                rid = name[len("dsh-"):-len(".manifest.json")]
+                if rid not in seen:
+                    seen.append(rid)
+            elif os.path.isdir(f"{RUNTIMES}/{name}") and parse_runtime_id(name):
+                # 空/半残目录（例如手动删过镜像）不算"已安装"✓
+                if runtime_ready(name) and name not in seen:
+                    seen.append(name)
+    except OSError:
+        pass
+    return sorted(set(seen))
+
+
+def _is_mounted(path: str) -> bool:
+    try:
+        with open("/proc/mounts", encoding="utf-8") as fh:
+            return any(line.split()[1] == path for line in fh if line.strip())
+    except OSError:
+        return False
+
+
+def runtime_ready(rid: str) -> bool:
+    """目录里真的有 node_modules/@deepseek-ai/dsh？"""
+    return os.path.exists(f"{runtime_dir(rid)}/node_modules/@deepseek-ai/dsh/package.json")
+
+
+def runtime_materialize(rid: str, quiet: bool = False) -> bool:
+    """让 runtimes/<id>/ 成为可用的运行目录：镜像在就挂（或解压），否则假定已是解压目录。
+
+    注意：**不再用 current 软链** —— 配置里存的就是 runtimes/<id> 的绝对路径。
+    """
+    d = runtime_dir(rid)
+    img = runtime_image(rid)
+    os.makedirs(d, exist_ok=True)
+    if runtime_ready(rid):
+        return True
+    if not os.path.exists(img):
+        warn(f"runtime {rid}: neither {d} nor {img} is usable")
+        return False
+    if not _is_mounted(d):
+        res = run(["mount", "-t", "squashfs", "-o", "loop,ro", img, d],
+                  check=False, capture=True)
+        if res.returncode == 0:
+            if not quiet:
+                info(f"mounted {os.path.basename(img)} -> {d} (zero-extract)")
+        else:
+            warn("cannot mount squashfs here (no loop devices); extracting instead")
+            shutil.rmtree(d, ignore_errors=True)
+            os.makedirs(d, exist_ok=True)
+            ex = run(["unsquashfs", "-q", "-n", "-d", d, img], check=False, capture=True)
+            if ex.returncode != 0:
+                warn(f"unsquashfs failed: {(ex.stderr or ex.stdout or '')[-300:]}")
+                return False
+    return runtime_ready(rid)
+
+
+def runtime_activate(rid: str, quiet: bool = False) -> bool:
+    if not runtime_materialize(rid, quiet=quiet):
+        return False
+    st = load_state()
+    st["config"]["dsh_runtime_dir"] = runtime_dir(rid)
+    parsed = parse_runtime_id(rid)
+    if parsed.get("dsh"):
+        st["config"]["dsh_version"] = parsed["dsh"]
+    st["config"]["dsh_runtime_default"] = rid
+    st["config"].pop("dsh_runtime_id", None)
+    save_config(st["config"])
+    if not quiet:
+        info(f"runtime: {rid} -> {runtime_dir(rid)}")
+    return True
+
+
+def runtime_current_id() -> str:
+    """兼容旧名：现在等价于"默认运行时"。"""
+    return runtime_default_id()
+
+
+def runtime_ensure_mounted(quiet: bool = True) -> None:
+    rid = runtime_current_id()
+    if not rid:
+        return
+    if runtime_ready(rid):
+        return
+    runtime_materialize(rid, quiet=quiet)
+
+
+RUNTIME_CHANNEL_BASE = ("https://raw.githubusercontent.com/dainan13/dsh-mu-runtime/"
+                        "main/channels/channels.json")
+
+
+# 下载加速：GitHub 直连在国内常常只有几十 KB/s ✗
+# axel 支持**多源**（同一个文件，从多个 URL 并行取）✓
+# 这些前缀会把原始 GitHub URL 变成镜像 URL ✓（可配置 runtime_mirrors 覆盖 ✓）
+# 顺序 = 速度顺序（2026-11 在 .61 实测）：
+#   githubproxy.cc  单连接 ≈3.0 MB/s  ✓ 首选
+#   gh-proxy.com    单连接 ≈0.17 MB/s
+#   ghproxy.net     单连接 ≈0.12 MB/s
+#   直连 github.com 常常 0 B/s（TLS 握手都超时）→ 放最后当兜底
+# 默认镜像前缀（都会带上面那个 UA ✓ 不带 UA 会被 403 ✗）
+# 注意：**没有"最好的代理"** —— 每个网络能通的都不一样 ✗
+# 这里只是一组常见的；现场可用 runtime_mirrors 覆盖 ✓ 或留空只用直连 ✓
+RUNTIME_MIRRORS_DEFAULT = (
+    "https://githubproxy.cc/ "
+    "https://gh-proxy.com/ "
+    "https://ghfast.top/ "
+    "https://ghproxy.net/ "
+    "https://hub.gitmirror.com/"
+)
+
+# 下载用的 User-Agent（镜像普遍拒绝脚本 UA ✗ 这是实测到的 403 原因）
+RUNTIME_DL_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+
+
+def _dl_request(url: str):
+    return urllib.request.Request(url, headers={"User-Agent": RUNTIME_DL_UA})
+
+
+def runtime_mirrors() -> list:
+    raw = _clean_opt(load_config().get("runtime_mirrors")) or RUNTIME_MIRRORS_DEFAULT
+    return [x.strip() for x in raw.replace(",", " ").split() if x.strip()]
+
+
+def runtime_proxy_list() -> list:
+    """可选：从配置的 URL 拉一份代理清单（JSON 数组或纯文本，每行一个前缀）✓
+
+    社区确实有维护这类列表的项目，但**它们的格式/地址会变** ✗
+    所以这里不内置任何具体项目地址 ✓ 由现场用 runtime_proxy_list 指定 ✓
+    （内置默认值有：RUNTIME_MIRRORS_DEFAULT ✓）
+    """
+    src = _clean_opt(load_config().get("runtime_proxy_list"))
+    if not src:
+        return []
+    with contextlib.suppress(Exception):
+        with urllib.request.urlopen(_dl_request(src), timeout=6) as resp:  # noqa: S310
+            raw = resp.read(256 * 1024).decode("utf-8", "replace")
+        try:
+            doc = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            doc = None
+        out = []
+        if isinstance(doc, list):
+            out = [str(x) for x in doc if isinstance(x, str)]
+        elif isinstance(doc, dict):
+            for key in ("mirrors", "proxies", "list", "nodes"):
+                if isinstance(doc.get(key), list):
+                    out = [str(x) for x in doc[key] if isinstance(x, str)]
+                    break
+        else:
+            out = [ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.startswith("#")]
+        return [x if x.endswith("/") else x + "/" for x in out if x.startswith("http")]
+    return []
+
+
+def runtime_download_sources(url: str) -> list:
+    """候选下载地址（**按速度排序**）：镜像优先，直连兜底 ✓
+
+    只对 github.com / githubusercontent.com 的地址加镜像 ✓ 其它地址原样 ✓
+    """
+    if not url.lower().startswith(("http://", "https://")):
+        return [url]
+    if "github.com/" not in url and "githubusercontent.com/" not in url:
+        return [url]
+    # 顺序：**直连优先**，镜像兜底 ✓
+    # 为什么不再"镜像优先"：镜像速度是**按客户网络**变化的 ✗
+    # （.61 上 githubproxy.cc 有 3MB/s，但换个机房/客户网络可能反而更慢或不通）；
+    # 直连在能出网的机房里最快 ✓ 在受限网络里会卡住 ✓ → 靠 8s 看门狗快速跳过 ✓
+    sources = [url]
+    prefixes = list(runtime_mirrors())
+    with contextlib.suppress(Exception):
+        prefixes += [p for p in runtime_proxy_list() if p not in prefixes]
+    for prefix in prefixes:
+        if prefix.rstrip("/") in url:
+            continue
+        cand = prefix.rstrip("/") + "/" + url
+        if cand not in sources:
+            sources.append(cand)
+    return sources
+
+
+def _clean_opt(value) -> str:
+    """配置里的 "None"/"null"/"" 都当作"未设置" ✓（曾把 Python None 写成字符串 ✗）"""
+    s = str(value or "").strip()
+    return "" if s.lower() in ("none", "null", "nil") else s
+
+
+def runtime_channel_base() -> str:
+    cfg = load_config()
+    return _clean_opt(cfg.get("runtime_channel_base")) or RUNTIME_CHANNEL_BASE
+
+
+_CHANNELS_CACHE: dict = {"at": 0.0, "doc": None, "error": "", "failed_at": 0.0}
+CHANNELS_TTL = 300.0
+CHANNELS_ERROR_TTL = 60.0   # 失败后的冷却：避免每个请求都去撞 DNS/连接 ✗
+
+
+def runtime_channels(force: bool = False, timeout: float = 4.0) -> dict | None:
+    """读 channels.json，带 5 分钟缓存 ✗ 绝不阻塞列表接口（曾经同步拉 15s ✗）。
+
+    force=True 时强制刷新；失败时保留上一次成功的结果（error 里记原因）。
+    """
+    now = time.time()
+    if not force and _CHANNELS_CACHE["doc"] is not None \
+            and now - float(_CHANNELS_CACHE["at"] or 0) < CHANNELS_TTL:
+        return _CHANNELS_CACHE["doc"]
+    failed_at = float(_CHANNELS_CACHE.get("failed_at") or 0)
+    if not force and failed_at and now - failed_at < CHANNELS_ERROR_TTL:
+        return _CHANNELS_CACHE["doc"]      # 冷却期内直接返回（可能是 None）
+    url = runtime_channel_base()
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            doc = json.loads(resp.read().decode("utf-8"))
+        _CHANNELS_CACHE.update({"at": now, "doc": doc, "error": "", "failed_at": 0.0})
+        return doc
+    except Exception as exc:  # noqa: BLE001
+        _CHANNELS_CACHE.update({"error": str(exc)[:160], "failed_at": now})
+        if _CHANNELS_CACHE["doc"] is not None:
+            warn(f"channels.json refresh failed ({exc}); using the cached copy")
+            return _CHANNELS_CACHE["doc"]
+        warn(f"channels.json unreachable ({url}): {exc}")
+        return None
+
+
+def runtime_channels_cached() -> dict | None:
+    """只返回缓存里的 channels —— 供 HTTP 接口使用，永不联网。"""
+    return _CHANNELS_CACHE["doc"]
+
+
+def runtime_channels_state() -> dict:
+    return {"fetched_at": int(_CHANNELS_CACHE["at"] or 0),
+            "error": _CHANNELS_CACHE["error"],
+            "ttl": int(CHANNELS_TTL)}
+
+
+def runtime_default_id() -> str:
+    """默认运行时：配置 dsh_runtime_default（旧键 dsh_runtime_id 兼容）。"""
+    cfg = load_config()
+    rid = str(cfg.get("dsh_runtime_default") or cfg.get("dsh_runtime_id") or "").strip()
+    if rid:
+        return rid
+    path = str(cfg.get("dsh_runtime_dir") or "").strip().rstrip("/")
+    tail = os.path.basename(path) if path else ""
+    return tail if parse_runtime_id(tail) else ""
+
+
+def instance_is_running(name: str) -> bool:
+    with contextlib.suppress(Exception):
+        return bool(load_state()["instances"].get(name, {}).get("state") == "running")
+    return False
+
+
+def set_default_runtime(rid: str) -> dict:
+    """改「实例默认运行时」，并把**所有跟随默认的实例**一次性对齐 ✓
+
+    为什么必须重启：默认是全局指针 ✓ conf 会被 sync 改写 ✓
+    如果只改指针不重启，就会出现"配置写的是新默认、进程还跑旧的" ✗
+    → 所以这里直接重启所有跟随者（显式运行时的不动 ✓）
+    """
+    if rid not in runtime_ids():
+        raise ValueError(f"runtime {rid} is not installed")
+    st = load_state()
+    followers = [n for n, i in st["instances"].items() if not str(i.get("runtime") or "")]
+    # 幂等：默认已经是它，且所有跟随者的 conf 都已经指向它 → 什么都别做 ✓
+    # （上一版没有这个判断，把 7 个实例白白重启了一遍 ✗）
+    already = runtime_default_id() == rid and all(
+        instance_conf_runtime(n) == rid for n in followers)
+    if already:
+        return {"default": rid, "followers": followers, "restarted": [],
+                "failed": [], "noop": True}
+    if not runtime_activate(rid):
+        raise ValueError("激活失败（镜像损坏或缺 pty.node）")
+    running = [n for n in followers if str((st["instances"][n] or {}).get("state") or "") == "running"]
+    sync_all(load_state())
+    restarted, failed = [], []
+    for name in running:
+        try:
+            st2 = load_state()
+            stop_instance(st2, name, mark=False)
+            ok = start_with_cookie_retry(load_state(), name, timeout=300.0)
+            (restarted if ok else failed).append(name)
+        except Exception:  # noqa: BLE001
+            failed.append(name)
+    return {"default": rid, "followers": followers,
+            "restarted": restarted, "failed": failed, "noop": False}
+
+
+def apply_instance_runtime(name: str, rid: str, restart: bool = True) -> dict:
+    """产品规则：改运行时必须处在停机态才能"直接改"✓
+
+    · 实例在运行 → 改完**立即重启**（否则运行中的进程还是旧运行时 ✓）
+    · 实例已停止 → 只改配置，**不启动** ✓（留给你自己决定何时拉起）
+    """
+    st = load_state()
+    if name not in st["instances"]:
+        raise KeyError(name)
+    if rid and rid not in runtime_ids():
+        raise ValueError(f"runtime {rid} is not installed")
+    running = bool(st["instances"][name].get("state") == "running")
+    if rid:
+        st["instances"][name]["runtime"] = rid
+    else:
+        st["instances"][name].pop("runtime", None)
+    save_state(st)
+    sync_all(load_state())
+    restarted = False
+    if running and restart:
+        # 运行中的实例：改完必须重启才生效 ✓（产品规则：运行态改运行时=重启）
+        st2 = load_state()
+        stop_instance(st2, name, mark=False)
+        start_with_cookie_retry(load_state(), name, timeout=300.0)
+        restarted = True
+    return {"instance": name, "runtime": rid,
+            "effective": resolve_instance_runtime(name),
+            "was_running": running, "restarted": restarted,
+            "started": False}
+
+
+def instance_conf_runtime(name: str) -> str:
+    """实例 conf 里的 DSH_RUNTIME_DIR → 运行时 id（平台下次启动真正会用的值 ✓）。"""
+    with contextlib.suppress(Exception):
+        text = read_text(f"{INST_CONF_DIR}/{name}.conf") or ""
+        for line in text.splitlines():
+            if line.startswith("DSH_RUNTIME_DIR="):
+                path = line.split("=", 1)[1].strip().strip('"')
+                if "/runtimes/" in path:
+                    rid = path.split("/runtimes/", 1)[1].split("/", 1)[0]
+                    return rid if parse_runtime_id(rid) else ""
+                # 旧式路径（gateway rootfs / 全局 node_modules）→ 无法对应到 runtime id
+                return ""
+    return ""
+
+
+def instance_running_runtime(name: str) -> str:
+    """实例**当前进程**真正在用的运行时（读 /proc/<pid>/mountinfo，看到才说 ✓）。
+
+    配置里的值是"重启后生效"的期望值 ✗ 不等于正在跑的那个 ✓
+    （默认被切换后所有跟随实例的 conf 会立即改写，但进程只有重启才换 ✓）
+    """
+    import glob as _glob
+    cand = _glob.glob(f"/run/openrc/started/dsh-mu-instance.{name}") or []
+    if not cand:
+        cand = _glob.glob(f"{VAR}/instances/{name}/rootfs")  # 仅用于存在性判断
+    # 认领进程：谁把 instances/<name>/home 挂进来，谁就是这个实例 ✓
+    # 然后找 **挂载点正好是 /usr/local/lib/node_modules** 的那一行 → 它的 source 才是真正在用的运行时 ✓
+    # （宿主上所有 squashfs 都挂载了，只看"有 runtimes/ 字样"会同时看到两个 ✗ 踩过）
+    for d in _glob.glob("/proc/[0-9]*"):
+        with contextlib.suppress(Exception):
+            info = read_text(f"{d}/mountinfo") or ""
+            if not info or f"/instances/{name}/home" not in info:
+                continue
+            for line in info.splitlines():
+                parts = line.split(" - ")
+                if len(parts) != 2:
+                    continue
+                left, right = parts
+                fields = left.split()
+                if len(fields) < 5 or fields[4] != "/usr/local/lib/node_modules":
+                    continue
+                src = right.split()[1] if len(right.split()) > 1 else ""
+                if "/runtimes/" in src:
+                    rid = src.split("/runtimes/", 1)[1].split("/", 1)[0]
+                    if parse_runtime_id(rid):
+                        return rid
+    return ""
+
+
+def instance_runtime(name: str) -> str:
+    """实例指定的运行时 id（空 = 跟随默认）。"""
+    inst = load_state()["instances"].get(name) or {}
+    rid = str(inst.get("runtime") or "").strip()
+    return rid if parse_runtime_id(rid) else ""
+
+
+def resolve_instance_runtime(name: str) -> str:
+    return instance_runtime(name) or runtime_default_id()
+
+
+def runtime_fetch_image(url: str, sha_want: str, dest: str,
+                        progress=None, quiet: bool = True) -> str:
+    """把镜像下到 dest（并发选源 + 流式写盘 + sha 校验）。返回实际 sha256（失败抛错）✓
+
+    install（首次安装）与 admin 下载任务共用这一份逻辑 ✓
+    以前 install 走的是"单连接 + 整个读进内存" ✗ 慢且吃内存 ✓
+    """
+    cands = runtime_download_sources(url)
+    winner = {"idx": None, "total": 0}
+    stop = threading.Event()
+    ev = threading.Event()
+
+    def _fetch(i, cand):
+        part = f"{dest}.{i}"
+        try:
+            with urllib.request.urlopen(_dl_request(cand), timeout=10) as resp:  # noqa: S310
+                total = int(resp.headers.get("Content-Length") or 0)
+                got = 0
+                with open(part, "wb") as fh:
+                    while not stop.is_set():
+                        chunk = resp.read(1 << 20)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        got += len(chunk)
+                        if winner["idx"] is None and got >= (1 << 20):
+                            winner.update({"idx": i, "total": total})
+                            ev.set()
+                        if winner["idx"] not in (None, i):
+                            break
+                if winner["idx"] == i and not stop.is_set():
+                    winner["total"] = total
+        except Exception as exc:  # noqa: BLE001
+            if not quiet:
+                warn(f"source failed: {str(exc)[:90]}")
+        finally:
+            if winner["idx"] != i:
+                with contextlib.suppress(OSError):
+                    os.unlink(part)
+
+    threads = [threading.Thread(target=_fetch, args=(i, c), daemon=True)
+               for i, c in enumerate(cands)]
+    for th in threads:
+        th.start()
+    ev.wait(timeout=25)
+    win = winner["idx"]
+    if win is None:
+        stop.set()
+        raise ValueError("所有下载源都失败（直连 + 镜像）；可用「上传镜像」或配置 runtime_mirrors")
+    part = f"{dest}.{win}"
+    while True:
+        alive = threads[win].is_alive()
+        if progress:
+            with contextlib.suppress(OSError):
+                progress(os.path.getsize(part), winner["total"] or 0)
+        if not alive:
+            break
+        time.sleep(0.7)
+    stop.set()
+    for i in range(len(cands)):
+        if i != win:
+            with contextlib.suppress(OSError):
+                os.unlink(f"{dest}.{i}")
+    digest = hashlib.sha256()
+    with open(part, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    got_sha = digest.hexdigest()
+    if sha_want and got_sha != sha_want.lower():
+        with contextlib.suppress(OSError):
+            os.unlink(part)
+        raise ValueError(f"sha256 mismatch (want {sha_want[:12]}… got {got_sha[:12]}…)")
+    os.replace(part, dest)
+    return got_sha
+
+
+def runtime_install_image(row: dict, quiet: bool = False) -> str:
+    """下载 dsh-<id>.squashfs → 校验 → 放置 → 激活。返回 id（失败返回空串）。"""
+    rid = str(row.get("id") or row.get("dsh") or "").strip()
+    url = str(row.get("url") or "").strip()
+    want = str(row.get("sha256") or "").strip()
+    if not rid or not url:
+        warn("channel row is incomplete (need id/dsh + url)")
+        return ""
+    os.makedirs(RUNTIMES, exist_ok=True)
+    img = runtime_image(rid)
+    if not os.path.exists(img):
+        if not quiet:
+            info(f"downloading {url}")
+        try:
+            size = runtime_fetch_image(url, want, img + ".part", quiet=quiet)
+            os.chmod(img + ".part", 0o600)
+            os.replace(img + ".part", img)
+        except Exception as exc:  # noqa: BLE001
+            warn(f"download failed: {exc}")
+            return ""
+        if not quiet:
+            info(f"downloaded (sha256 {size[:12]}…)")
+    if not runtime_activate(rid, quiet=quiet):
+        return ""
+    sync_all(load_state())
+    info("done. instances pick it up on their next restart:")
+    info("  dsh-muctl instance restart <name>")
+    return rid
+
+
+def installed_node_version() -> str:
+    try:
+        rootfs = runtime_rootfs()
+        out = run(["chroot", rootfs, "/usr/bin/node", "-v"], check=False, capture=True)
+        return (out.stdout or "").strip() or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def node_pty_version(tree: str) -> str:
+    try:
+        with open(f"{tree}/node_modules/node-pty/package.json", encoding="utf-8") as fh:
+            return str(json.load(fh).get("version") or "?")
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+# ---------------------------------------------------------------- download jobs
+# 下载任务要**落盘**：用户关掉窗口、后端重启后都要能看到"上次下到哪 / 为什么失败"
+_JOBS_PATH = f"{VAR}/runtimes/.jobs.json"
+_DL_JOBS: dict = {}
+_DL_LOCK = threading.Lock()
+
+
+def _jobs_load() -> dict:
+    try:
+        with open(_JOBS_PATH, encoding="utf-8") as fh:
+            doc = json.load(fh)
+            return doc if isinstance(doc, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _jobs_save(doc: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_JOBS_PATH), exist_ok=True)
+        tmp = _JOBS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=2, sort_keys=True)
+        os.replace(tmp, _JOBS_PATH)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _job_update(job: str, **fields) -> None:
+    with _DL_LOCK:
+        _DL_JOBS.setdefault(job, {}).update(fields)
+        cur = _DL_JOBS[job]
+    doc = _jobs_load()
+    row = doc.get(job) or {}
+    row.update(fields)
+    row["job"] = job
+    row["updated_at"] = int(time.time())
+    row.setdefault("started_at", int(time.time()))
+    doc[job] = row
+    _jobs_save(doc)
+
+
+def runtime_image_sha_sidecar(rid: str) -> str:
+    """读/写 `<id>.sha256` 侧记文件：避免每次都重算 99MB 的 sha256 ✓"""
+    side = f"{RUNTIMES}/dsh-{rid}.sha256"
+    with contextlib.suppress(Exception):
+        val = (read_text(side) or "").strip()
+        if val:
+            return val
+    val = runtime_image_sha256(rid)
+    if val:
+        with contextlib.suppress(Exception):
+            write_text(side, val + "\n")
+    return val
+
+
+def runtime_migrate_ids(dry_run: bool = False) -> dict:
+    """把不带内容指纹的旧 id 迁移成 <dsh>[-variant][-r<rev>]-<sha6> ✓
+
+    本地构建（MANIFEST.source != "ci"）的 variant 若还是 plain → 改成 local ✓
+    这样实例表格/下拉里能一眼分清"CI 构建"和"本机构建"。
+    """
+    st = load_state()
+    olds = [r for r in runtime_ids() if not (parse_runtime_id(r) or {}).get("fingerprint")]
+    if not olds:
+        return {"renamed": [], "restarted": [], "dry_run": dry_run}
+    plan = {}
+    for rid in olds:
+        parsed = parse_runtime_id(rid) or {}
+        fp = ""
+        if os.path.exists(runtime_image(rid)):
+            fp = runtime_image_sha_sidecar(rid)[:6]
+        if not fp:
+            with contextlib.suppress(Exception):
+                stt = os.stat(runtime_dir(rid))
+                fp = hashlib.sha256(f"{rid}|{stt.st_ino}|{int(stt.st_mtime)}".encode()).hexdigest()[:6]
+        man = runtime_manifest(rid)
+        variant = parsed.get("variant") or "plain"
+        if variant == "plain" and (man.get("source") or "") != "ci":
+            variant = "local"
+        stem = f"{parsed['dsh']}-{variant}"      # variant 段永远写出来 ✓（plain 也写）
+        rev = int(parsed.get("rev") or 0)
+        if rev:
+            stem = f"{stem}-r{rev}"
+        plan[rid] = f"{stem}-{fp}"
+    if dry_run:
+        return {"plan": plan, "dry_run": True}
+
+    used = {str(i.get("runtime") or "") for i in st["instances"].values()}
+    default_now = st["config"].get("dsh_runtime_default") or (parse_runtime_id(
+        os.path.basename(str(st["config"].get("dsh_runtime_dir") or "").rstrip("/")) or "") or {}).get("id")
+    touches = [old for old in plan if old == default_now or old in used]
+    running = [n for n, i in st["instances"].items()
+               if str(i.get("state") or "") == "running"] if touches else []
+    for n in running:
+        stop_instance(load_state(), n, mark=False)
+    restarted, failed = [], []
+    for old_id, new_id in plan.items():
+        if _is_mounted(runtime_dir(old_id)):
+            run(["umount", runtime_dir(old_id)], check=False, capture=True)
+        with contextlib.suppress(OSError):
+            os.replace(runtime_image(old_id), runtime_image(new_id))
+        with contextlib.suppress(OSError):
+            os.replace(f"{RUNTIMES}/dsh-{old_id}.manifest.json",
+                       f"{RUNTIMES}/dsh-{new_id}.manifest.json")
+        with contextlib.suppress(OSError):
+            os.unlink(f"{RUNTIMES}/dsh-{old_id}.sha256")
+        with contextlib.suppress(OSError):
+            shutil.rmtree(runtime_dir(old_id), ignore_errors=True)
+        # 关键：搬家之后要重新挂载 ✗ 否则新目录是空的 → 实例起不来 ✗（这次踩过 ✓）
+        with contextlib.suppress(Exception):
+            runtime_materialize(new_id, quiet=True)
+    cur = load_state()
+    for old_id, new_id in plan.items():
+        cur["config"]["dsh_runtime_default"] = (
+            new_id if cur["config"].get("dsh_runtime_default") == old_id
+            else cur["config"].get("dsh_runtime_default") or new_id)
+    if cur["config"].get("dsh_runtime_default") in plan:
+        cur["config"]["dsh_runtime_default"] = plan[cur["config"]["dsh_runtime_default"]]
+        cur["config"].pop("dsh_runtime_id", None)
+    if cur["config"].get("dsh_runtime_dir"):
+        for old_id, new_id in plan.items():
+            if f"/runtimes/{old_id}/" in cur["config"]["dsh_runtime_dir"]:
+                cur["config"]["dsh_runtime_dir"] = f"{runtime_dir(new_id)}/node_modules/@deepseek-ai/dsh"
+    for n, inst in cur["instances"].items():
+        old = str(inst.get("runtime") or "")
+        if old in plan:
+            inst["runtime"] = plan[old]
+    save_config(cur["config"])
+    save_state(cur)
+    sync_all(load_state())
+    for n in running:
+        try:
+            ok = start_with_cookie_retry(load_state(), n, timeout=300.0)
+            (restarted if ok else failed).append(n)
+        except Exception:  # noqa: BLE001
+            failed.append(n)
+    return {"plan": plan, "restarted": restarted, "failed": failed, "dry_run": False}
+
+
+def runtime_fingerprint(rid: str) -> str:
+    """列表里展示的 6 位内容指纹：id 里带就用它 ✓ 否则用镜像 sha 的前 6 位 ✓"""
+    parsed = parse_runtime_id(rid) or {}
+    if parsed.get("fingerprint"):
+        return parsed["fingerprint"]
+    if os.path.exists(runtime_image(rid)):
+        return runtime_image_sha_sidecar(rid)[:6]
+    return ""
+
+
+def runtime_image_sha256(rid: str) -> str:
+    img = runtime_image(rid)
+    if not os.path.exists(img):
+        return ""
+    h = hashlib.sha256()
+    with open(img, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def runtime_free_id(base: str) -> str:
+    """给"内容与已有同名版本不同"的构建找一个不冲突的 id ✓
+
+    <dsh>[-variant][-r<rev>] → 依次试 -r1, -r2 … 直到空闲
+    （rev=0 的含义是"第一次构建"，所以冲突时从 r1 开始 ✓）
+    """
+    parsed = parse_runtime_id(base)
+    if not parsed:
+        return base
+    if base not in runtime_ids():
+        return base
+    dsh, variant = parsed["dsh"], parsed["variant"]
+    stem = dsh if variant == "plain" else f"{dsh}-{variant}"
+    n = max(1, int(parsed.get("rev") or 0) + 1)
+    while True:
+        cand = f"{stem}-r{n}"
+        if cand not in runtime_ids() and not os.path.exists(runtime_image(cand)):
+            return cand
+        n += 1
+
+
+def decide_runtime_id(rid: str, sha_want: str = "", sha_have: str = "") -> tuple:
+    """决定这次安装落在哪个 id 上。
+
+    返回 (real_id, action, reason)：
+      action = "new"      → 用这个 id ✓
+               "same"     → 已经有一模一样的镜像 ✓ 什么都不用做
+               "fork"     → 同名但内容不同 ✓ 自动分叉到 -rN
+    """
+    parsed = parse_runtime_id(rid) or {}
+    fam = parsed.get("dsh") or rid
+    # 已经把指纹写在 id 里了 → 直接用 ✓
+    if parsed.get("fingerprint"):
+        if os.path.exists(runtime_image(rid)):
+            have = sha_have or runtime_image_sha256(rid)
+            if sha_want and have and sha_want.lower() == have.lower():
+                return rid, "same", f"{rid} 已经是同一份镜像（sha256 一致）"
+            return rid, "new", ""
+        return rid, "new", ""
+    # 先看**不带指纹的那个 id** 是否已经是同一份内容 ✓（否则会白存一份 99MB ✗）
+    if os.path.exists(runtime_image(rid)) and sha_want:
+        have = sha_have or runtime_image_sha256(rid)
+        if have and have.lower() == sha_want.lower():
+            return rid, "same", f"{rid} 已经是同一份镜像（sha256 一致）"
+    if sha_want:
+        variant = parsed.get("variant") or "plain"
+        real = f"{fam}-{variant}-{sha_want[:6].lower()}"
+        if real in runtime_ids() or os.path.exists(runtime_image(real)):
+            have = sha_have or runtime_image_sha256(real)
+            if not have or have.lower() == sha_want.lower():
+                return real, "same", f"{real} 已经是同一份镜像（sha256 一致）"
+            return real, "new", ""       # 指纹撞了但内容不同（极小概率）→ 覆盖自己的同名项
+        return real, "new", ""
+    # 没有 sha（例如目录形态）→ 用 inode/mtime 当指纹 ✓（你说的"随机/inode 算一个" ✓）
+    if rid not in runtime_ids() and not os.path.exists(runtime_image(rid)):
+        return rid, "new", ""
+    real = runtime_free_id(rid)
+    return real, "fork", f"{rid} 已存在且内容不同 → 存为 {real}"
+
+
+def runtime_id_in_use(rid: str) -> str:
+    """返回一个"为什么不能覆盖这个 id"的理由；可覆盖时返回 "" ✓
+
+    规则（防止"覆盖正在使用的镜像"✗）：
+      · 是实例默认运行时 → 不能覆盖 ✓
+      · 有运行中的实例在用它 → 不能覆盖 ✓
+      · 已挂载（可能被实例用着）→ 不能覆盖 ✓
+    """
+    if runtime_default_id() == rid:
+        return "它是实例默认运行时"
+    try:
+        for n, i in load_state()["instances"].items():
+            if str(i.get("runtime") or "") == rid and \
+                    str(i.get("state") or "") == "running":
+                return f"实例 {n} 正在用它"
+    except Exception:  # noqa: BLE001
+        pass
+    if _is_mounted(runtime_dir(rid)):
+        return "它已经挂载（可能正被实例使用）"
+    return ""
+
+
+def runtime_download_async(row: dict, activate: bool = False) -> str:
+    """后台下载镜像并可选激活；状态落盘，页面可随时查。"""
+    rid = str(row.get("id") or row.get("dsh") or "").strip()
+    url = str(row.get("url") or "").strip()
+    want = str(row.get("sha256") or "").strip()
+    if not rid or not url:
+        raise ValueError("row needs id + url")
+    # 已经有 sha（channels.json 给了）就先做幂等判断 ✓ 否则下完再定名 ✓
+    if want:
+        real0, action0, reason0 = decide_runtime_id(rid, want)
+        if action0 == "same":
+            job = f"dl-{rid}-{int(time.time() * 1000)}"
+            _job_update(job, id=rid, state="done", received=0, total=0, error="",
+                        url=url, activate=False, note=reason0, id_real=rid)
+            return job
+        if action0 == "new" and real0 != rid:
+            rid = real0
+    job = f"dl-{rid}-{int(time.time() * 1000)}"
+    _job_update(job, id=rid, state="starting", received=0, total=0, error="",
+                url=url, activate=bool(activate), id_real=rid)
+    sys.stderr.write(f"[runtime-dl] start {job} {rid} <- {url}\n")
+    sys.stderr.flush()
+
+    def worker():
+        nonlocal rid          # worker 里会改写 rid（按内容指纹定名）✗ 不加这行会 UnboundLocalError ✓
+        img = runtime_image(rid)
+        os.makedirs(RUNTIMES, exist_ok=True)
+        tmp = img + ".part"
+        try:
+            # 优先 axel（多连接 + 可续传，对跨境慢链路通常更快）；
+            # 没有 axel 就退回 urllib。进度统一用"轮询文件大小"→ 两种下载器都准 ✓
+            # axel 只支持 http/https/ftp ✗ file:// 会直接失败 → 那种用 urllib ✓
+            # 并发"赛马"：所有候选源同时下，谁先吐满 1 MB 谁就赢 ✓
+            # 为什么不能固定顺序：镜像快慢随时间、按客户网络变化 ✗
+            # （同一台机器两次测，第一名从 githubproxy.cc 变成 ghfast.top ✓）
+            cands = runtime_download_sources(url)
+            _job_update(job, state="downloading", total=0, source="; ".join(c[:40] for c in cands[:3]))
+            sys.stderr.write(f"[runtime-dl] racing {len(cands)} source(s)\n")
+            sys.stderr.flush()
+            winner = {"idx": None, "got": 0, "total": 0}
+            ev = threading.Event()
+            stop = threading.Event()
+
+            def _fetch(i, cand):
+                part = f"{tmp}.{i}"
+                try:
+                    with urllib.request.urlopen(_dl_request(cand), timeout=10) as resp:  # noqa: S310
+                        tot = int(resp.headers.get("Content-Length") or 0)
+                        got = 0
+                        with open(part, "wb") as fh:
+                            while not stop.is_set():
+                                chunk = resp.read(1 << 20)
+                                if not chunk:
+                                    break
+                                fh.write(chunk)
+                                got += len(chunk)
+                                if winner["idx"] is None and got >= (1 << 20):
+                                    winner.update({"idx": i, "got": got, "total": tot})
+                                    ev.set()
+                                if winner["idx"] not in (None, i):
+                                    break          # 别人赢了 → 放弃 ✓
+                            if winner["idx"] == i and not stop.is_set():
+                                winner["got"] = got
+                                winner["total"] = tot
+                except Exception as exc:  # noqa: BLE001
+                    sys.stderr.write(f"[runtime-dl] {cand[:50]} failed: {str(exc)[:90]}\n")
+                    sys.stderr.flush()
+                finally:
+                    with contextlib.suppress(OSError):
+                        if winner["idx"] != i:
+                            os.unlink(part)
+
+            threads = [threading.Thread(target=_fetch, args=(i, c), daemon=True)
+                       for i, c in enumerate(cands)]
+            for th in threads:
+                th.start()
+            ev.wait(timeout=25)
+            win = winner["idx"]
+            if win is None:
+                stop.set()
+                raise ValueError(
+                    "所有下载源都失败（直连 + 镜像）。"
+                    "如果这台机器出网受限，用「上传镜像」把 .squashfs 传上来即可，"
+                    "或配置 runtime_mirrors / runtime_proxy_list 指向内网镜像。")
+            # 等赢家下完（期间汇报进度 ✓）
+            part = f"{tmp}.{win}"
+            while True:
+                alive = threads[win].is_alive()
+                with contextlib.suppress(OSError):
+                    _job_update(job, received=os.path.getsize(part),
+                                total=winner["total"] or 0)
+                if not alive:
+                    break
+                time.sleep(0.7)
+            stop.set()
+            os.replace(part, tmp)
+            for i, _ in enumerate(cands):
+                if i != win:
+                    with contextlib.suppress(OSError):
+                        os.unlink(f"{tmp}.{i}")
+            sys.stderr.write(f"[runtime-dl] winner: {cands[win][:70]}\n")
+            sys.stderr.flush()
+            total = int(winner["total"] or 0)
+            got = os.path.getsize(tmp)
+            if not os.path.exists(tmp):
+                raise ValueError("下载未完成：工具没有产出文件（网络不可达？）")
+            got = os.path.getsize(tmp)
+            if total and got != total:
+                raise ValueError(f"下载不完整：{got} / {total} 字节")
+            digest = hashlib.sha256()
+            with open(tmp, "rb") as fh:
+                for block in iter(lambda: fh.read(1 << 20), b""):
+                    digest.update(block)
+            got_sha = digest.hexdigest()
+            real, action, reason = decide_runtime_id(rid, got_sha)
+            if action == "same":
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                _job_update(job, state="done", note=reason, id_real=real)
+                return
+            if real != rid:
+                sys.stderr.write(f"[runtime-dl] id: {rid} -> {real}（内容指纹）\n")
+                rid = real
+                img = runtime_image(rid)
+                tmp = img + ".part"
+                with contextlib.suppress(OSError):
+                    os.replace(f"{runtime_image(str(row.get('id') or rid))}.part", tmp)
+            if want and got_sha != want:
+                raise ValueError(f"sha256 mismatch (want {want[:12]}… got {digest.hexdigest()[:12]}…)")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, img)
+            _job_update(job, state="installing", received=got)
+            # 只下载不挂载 → 列表会显示 missing ✗（用户看到的正是这个）
+            # 挂载是只读、秒级、不激活 ✓ 所以这里顺手做掉 ✓
+            with contextlib.suppress(Exception):
+                runtime_materialize(rid, quiet=True)
+            if _DL_JOBS.get(job, {}).get("activate") and not runtime_activate(rid):
+                raise ValueError("激活失败（镜像损坏或缺 pty.node）")
+            _job_update(job, state="done", error="", received=got)
+            sys.stderr.write(f"[runtime-dl] done {job} {rid}\n")
+            sys.stderr.flush()
+        except Exception as exc:  # noqa: BLE001
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            _job_update(job, state="error", error=str(exc)[:300])
+            sys.stderr.write(f"[runtime-dl] error {job} {rid}: {exc}\n")
+            sys.stderr.flush()
+
+    def _guarded():
+        try:
+            worker()
+        except Exception as exc:  # noqa: BLE001
+            _job_update(job, state="error", error=f"{type(exc).__name__}: {exc}"[:300])
+            sys.stderr.write(f"[runtime-dl] worker crashed: {type(exc).__name__}: {exc}\n")
+            sys.stderr.flush()
+
+    threading.Thread(target=_guarded, daemon=True).start()
+    return job
+
+
+def runtime_download_status(job: str) -> dict:
+    doc = _jobs_load()
+    row = dict(doc.get(job) or {})
+    with _DL_LOCK:
+        live = _DL_JOBS.get(job)
+    if row and row.get("state") in ("starting", "downloading", "installing") and live is None:
+        row["state"] = "interrupted"
+        row["error"] = "后端重启或下载线程已结束（未完成）"
+    if live:
+        row.update({k: v for k, v in live.items() if v not in ("", None)})
+    return row
+
+
+def runtime_downloads_clear() -> int:
+    """删掉已结束（done/error/interrupted）的任务记录；进行中的保留。"""
+    doc = _jobs_load()
+    keep = {}
+    for job, row in doc.items():
+        st = runtime_download_status(job).get("state")
+        if st in ("starting", "downloading", "installing"):
+            keep[job] = row
+    removed = len(doc) - len(keep)
+    _jobs_save(keep)
+    return removed
+
+
+def runtime_downloads(limit: int = 20) -> list:
+    # 已结束（done/error/interrupted）且超过 3 小时的记录自动清掉 ✓
+    # 否则这张表会越积越多历史（截图里就是这样 ✗）
+    now = int(time.time())
+    doc = _jobs_load()
+    kept = {}
+    for job, row in doc.items():
+        st = runtime_download_status(job).get("state")
+        if st in ("starting", "downloading", "installing"):
+            kept[job] = row
+            continue
+        age = now - int(row.get("updated_at") or 0)
+        if age < 3 * 3600:
+            kept[job] = row
+    if len(kept) != len(doc):
+        _jobs_save(kept)
+    doc = _jobs_load()
+    rows = [runtime_download_status(job) for job in doc]
+    rows.sort(key=lambda r: int(r.get("updated_at") or 0), reverse=True)
+    return rows[:limit]
+
+
 def cmd_runtime(args):
-    """DSH runtime helpers (shared rootfs; the host needs nothing)."""
+    """运行时管理（镜像优先；配置存绝对路径，不用软链）。"""
     ensure_root()
     action = getattr(args, "action", "status") or "status"
     rootfs = runtime_rootfs()
-    if not rootfs or not os.path.isdir(rootfs):
-        die(f"runtime rootfs not found: {rootfs!r}")
-    pty_dir = node_pty_dir(rootfs)
-    if action == "status":
-        glibc = node_pty_is_glibc(rootfs)
-        built = os.path.exists(f"{pty_dir}/build/Release/pty.node")
-        info(f"  rootfs      {rootfs}")
-        info(f"  node-pty    {pty_dir}")
-        info(f"  prebuilt    {'yes' if os.path.exists(pty_dir + '/prebuilds/linux-x64/pty.node') else 'no'}"
-             f"  musl-build {'yes' if built else 'no'}")
-        info(f"  verdict     {'glibc build (terminals will segfault)' if glibc else 'ok'}")
-        return 0 if not glibc else 1
+    pty_dir = node_pty_dir(rootfs) if rootfs else ""
 
-    if action == "install":
-        st = load_state()
-        want = str(getattr(args, "version", "") or "").strip() \
-            or str(st["config"].get("dsh_version") or VERSION)
-        info(f"installing @deepseek-ai/dsh@{want} into the shared runtime "
-             f"(this runs npm inside the gateway rootfs; takes a few minutes)")
-        install_dsh_runtime(st, want, force=True)
-        got = installed_dsh_version()
-        info(f"runtime now: @deepseek-ai/dsh@{got or '?'}")
-        if got and got != want:
-            info("WARNING: the installed version does not match the requested one")
-            return 1
-        # A fresh node_modules tree ships node-pty's glibc prebuild again; terminals
-        # segfault on musl until it is rebuilt.
-        if node_pty_is_glibc(rootfs):
-            info("node-pty is a glibc build again -> rebuilding for musl")
-            return cmd_runtime(type("A", (), {"action": "fix-pty", "version": ""})())
-        info("instances pick this up on their next restart: dsh-muctl instance restart <name>")
+    if action == "status":
+        cfg = load_config()
+        rid = runtime_current_id()
+        info(f"  configured  {rid or '(none — runtime not installed)'}")
+        if rid:
+            parsed = parse_runtime_id(rid)
+            man = runtime_manifest(rid)
+            info(f"  directory   {runtime_dir(rid)}")
+            info(f"  mode        {'mounted' if _is_mounted(runtime_dir(rid)) else 'extracted'}")
+            info(f"  dsh         {parsed.get('dsh', '?')}  variant={parsed.get('variant', '?')}"
+                 f"  rev={parsed.get('rev', 0)}")
+            if man:
+                info(f"  manifest    node={man.get('node_build', '?')}"
+                     f" node-pty={man.get('node_pty', '?')} source={man.get('source', '?')}")
+        info(f"  rootfs      {rootfs or '-'}")
+        if pty_dir:
+            info(f"  node-pty    {pty_dir}")
         return 0
 
-    if action != "fix-pty":
-        die(f"unknown runtime action: {action}")
+    if action == "list":
+        ids = runtime_ids()
+        cur = runtime_current_id()
+        if not ids:
+            info("no runtime installed")
+        for rid in ids:
+            img = runtime_image(rid)
+            size = (os.path.getsize(img) // 1048576) if os.path.exists(img) else 0
+            mode = "mounted" if _is_mounted(runtime_dir(rid)) else (
+                "extracted" if runtime_ready(rid) else "missing")
+            man = runtime_manifest(rid)
+            info(f"{'*' if rid == cur else ' '} {rid:<26} {size:>4} MB  {mode:<10} "
+                 f"dsh={parse_runtime_id(rid).get('dsh', '?')} variant={man.get('variant', 'plain')}")
+        return 0
 
-    info("installing build tools inside the runtime rootfs (host untouched)")
-    with contextlib.suppress(OSError):
-        shutil.copyfile("/etc/resolv.conf", f"{rootfs}/etc/resolv.conf")
-    rc = run(["chroot", rootfs, "/bin/sh", "-c",
-              "apk add --no-cache python3 make g++ linux-headers"],
-             check=False, capture=True)
-    if rc.returncode != 0:
-        info("WARNING: could not install build tools (offline?); terminals stay broken")
-        info(((rc.stdout or "") + (rc.stderr or ""))[-300:])
-        return 1
-    info("rebuilding node-pty from source (musl)")
-    rc = run(["chroot", rootfs, "/bin/sh", "-c",
-              "cd /usr/local/lib/node_modules/@deepseek-ai/dsh && "
-              "npm rebuild node-pty --build-from-source 2>&1 | tail -3"],
-             check=False, capture=True)
-    print((rc.stdout or "") + (rc.stderr or ""))
-    if node_pty_is_glibc(rootfs):
-        info("WARNING: still a glibc build; the rebuild did not take effect")
-        return 1
-    info("node-pty rebuilt for musl; restart instances so they load the new module")
-    return 0
+    if action == "channels":
+        doc = runtime_channels()
+        if not doc:
+            die("could not read channels.json (set runtime_channel_base in config)")
+        d = doc.get("default") or {}
+        info(f"default : {d.get('id') or d.get('dsh') or '-'}")
+        for row in doc.get("alpha") or []:
+            info(f"alpha   : {row.get('id') or row.get('dsh')}")
+        info(f"installed: {', '.join(runtime_ids()) or '-'}")
+        return 0
+
+    if action == "install":
+        want = str(getattr(args, "version", "") or "").strip()
+        if want:
+            row = {"id": want, "dsh": parse_runtime_id(want).get("dsh", want), "url": "", "sha256": ""}
+            die(f"installing by explicit id is not supported yet; "
+                f"put the image in {RUNTIMES}/dsh-{want}.squashfs and run `runtime use {want}`")
+        doc = runtime_channels()
+        if not doc:
+            die("channels.json is unreachable and no version was given; "
+                "set runtime_channel_base or pass --from a local image")
+        row = doc.get("default") or {}
+        if not (row.get("id") or row.get("dsh")):
+            die("channels.json has no default entry")
+        info(f"using the default channel: {row.get('id') or row.get('dsh')}")
+        return 0 if runtime_install_image(row) else 1
+
+    if action == "use":
+        want = str(getattr(args, "version", "") or "").strip()
+        if not want:
+            die("usage: dsh-muctl runtime use <id>")
+        if want in ("builtin", "none", "-"):
+            st = load_state()
+            st["config"].pop("dsh_runtime_dir", None)
+            st["config"].pop("dsh_runtime_id", None)
+            save_config(st["config"])
+            info("runtime: cleared (no image configured; instances need one to start)")
+            return 0
+        if want not in runtime_ids():
+            die(f"runtime {want} is not installed (have: {', '.join(runtime_ids()) or 'none'})")
+        try:
+            res = set_default_runtime(want)
+        except ValueError as exc:
+            die(str(exc))
+        info(f"default runtime: {want}")
+        if res["restarted"]:
+            info(f"restarted followers: {', '.join(res['restarted'])}")
+        if res["failed"]:
+            warn(f"these followers did not come back: {', '.join(res['failed'])}")
+        if not res["restarted"] and not res["failed"]:
+            info("no running instance follows the default; nothing to restart")
+        return 0
+
+    if action == "ensure-mounted":
+        runtime_ensure_mounted(quiet=True)
+        return 0
+
+    if action == "prune":
+        keep = int(str(getattr(args, "version", "") or "2") or 2)
+        cur = runtime_default_id()
+        ids = [i for i in runtime_ids() if i != cur]
+        victims = ids[:max(0, len(ids) - max(0, keep - 1))]
+        removed = 0
+        for rid in victims:
+            # 同一套删除规则（与 admin 一致）：
+            #  默认 → 不删；被运行中实例使用 → 不删；仅被停止实例使用 → 删并回落默认
+            holders = [n for n, i in load_state()["instances"].items()
+                       if str(i.get("runtime") or "") == rid]
+            running = [n for n in holders
+                       if str((load_state()["instances"][n] or {}).get("state") or "") == "running"]
+            if running:
+                warn(f"skip {rid}: in use by running instance(s) {', '.join(running)}")
+                continue
+            if _is_mounted(runtime_dir(rid)):
+                run(["umount", runtime_dir(rid)], check=False, capture=True)
+            shutil.rmtree(runtime_dir(rid), ignore_errors=True)
+            with contextlib.suppress(OSError):
+                os.unlink(runtime_image(rid))
+                os.unlink(f"{RUNTIMES}/dsh-{rid}.manifest.json")
+            if holders:
+                st_after = load_state()
+                for n in holders:
+                    st_after["instances"][n].pop("runtime", None)
+                save_state(st_after)
+                sync_all(load_state())
+                info(f"  {', '.join(holders)} moved back to the default runtime")
+            info(f"removed {rid}")
+            removed += 1
+        if not removed:
+            info("nothing to prune")
+        return 0
+
+    if action == "migrate-ids":
+        # 这条命令改 id 会动到镜像/挂载/实例 conf ✗ 曾经把 8 个实例弄挂 15 分钟 ✗
+        # → 默认只 dry-run，必须显式 --yes 才真的执行 ✓
+        if not getattr(args, "yes", False):
+            res = runtime_migrate_ids(dry_run=True)
+            for old_id, new_id in (res.get("plan") or {}).items():
+                info(f"  {old_id} -> {new_id}")
+            if res.get("plan"):
+                warn("这只是预演 ✓ 真要执行请加 --yes（会停/重启受影响的实例）")
+            else:
+                info("没有需要迁移的 id ✓")
+            return 0
+        res = runtime_migrate_ids(dry_run=False)
+        if res.get("dry_run"):
+            for old, new in (res.get("plan") or {}).items():
+                info(f"  {old} -> {new}")
+        else:
+            for old, new in (res.get("plan") or {}).items():
+                info(f"  {old} -> {new}")
+            if res.get("restarted"):
+                info(f"restarted: {', '.join(res['restarted'])}")
+            if res.get("failed"):
+                warn(f"did not come back: {', '.join(res['failed'])}")
+        return 0
+
+    if action == "verify":
+        rid = str(getattr(args, "version", "") or runtime_current_id() or "").strip()
+        if not rid:
+            die("没有可校验的运行时（未配置，也没给 id）")
+        d = runtime_dir(rid)
+        man = runtime_manifest(rid)
+        parsed = parse_runtime_id(rid) or {}
+        problems = []
+        if not runtime_ready(rid):
+            problems.append("目录里没有 node_modules/@deepseek-ai/dsh")
+        if not os.path.exists(f"{d}/node_modules/node-pty/build/Release/pty.node"):
+            problems.append("缺 node-pty 的 pty.node（终端会坏）")
+        if not man:
+            problems.append("缺 MANIFEST.json")
+        if man and parsed and man.get("dsh") and man["dsh"] != parsed["dsh"]:
+            problems.append(f"MANIFEST.dsh={man['dsh']} 与 id 解析出的 {parsed['dsh']} 不一致")
+        mode = "mounted" if _is_mounted(d) else ("extracted" if runtime_ready(rid) else "missing")
+        info(f"  runtime     {rid}")
+        info(f"  directory   {d}")
+        info(f"  mode        {mode}")
+        if man:
+            info(f"  manifest    dsh={man.get('dsh', '?')} variant={man.get('variant', '?')} "
+                 f"rev={man.get('rev', 0)} node={man.get('node_build', '?')} "
+                 f"node-pty={man.get('node_pty', '?')} source={man.get('source', '?')}")
+        if problems:
+            for pr in problems:
+                warn(f"  issue       {pr}")
+            return 1
+        info("  verdict     ok")
+        return 0
+
+    if action == "pack":
+        rid = str(getattr(args, "version", "") or "").strip()
+        if not rid or not parse_runtime_id(rid):
+            die("usage: dsh-muctl runtime pack <dsh[-variant][-rN]> [--from <dir>] [--keep-dir]")
+        src = str(getattr(args, "from_dir", "") or "").strip()
+        if not src:
+            # 默认：当前配置的目录；再否则内置树
+            rid_cur = runtime_current_id()
+            src = runtime_dir(rid_cur) if rid_cur else (
+                dsh_runtime_dir(load_config()))
+        if not os.path.exists(f"{src}/node_modules/@deepseek-ai/dsh/package.json"):
+            die(f"{src} does not look like a runtime tree")
+        pty = f"{src}/node_modules/node-pty/build/Release/pty.node"
+        if not os.path.exists(pty):
+            die(f"{src}/node_modules/node-pty/build/Release/pty.node is missing")
+        man = {
+            "schema": 1,
+            "id": rid,
+            "dsh": parse_runtime_id(rid)["dsh"],
+            "variant": parse_runtime_id(rid)["variant"],
+            "rev": parse_runtime_id(rid)["rev"],
+            "arch": "x86_64",
+            "libc": "musl",
+            "source": "pack",
+            "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "node_build": (installed_node_version() or "?"),
+            "node_pty": node_pty_version(src),
+            "pty_sha256": hashlib.sha256(open(pty, "rb").read()).hexdigest(),
+            "provides": [],
+        }
+        os.makedirs(RUNTIMES, exist_ok=True)
+        tmpman = f"{RUNTIMES}/dsh-{rid}.manifest.json"
+        atomic_write(tmpman, json.dumps(man, indent=2, sort_keys=True) + "\n", mode=0o644)
+        img = runtime_image(rid)
+        info(f"packing {src} -> {img} (zstd)")
+        res = run(["mksquashfs", src, img, "-comp", "zstd", "-noappend", "-quiet"],
+                  check=False, capture=True)
+        if res.returncode != 0:
+            warn(f"mksquashfs failed: {(res.stderr or res.stdout or '')[-300:]}")
+            return 1
+        info(f"image: {os.path.getsize(img) // 1048576} MB")
+        if not getattr(args, "keep_dir", False) and os.path.abspath(src) == os.path.abspath(runtime_dir(rid)):
+            info("(source directory kept; it is the mount point)")
+        if not runtime_activate(rid):
+            return 1
+        sync_all(load_state())
+        return 0
+
+    # 其它（fix-pty / install 带版本）走原有逻辑
+    if action == "fix-pty":
+        return _runtime_fix_pty(rootfs)
+    die(f"unknown runtime action: {action}")
 
 
 def cmd_ext(args):
@@ -7975,25 +9322,29 @@ def change_instance_port(st: dict, name: str, want: int | None, restart: bool = 
     if dry_run:
         return {"instance": name, "from": current, "to": want, "changed": True,
                 "detail": "dry run"}
+    # 产品规则（与"改运行时"一致）：
+    #   实例在运行 → 改完端口**必须重启**才生效 ✓
+    #   实例已停止 → 只改配置，**不启动** ✓（何时拉起由运维决定 ✓）
+    was_running = bool(service_started(name) or port_in_use(current))
     inst["port"] = want
     inst["upstream"] = inst.get("upstream") or {}
     save_state(st)
     sync_all(st)
-    restart_required = port_in_use(current) or service_started(name)
     listening = False
-    if restart and restart_required:
+    restarted = False
+    if was_running:
         run(["/sbin/rc-service", f"dsh-mu-{name}", "restart"], check=False)
         listening = wait_for_port(want)
-    if restart or listening:
+        restarted = True
         fresh = load_state()
-        fresh["instances"][name]["state"] = "running" if (listening or restart_required) else "stopped"
+        fresh["instances"][name]["state"] = "running"
         save_state(fresh)
         render_gateway(fresh)
     return {"instance": name, "from": current, "to": want, "changed": True,
-            "restarted": bool(restart), "listening": listening,
-            "previous_port_listening": restart_required,
-            "detail": ("restarted and listening on the new port" if listening
-                       else ("restarted on the new port" if restart else "restart to apply"))}
+            "was_running": was_running, "restarted": restarted, "started": False,
+            "listening": listening,
+            "detail": ("was running: restarted on the new port" if restarted
+                       else "was stopped: port saved, instance left stopped")}
 
 
 def cmd_instance_port(args):
@@ -8096,38 +9447,63 @@ def gateway_started_at() -> float:
 
 
 def admin_backend_pid() -> int:
-    """PID of the running admin backend (0 when it is not running)."""
-    # Scan /proc and require an *exact* argv element: pgrep -f matches its own shell
-    # command line, which produced a bogus pid on a dev box.
+    """PID of the running admin backend (0 when it is not running).
+
+    Supervisor 进程（supervise-daemon）的 argv 里也带这个路径 ✗
+    取**启动时间最新**的那个 ✓ 否则升级后会把 supervisor 的老启动时间当成后端启动时间 ✗
+    """
     target = "/usr/local/sbin/dsh-mud"
+    best_pid, best_start = 0, 0.0
     for entry in os.listdir("/proc"):
         if not entry.isdigit() or int(entry) == os.getpid():
             continue
         try:
             with open(f"/proc/{entry}/cmdline", "rb") as fh:
-                raw = fh.read()
-        except OSError:
+                argv = [x.decode("utf-8", "replace") for x in fh.read().split(b"\0") if x]
+            if target not in argv:
+                continue
+            with open(f"/proc/{entry}/stat") as fh:
+                start_ticks = int(fh.read().split()[21])
+            with open("/proc/stat") as fh:
+                btime = next(int(line.split()[1]) for line in fh if line.startswith("btime"))
+            started = btime + start_ticks / float(os.sysconf("SC_CLK_TCK"))
+            if started > best_start:
+                best_pid, best_start = int(entry), started
+        except (OSError, ValueError, StopIteration, IndexError):
             continue
-        args = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
-        if target in args:
-            return int(entry)
-    return 0
+    return best_pid
 
 
 def admin_backend_started_at() -> float:
+    """启动时间（秒）。我重写 admin_backend_pid 时把这段删掉了 ✗ 现在补回 ✓"""
     pid = admin_backend_pid()
     if not pid:
         return 0.0
     try:
         with open(f"/proc/{pid}/stat") as fh:
             fields = fh.read().split()
-        # starttime is in clock ticks since boot; combine with /proc/stat btime
         start_ticks = int(fields[21])
         with open("/proc/stat") as fh:
             btime = next(int(line.split()[1]) for line in fh if line.startswith("btime"))
         return btime + start_ticks / float(os.sysconf("SC_CLK_TCK"))
     except (OSError, ValueError, StopIteration, IndexError):
         return 0.0
+
+
+ADMIN_STAMP = "/run/dsh-mu/admin.stamp"
+
+
+def admin_stamp() -> float:
+    with contextlib.suppress(OSError, ValueError):
+        return float((read_text(ADMIN_STAMP) or "0").strip() or 0)
+    return 0.0
+
+
+def mark_admin_restarted() -> None:
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(ADMIN_STAMP), exist_ok=True)
+        with open(ADMIN_STAMP, "w") as fh:
+            fh.write(str(time.time()))
 
 
 def stale_admin_code() -> bool:
@@ -8137,13 +9513,14 @@ def stale_admin_code() -> bool:
     code in memory -- that is why a brand-new action (or a fixed downloader) can still
     behave like the previous version until the service is restarted.
     """
-    started = admin_backend_started_at()
-    if not started:
-        return False
     try:
-        return os.stat(__file__).st_mtime > started + 1
+        mtime = os.stat(__file__).st_mtime
     except OSError:
         return False
+    started = max(admin_stamp(), admin_backend_started_at() or 0.0)
+    if not started:
+        return False
+    return mtime > started + 1
 
 
 # ------------------------------------------------------------ dsh native modules
@@ -8180,6 +9557,10 @@ def ensure_dsh_native_modules(quiet: bool = True) -> list[str]:
         target = os.path.join(rt, PTY_REL)
         if os.path.exists(target):
             continue
+        # 运行时是**只读 squashfs 挂载** ✗ 写不进去（写会报 Read-only file system）
+        # 而且镜像里本来就带 pty ✓ 这里直接跳过，别制造假错误 ✓
+        if not os.access(os.path.dirname(target) or ".", os.W_OK):
+            continue
         try:
             os.makedirs(os.path.dirname(target), exist_ok=True)
             shutil.copy2(VENDOR_PTY, target)
@@ -8190,6 +9571,22 @@ def ensure_dsh_native_modules(quiet: bool = True) -> list[str]:
         except OSError as exc:
             warn(f"could not restore {target}: {exc}")
     return fixed
+
+
+def gateway_needs_restart() -> bool:
+    """网关 lua/片段比运行中的新吗？（升级后未重启就会 stale ✓）"""
+    try:
+        dest = f"{gateway_paths().get('rootfs', '')}/usr/local/lib/dsh-mu/lua"
+        src = f"{LIB}/lua"
+        if not os.path.isdir(dest) or not os.path.isdir(src):
+            return False
+        newest_src = max((os.path.getmtime(os.path.join(src, f)) for f in os.listdir(src)
+                          if f.endswith(".lua")), default=0)
+        oldest_dst = min((os.path.getmtime(os.path.join(dest, f)) for f in os.listdir(dest)
+                          if f.endswith(".lua")), default=0)
+        return newest_src > oldest_dst + 1
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def restart_admin_if_stale(quiet: bool = False) -> bool:
@@ -8376,6 +9773,10 @@ def backup_groups() -> dict[str, list[str]]:
         "providers": [f"{PROVIDERS_DIR}", f"{ETC}/providers.json"],
         "plans": [f"{PLANS_DIR}"],
         "tls": [f"{ETC}/tls"],
+        # 用量与 token 库（SQLite）。以前没纳入备份 ✗ → 恢复后用量记录全丢 ✓
+        # 备份时用 SQLite 的在线备份 API 生成一致快照（见 create_backup ✓），
+        # 直接 tar 一个正在写的 WAL 库可能拿到半写状态 ✗
+        "usage": [STATE_DB],
     }
 
 
@@ -8458,10 +9859,28 @@ def create_backup(out: str, with_instances: bool = False,
         # BusyBox tar (Alpine) only honours one -C. Directories are symlinked and
         # archived with -h, so instance homes are not copied twice.
         tops = {BACKUP_MANIFEST}
+        snapshot = None
+        if STATE_DB.lstrip("/") in [m.lstrip("/") for m in members]:
+            # 用 SQLite backup API 做一致快照 ✓ 避免 WAL 半写 ✗
+            try:
+                import sqlite3 as _sq
+                snap = f"{staging}/.state-snapshot.db"
+                os.makedirs(os.path.dirname(snap), exist_ok=True)
+                src = _sq.connect(f"file:{STATE_DB}?mode=ro", uri=True)
+                dst = _sq.connect(snap)
+                with dst:
+                    src.backup(dst)
+                src.close(); dst.close()
+                snapshot = snap
+            except Exception as exc:  # noqa: BLE001 - 退回直接拷贝
+                warn(f"usage db snapshot failed ({exc}); copying the file as-is")
+                snapshot = None
         for member in members:
             src, dst = f"/{member}", f"{staging}/{member}"
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            if os.path.isdir(src) and not os.path.islink(src):
+            if snapshot and member.lstrip("/") == STATE_DB.lstrip("/"):
+                shutil.copy2(snapshot, dst)
+            elif os.path.isdir(src) and not os.path.islink(src):
                 os.symlink(src, dst)
             else:
                 shutil.copy2(src, dst)
@@ -11068,8 +12487,13 @@ def write_profile_llm_block(st: dict, name: str, block: str) -> None:
              f"the file was left untouched")
         return
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    atomic_write(path, text, mode=0o600)
-    info(f"profile patch: {name}: wrote {len(text)} chars")
+    # 内容相同就不写 ✗（每次 sync 都重写会把 mtime 顶上去 ✗
+    # doctor 用 mtime 判"实例读的是不是当前 patch" → 于是刚建完实例就报 stale ✗）
+    if (read_text(path) or "") == text:
+        info(f"profile patch: {name}: unchanged ({len(text)} chars)")
+    else:
+        atomic_write(path, text, mode=0o600)
+        info(f"profile patch: {name}: wrote {len(text)} chars")
     inst = st["instances"].get(name) or {}
     with contextlib.suppress(OSError):
         os.chown(path, int(inst.get("uid", 0)), int(inst.get("gid", inst.get("uid", 0))))
@@ -12577,8 +14001,16 @@ def doctor_checks(st: dict) -> list[dict]:
             f"{len(downloaded)} offline package(s) in {plugin_cache_dir()}"
             + (f"; pnpm store {files} file(s)" if files else ""))
     elif (st.get("plugin_policy") or {}):
-        add("plugin policy", DOCTOR_WARN, "policies exist but no offline package was "
-            "downloaded", "re-add each package from the admin page")
+        # 只有"用户真的启用了插件、但缓存里没有离线包"才算问题 ✗
+        # 全新安装里这条会凭空 WARN ✗（提示噪音 ✓ 已改）
+        pols = st.get("plugin_policy") or {}
+        active = [n for n, row in pols.items() if row.get("preinstall") or row.get("push")]
+        if active:
+            add("plugin policy", DOCTOR_WARN,
+                f"{len(active)} 个插件策略已启用但缓存里没有离线包",
+                "在 admin 插件页重新添加一次（会下载离线包）")
+        else:
+            add("plugin policy", DOCTOR_PASS, "未启用插件（无预装/推送策略）")
 
     # --------------------------------------------------------------- plugin policy
     rows = plugin_policy(st)
@@ -12614,9 +14046,9 @@ def doctor_checks(st: dict) -> list[dict]:
     # ------------------------------------------------------------- web search plan
     sp = search_plan(st)
     if sp is None:
-        add("web search plan", DOCTOR_WARN,
-            "no search-capable plan (needs api.deepseek.com + anthropic-messages)",
-            "add a DeepSeek plan and mark it hidden if it is platform-owned")
+        # 全新安装只有一个 keyless 计划 ✓ 没有搜索能力是**正常默认** ✓ 不该 WARN ✗
+        add("web search plan", DOCTOR_PASS,
+            "未配置搜索能力（要用 web_search 时再加一个 api.deepseek.com 的 plan）")
     else:
         add("web search plan", DOCTOR_PASS,
             f"{sp.get('name') or sp['id']} (order={sp.get('order')}"
@@ -12625,8 +14057,13 @@ def doctor_checks(st: dict) -> list[dict]:
     # ------------------------------------------------------------------- egress
     policy = str(cfg.get("instance_egress") or "no-intranet")
     enforced = [n for n in st["instances"] if instance_egress(st, n)[0] != "open"]
-    if policy == "open" and not enforced:
-        add("egress policy", DOCTOR_PASS, "open: instances may reach the intranet")
+    ext_enforced = bool(render_ext_egress(st))
+    if (policy == "open" and not enforced) or (not enforced and not ext_enforced):
+        # 没有任何实例/扩展需要限制 → 平台本来就不建表 ✓
+        # 以前这里会 WARN "no nft table is loaded" ✗ 全新安装必现的假告警 ✗
+        add("egress policy", DOCTOR_PASS,
+            "open: instances may reach the intranet" if policy == "open"
+            else f"policy={policy}，暂无需要限制的实例（不建表）")
     elif not nft_available():
         add("egress nft", DOCTOR_WARN, "nft is not installed, the policy is not enforced",
             "apk add nftables && dsh-muctl sync")
@@ -12702,12 +14139,44 @@ def doctor_checks(st: dict) -> list[dict]:
                     "patch not applied (stock UI: every row has an edit button)",
                     "dsh-muctl sync   # retries; if the bundle changed, stock behaviour stays")
 
+    # ------------------------------------------------- runtime image (squashfs)
+    try:
+        rid = runtime_current_id()
+        if not rid:
+            add("runtime", DOCTOR_WARN, "没有配置运行时（实例起不来）",
+                "dsh-muctl runtime use <id>，或从 admin「运行时」页安装/上传")
+        else:
+            d = runtime_dir(rid)
+            parsed = parse_runtime_id(rid) or {}
+            mode = "mounted" if _is_mounted(d) else ("extracted" if runtime_ready(rid) else "missing")
+            pty = f"{d}/node_modules/node-pty/build/Release/pty.node"
+            if mode == "missing":
+                add("runtime", DOCTOR_FAIL, f"{rid}: 目录不可用（{d}）",
+                    "dsh-muctl runtime install 或 runtime use <其它版本>")
+            elif not os.path.exists(pty):
+                add("runtime", DOCTOR_WARN, f"{rid}: 缺 pty.node（终端会坏）",
+                    "把镜像重打一次，或从别的运行时拷 pty.node")
+            else:
+                add("runtime", DOCTOR_PASS,
+                    f"{rid} ({mode}) dsh={parsed.get('dsh', '?')} variant={parsed.get('variant', 'plain')}")
+    except Exception as exc:  # noqa: BLE001
+        add("runtime", DOCTOR_WARN, f"检查失败：{exc}"[:120])
+
     # ------------------------------------------------- dsh native modules (pty)
     try:
+        # dsh_runtime_dirs() 返回的是「dsh 包目录」✓ PTY_REL 是相对它算的 ✓
+        # 之前的误报来自 gateway rootfs 里那份旧 npm 树 ✗ 已删除 ✓ 所以这里回到原始写法
+        # （我一度改成扫 node_modules ✗ 路径少了一层，反而全报缺 ✗）
+        # dsh_runtime_dirs() 给的是「dsh 包目录」(.../node_modules/@deepseek-ai/dsh) ✓
+        # 而 pty.node 在**运行时根**的 node_modules 下 (.../node_modules/node-pty/...) ✓
+        # 旧代码直接 join(rt, PTY_REL) → 去 dsh/node_modules 里找 ✗ 永远找不到 ✗ 一直误报 ✗
         rts = dsh_runtime_dirs()
-        missing = [rt for rt in rts if not os.path.exists(os.path.join(rt, PTY_REL))]
+        def _pty_of(dsh_dir: str) -> str:
+            nm = os.path.dirname(os.path.dirname(dsh_dir))   # .../node_modules
+            return os.path.join(nm, "node-pty", "build", "Release", "pty.node")
+        missing = [rt for rt in rts if not os.path.exists(_pty_of(rt))]
         if not rts:
-            add("dsh native modules", DOCTOR_PASS, "没有实例配置，跳过")
+            add("dsh native modules", DOCTOR_PASS, "没有可用的运行时，跳过")
         elif missing:
             add("dsh native modules", DOCTOR_WARN,
                 f"{len(missing)} 个运行时缺 node-pty 原生模块（终端会报 pty.node 找不到）",
@@ -12938,8 +14407,9 @@ def doctor_checks(st: dict) -> list[dict]:
     if os.path.exists(f"{runtime}/package.json"):
         add("shared dsh runtime", DOCTOR_PASS, f"{runtime}")
     else:
-        add("shared dsh runtime", DOCTOR_FAIL, f"missing: {runtime}",
-            "dsh-muctl install (the gateway template carries node/npm)")
+        # 和上面的 'runtime' 检查是同一件事 ✗ 不要重复告警 ✓
+        add("shared dsh runtime", DOCTOR_PASS,
+            "未配置运行时（见上面的 runtime 项）")
 
     if relay_enabled(cfg):
         port = int(cfg.get("relay_listen", 8099) or 8099)
@@ -12993,8 +14463,10 @@ def doctor_checks(st: dict) -> list[dict]:
         add("global dsh runtime", DOCTOR_WARN, f"installed {current_dsh}, configured {want}",
             f"dsh-muctl install --force-dsh   # or: dsh-muctl config dsh_version {current_dsh}")
     else:
-        add("global dsh runtime", DOCTOR_FAIL, f"not installed in {runtime}",
-            "dsh-muctl install   # chroots into the gateway template and runs npm install -g")
+        # 现在的正路是"运行时镜像" ✓ 宿主全局没有 npm 包是**正常**的 ✗
+        # 也不可能通过 npm 补上（宿主没有 node ✗）→ 提示即可 ✓ 不参与"问题计数" ✓
+        add("global dsh runtime", DOCTOR_PASS,
+            f"宿主全局无 DSH（正常：jail 模式用运行时镜像；legacy 模式才需要 {runtime}）")
 
     for entry in ensure_system_admins(st):
         if entry.get("demoted"):
@@ -13178,28 +14650,44 @@ def doctor_checks(st: dict) -> list[dict]:
         add("cgroup delegation", DOCTOR_FAIL,
             f"/sys/fs/cgroup/dsh-mu subtree_control: {' '.join(delegated) or 'empty'}",
             "rc-service dsh-mu-cgroup start   # drains the container's cgroup root, then delegates")
-    leaf = "/sys/fs/cgroup/dsh-mu/_doctor"
-    try:
-        os.makedirs(leaf, exist_ok=True)
-        wrote = []
-        for name, value in (("memory.max", "268435456"), ("cpu.max", "100000 100000"), ("pids.max", "64")):
-            try:
-                with open(f"{leaf}/{name}", "w") as fh:
-                    fh.write(value)
-                wrote.append(name)
-            except OSError:
-                pass
-        add("cgroup limits writable", DOCTOR_PASS if len(wrote) == 3 else DOCTOR_FAIL,
-            ", ".join(wrote) + " writable" if wrote else "no limit files",
-            "" if len(wrote) == 3 else "delegation incomplete; instances cannot carry limits")
-        with open(f"{leaf}/cgroup.kill", "w") as fh:
-            fh.write("1")
-    except OSError as exc:
-        add("cgroup limits writable", DOCTOR_FAIL, str(exc),
+    # 探针路径**必须每次唯一** ✗ 以前固定叫 _doctor：
+    #   页面自动刷新 + 手动"重新自检"并发时，两个 doctor 抢同一个目录 ✗
+    #   → 一个刚建好另一个就删/写 → 出现间歇性
+    #     "No such file or directory: /sys/fs/cgroup/dsh-mu_doctor/cgroup.kill" ✗
+    #   用户看到红色 FAIL 却什么都没做错 ✗ → 这条不能容忍 ✓
+    leaf = f"/sys/fs/cgroup/dsh-mu/_doctor_{os.getpid()}_{int(time.time() * 1000)}"
+    probe_err = ""
+    wrote = []
+    for attempt in range(2):
+        try:
+            os.makedirs(leaf, exist_ok=True)
+            wrote = []
+            for name, value in (("memory.max", "268435456"), ("cpu.max", "100000 100000"),
+                                ("pids.max", "64")):
+                try:
+                    with open(f"{leaf}/{name}", "w") as fh:
+                        fh.write(value)
+                    wrote.append(name)
+                except OSError:
+                    pass
+            with open(f"{leaf}/cgroup.kill", "w") as fh:
+                fh.write("1")
+            probe_err = ""
+            break
+        except OSError as exc:
+            probe_err = str(exc)
+            with contextlib.suppress(OSError):
+                os.rmdir(leaf)
+            time.sleep(0.3)          # 并发/刚重建时重试一次 ✓
+    if probe_err:
+        add("cgroup limits writable", DOCTOR_FAIL, probe_err,
             "rc-service dsh-mu-cgroup start")
-    finally:
-        with contextlib.suppress(OSError):
-            os.rmdir(leaf)
+    else:
+        add("cgroup limits writable", DOCTOR_PASS if len(wrote) == 3 else DOCTOR_FAIL,
+            (", ".join(wrote) + " writable") if wrote else "no limit files",
+            "" if len(wrote) == 3 else "delegation incomplete; instances cannot carry limits")
+    with contextlib.suppress(OSError):
+        os.rmdir(leaf)
 
     # ------------------------------------------------------------ disk / ports
     free = _disk_free_mb(VAR if os.path.isdir(VAR) else "/")
@@ -13210,12 +14698,24 @@ def doctor_checks(st: dict) -> list[dict]:
             "" if free > 2048 else "free space before building the jail template")
     else:
         per_instance = template_mb + 40
-        if free < per_instance * 2:
-            add("disk space", DOCTOR_FAIL, f"{free} MB free, ~{per_instance} MB per instance",
-                "free space or trim ALPINE_TEMPLATE_PACKAGES")
+        try:
+            n_inst = max(1, len(load_state()["instances"]))
+        except Exception:  # noqa: BLE001
+            n_inst = 1
+        # 实例会各写各的 workspace/日志 ✓ 留出"每个实例一份 + 500MB 余量"才安全
+        # （旧阈值 free < per_instance*2 太松 ✗ 实测 .61 在 0 MB 空闲时才 FAIL ✗）
+        need = per_instance * n_inst + 500
+        if free < need:
+            add("disk space", DOCTOR_FAIL,
+                f"{free} MB free; 需要约 {need} MB（{n_inst} 实例 × {per_instance} + 500 余量）",
+                "扩容或清理：dsh-muctl runtime prune / 删除不用的运行时镜像 / 清 gateway rootfs/tmp")
+        elif free < int(need * 1.3):
+            add("disk space", DOCTOR_WARN,
+                f"{free} MB free; 接近下限（{need} MB）",
+                "留意运行时的镜像占用（每个约 95–100 MB）")
         else:
             add("disk space", DOCTOR_PASS,
-                f"{free} MB free (~{free // per_instance} instances at {per_instance} MB)")
+                f"{free} MB free（{n_inst} 实例约需 {need} MB）")
 
     listen = int(cfg.get("gateway_listen", 80))
     if port_in_use(listen):
@@ -13647,6 +15147,9 @@ def build_parser() -> argparse.ArgumentParser:
     a = isub.add_parser("list", help="list all instances (same as status without names)")
     a.add_argument("--json", action="store_true")
     a.set_defaults(func=cmd_instance_list)
+    a = isub.add_parser("runtime", help="pin one instance to a runtime image (default = follow the default)")
+    a.add_argument("names", nargs="+")
+    a.set_defaults(func=cmd_instance_runtime)
     a = isub.add_parser("del")
     a.add_argument("name")
     a.add_argument("--purge", action="store_true")
@@ -13771,9 +15274,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-restart", action="store_true", help="do not mention instance restarts")
     sp.set_defaults(func=cmd_upgrade)
     sp = sub.add_parser("runtime", help="DSH runtime helpers (shared rootfs)")
-    sp.add_argument("action", choices=["status", "fix-pty", "install"], nargs="?",
+    sp.add_argument("action",
+                    choices=["status", "fix-pty", "install", "use", "channels",
+                             "list", "prune", "ensure-mounted", "pack", "verify",
+                             "migrate-ids"],
+                    nargs="?",
                     default="status")
     sp.add_argument("version", nargs="?", help="with `install`: dsh version, e.g. 0.2.1-rc.5")
+    sp.add_argument("--dry-run", dest="dry_run", action="store_true",
+                    help="migrate-ids: 只打印计划（现在默认就是预演 ✓ 保留此参数兼容）")
+    sp.add_argument("--yes", dest="yes", action="store_true",
+                    help="migrate-ids: 真的执行（会停/重启受影响的实例 ✗ 危险）")
+    sp.add_argument("--from", dest="from_dir", default="",
+                    help="runtime pack: 源目录（默认当前运行时目录）")
+    sp.add_argument("--keep-dir", dest="keep_dir", action="store_true",
+                    help="runtime pack: 保留源目录（默认就保留，占位用于未来）")
     sp.set_defaults(func=cmd_runtime)
     sp = sub.add_parser("ext", help="extensions: jailed appliances shipped by plugin packages")
     sp.add_argument("action", choices=["list", "reload", "status", "start", "stop", "restart",

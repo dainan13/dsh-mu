@@ -119,6 +119,21 @@ if type(entry) ~= "table" then
 	return deny(403, "unknown relay token")
 end
 
+-- 上游（opencode.ai 系的中转站）要求请求头 x-opencode-session ✓ 否则直接 400：
+--   MissingSessionID: Request is missing x-opencode-session and cannot be routed efficiently
+-- 我们按"实例账号 + token"生成一个**稳定**的会话标识（不含 token 本体 ✓ 不是随机 ✗）
+-- 对所有路由都设置一次；不认这个头的上游会忽略它 ✓ 无副作用 ✓
+do
+	local ident = tostring(entry.user or "") .. "|" .. tostring(route or "") .. "|" .. tostring(entry.plan or "")
+	local sha = require "resty.sha256"
+	local h = sha:new()
+	h:update(ident)
+	local sess = ngx.encode_base64(h:final()):gsub("[^%w]", ""):sub(1, 32)
+	ngx.req.set_header("x-opencode-session", sess)
+	-- 有些中转站还认这两个（同源语义 ✓ 一起给上 ✓ 不需要就忽略 ✓）
+	ngx.req.set_header("x-session-id", sess)
+end
+
 -- ---------------------------------------------------------------- plugin market
 -- The platform feeds DSH's Discover tab from here: a format-1 index, npm
 -- packuments, and the tarballs themselves. No provider is involved and nothing is

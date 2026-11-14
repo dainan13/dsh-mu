@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import urllib.parse
 import concurrent.futures
+import hashlib
 import contextlib
 import shutil
 import os
@@ -194,6 +196,18 @@ def _serve_resp_unix(sock_path: str):
         except OSError:
             continue
         _thread_start(_resp_client, conn)
+
+
+def _warm_channels_cache(interval: float = 300.0) -> None:
+    """后台刷新 channels.json：接口永远只读缓存，不会卡在 DNS/网络上 ✓"""
+    first = True
+    while True:
+        try:
+            mu.runtime_channels(force=True, timeout=8.0 if first else 8.0)
+        except Exception:  # noqa: BLE001
+            pass
+        first = False
+        time.sleep(interval)
 
 
 def _warm_doctor_cache(interval: float = 60.0) -> None:
@@ -441,6 +455,10 @@ def instance_view(st: dict, name: str) -> dict:
         "live": mu.port_in_use(port),
         "activity": mu.instance_activity(name),
         "activity_age": mu.human_age(mu.instance_activity(name)["age_s"]),
+        "runtime": str(inst.get("runtime") or ""),
+        # 「重启后会用哪个」以实例 conf 为准 ✓（不是把默认现算一遍 ✗ —— 那会造成"看起来被切了"）
+        "runtime_next": mu.instance_conf_runtime(name) or mu.resolve_instance_runtime(name),
+        "runtime_running": mu.instance_running_runtime(name),
         "cookie": bool(inst.get("upstream", {}).get("cookie")),
         "uid": int(inst.get("uid", 0)),
         "limits": {k: inst.get(k) for k in ("cpu_max", "mem_max", "mem_high", "pids_max")},
@@ -712,6 +730,18 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("GET", re.compile(r"^/api/me/plans$"), "me_plans_get"),
     ("POST", re.compile(r"^/api/me/plans$"), "me_plan_action"),
     ("GET", re.compile(r"^/api/doctor-summary$"), "doctor_summary"),
+    ("GET", re.compile(r"^/api/runtimes$"), "runtime_list"),
+    ("POST", re.compile(r"^/api/runtimes/install$"), "runtime_install"),
+    ("POST", re.compile(r"^/api/runtimes/activate$"), "runtime_activate"),
+    ("POST", re.compile(r"^/api/runtimes/default$"), "runtime_set_default"),
+    ("POST", re.compile(r"^/api/runtimes/download$"), "runtime_download"),
+    ("GET", re.compile(r"^/api/runtimes/downloads$"), "runtime_downloads"),
+    ("DELETE", re.compile(r"^/api/runtimes/downloads$"), "runtime_downloads_clear"),
+    ("GET", re.compile(r"^/api/runtimes/download/([\w.-]+)$"), "runtime_download_status"),
+    ("POST", re.compile(r"^/api/runtimes/assign$"), "runtime_assign"),
+    ("GET", re.compile(r"^/api/runtimes/channels$"), "runtime_channels_refresh"),
+    ("POST", re.compile(r"^/api/runtimes/verify$"), "runtime_verify"),
+    ("DELETE", re.compile(r"^/api/runtimes/([\w.-]+)$"), "runtime_delete"),
     ("GET", re.compile(r"^/api/usage$"), "usage_view"),
     ("GET", re.compile(r"^/api/plans$"), "plan_list"),
     ("POST", re.compile(r"^/api/plans$"), "plan_add"),
@@ -767,6 +797,8 @@ MUTATING = {"auth_verify", "instance_ensure", "provider_save", "provider_delete"
             "default_chain_get", "default_chain_set",
             "plan_key", "user_default_clear", "user_defaults_clear_all",
             "egress_get", "egress_set", "plugin_policy_get", "plugin_policy_set",
+            "runtime_install", "runtime_activate", "runtime_delete",
+            "runtime_download", "runtime_set_default", "runtime_assign",
             "provider_catalog", "provider_import", "provider_import_all", "package_toggle",
             "ext_get", "ext_action",
             "me_plan_action", "me_restart",
@@ -941,6 +973,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_html(self, status: int, body: bytes):
+        # 把页面里 __PAGE_BUILD__ 换成本次构建的版本号：
+        # 这样"页面自身的 build"与"后端 API 的版本"是**两个独立来源** ✓
+        # 两者不一致 → 浏览器拿到的是缓存的旧 HTML ✓（比猜字符串可靠）
+        if b"__PAGE_BUILD__" in body:
+            body = body.replace(b"__PAGE_BUILD__", VERSION.encode())
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -994,7 +1031,77 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch("GET")
 
     def do_POST(self):
+        # 上传运行时镜像：99MB 级别，不能走 JSON（1MB 上限 ✗）→ 裸流写文件 ✓
+        try:
+            up_path = urllib.parse.urlparse(self.path).path.rstrip("/")
+        except Exception:  # noqa: BLE001
+            up_path = ""
+        if up_path == "/admin/api/runtimes/upload" or up_path == "/api/runtimes/upload":
+            self._runtime_upload()
+            return
         self._dispatch("POST")
+
+    def _runtime_upload(self) -> None:
+        """POST /api/runtimes/upload?id=<runtime-id>  body=原始 .squashfs 字节。"""
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        rid = str((q.get("id") or [""])[0]).strip()
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if not rid or not mu.parse_runtime_id(rid):
+            return self._send(400, {"error": "id 必须是 <dsh>[-<variant>][-r<rev>]"})
+        if length <= 0 or length > 2 * 1024 * 1024 * 1024:
+            return self._send(400, {"error": "Content-Length 不合法", "got": length})
+        os.makedirs(mu.RUNTIMES, exist_ok=True)
+        tmp = f"{mu.RUNTIMES}/.upload-{rid}.part"
+        digest = hashlib.sha256()
+        try:
+            left = length
+            with open(tmp, "wb") as fh:
+                while left > 0:
+                    chunk = self.rfile.read(min(1 << 20, left))
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+                    digest.update(chunk)
+                    left -= len(chunk)
+            if left != 0:
+                os.unlink(tmp)
+                return self._send(400, {"error": "上传中断（字节数不足）"})
+            with open(tmp, "rb") as fh:
+                magic = fh.read(4)
+            if magic != b"hsqs":
+                os.unlink(tmp)
+                return self._send(400, {"error": "不是 squashfs 镜像（magic 不符）"})
+            # 同名但内容不同 → 自动分叉成 -rN ✓（客户自己 build 的镜像也能装 ✓）
+            # 内容完全一致 → 直接丢掉临时文件，什么都不改 ✓
+            real, action, reason = mu.decide_runtime_id(rid, digest.hexdigest())
+            if action == "same":
+                os.unlink(tmp)
+                return self._send(200, {"ok": True, "id": rid, "bytes": length,
+                                        "sha256": digest.hexdigest(),
+                                        "same": True, "note": reason,
+                                        "hint": "已经安装过同一份镜像，未做改动"})
+            # 注意：action 可能是 "new" 而 real != rid（内容指纹命名）✗ 只处理 fork 会覆盖原文件 ✗
+            if real != rid:
+                rid = real
+            os.replace(tmp, mu.runtime_image(rid))
+            with contextlib.suppress(Exception):
+                mu.runtime_materialize(rid, quiet=True)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            return self._send(500, {"error": f"写文件失败：{exc}"})
+        audit("root", "runtime_upload", rid,
+              {"status": 200, "method": "POST", "path": "/api/runtimes/upload",
+               "body": {"id": rid, "bytes": length}}, self.client_address[0])
+        return self._send(200, {"ok": True, "id": rid, "bytes": length,
+                                "sha256": digest.hexdigest(),
+                                "id_real": rid,
+                                "hint": (f"已存为 {rid}（与已有同名版本内容不同，自动分叉）✓"
+                                         if rid != str((q.get("id") or [""])[0]).strip()
+                                         else f"点「激活」使用它，或 dsh-muctl runtime use {rid}")})
 
     def do_PATCH(self):
         self._dispatch("PATCH")
@@ -1860,6 +1967,239 @@ class Handler(BaseHTTPRequestHandler):
                          "warning": [c["check"] for c in checks if c["status"] == mu.DOCTOR_WARN],
                          "total": len(checks),
                          "cached_at": int(_DOCTOR_CACHE.get("at") or 0)}
+        if name == "runtime_list":
+            cfg = mu.load_config()
+            cur_id = mu.runtime_current_id()
+            # 有镜像但还没挂载的（手工拷进来的、或旧版本下载的）→ 懒物化一次 ✓
+            # 否则列表把它们显示成 missing ✗（镜像明明在 ✓ 只是没挂 ✓）
+            for _rid in mu.runtime_ids():
+                if not mu.runtime_ready(_rid) and os.path.exists(mu.runtime_image(_rid)):
+                    with contextlib.suppress(Exception):
+                        mu.runtime_materialize(_rid, quiet=True)
+            rows = []
+            for rid in mu.runtime_ids():
+                parsed = mu.parse_runtime_id(rid) or {}
+                man = mu.runtime_manifest(rid)
+                img = mu.runtime_image(rid)
+                d = mu.runtime_dir(rid)
+                rows.append({
+                    "id": rid,
+                    "dsh": parsed.get("dsh") or man.get("dsh") or "",
+                    "variant": man.get("variant") or parsed.get("variant") or "plain",
+                    "rev": man.get("rev", parsed.get("rev", 0)),
+                    "size_mb": (os.path.getsize(img) // 1048576) if os.path.exists(img) else 0,
+                    "mode": ("mounted" if mu._is_mounted(d) else
+                             ("extracted" if mu.runtime_ready(rid) else
+                              ("image" if os.path.exists(img) else "missing"))),
+                    "active": rid == cur_id,
+                    "fingerprint": mu.runtime_fingerprint(rid),
+                    "node_pty": man.get("node_pty") or "",
+                    "node_build": man.get("node_build") or "",
+                    "source": man.get("source") or "",
+                    "has_pty": os.path.exists(
+                        f"{d}/node_modules/node-pty/build/Release/pty.node"),
+                })
+            doc = mu.runtime_channels_cached() or {}
+            default_id = mu.runtime_default_id()
+            inst_rows = []
+            for n, i in sorted(mu.load_state()["instances"].items()):
+                inst_rows.append({
+                    "name": n,
+                    "running": bool(i.get("state") == "running"),
+                    "runtime": str(i.get("runtime") or ""),
+                    "effective": mu.resolve_instance_runtime(n),
+                })
+            # 「默认」是个**指针**，不是一次实际分配 ✗
+            # → used_by 只数"显式指定"的实例；跟随默认的单独用 default_followers 表示 ✓
+            explicit: dict[str, int] = {}
+            followers = 0
+            for row in inst_rows:
+                if row["runtime"]:
+                    explicit[row["runtime"]] = explicit.get(row["runtime"], 0) + 1
+                else:
+                    followers += 1
+            for r in rows:
+                r["is_default"] = (r["id"] == default_id)
+                r["default_followers"] = followers if r["is_default"] else 0
+                # 「使用中」= 显式指定 + 跟随默认（默认本身也是实打实在用的运行时 ✓）
+                r["used_by"] = explicit.get(r["id"], 0) + r["default_followers"]
+            return 200, {
+                "default": default_id,
+                "channels_state": mu.runtime_channels_state(),
+                "current": cur_id,
+                "runtime_dir": cfg.get("dsh_runtime_dir") or "",
+                "channel_base": mu.runtime_channel_base(),
+                "channel_default": (doc.get("default") or {}),
+                # alpha 是**指针**（对象）✓ 老版本可能是数组 → 统一取最新一条传给前端 ✓
+                "channel_alpha": (lambda a: (a[0] if a else {}) if isinstance(a, list) else (a or {}))(
+                    doc.get("alpha")),
+                "runtimes": rows,
+                "instances": inst_rows,
+                "runtime_ids": mu.runtime_ids(),
+            }
+        if name == "runtime_install":
+            want = str(body.get("id") or body.get("version") or "").strip()
+            chan = str(body.get("channel") or "").strip()
+            # 优先用前端（浏览器）从线上目录拿到的那一行：id + url + sha256 ✓
+            # 这样服务器不需要能出网 ✓ 也不需要服务端缓存通道 ✓
+            row = None
+            if body.get("url"):
+                row = {"id": want or str(body.get("dsh") or ""),
+                       "dsh": str(body.get("dsh") or want),
+                       "rev": int(body.get("rev") or 0),
+                       "url": str(body.get("url")),
+                       "sha256": str(body.get("sha256") or "")}
+            if row is None:
+                doc = mu.runtime_channels()
+                if not doc:
+                    return 400, {"error": "没有给出镜像地址，且服务端也读不到 channels.json",
+                                 "detail": mu.runtime_channel_base()}
+                if chan == "alpha":
+                    for cand in doc.get("alpha") or []:
+                        if not want or (cand.get("id") or cand.get("dsh")) == want:
+                            row = cand
+                            break
+                else:
+                    d = doc.get("default") or {}
+                    if want and (d.get("id") or d.get("dsh")) != want:
+                        for cand in doc.get("alpha") or []:
+                            if (cand.get("id") or cand.get("dsh")) == want:
+                                row = cand
+                                break
+                    else:
+                        row = d
+            if not row:
+                return 404, {"error": "没有找到这个版本", "want": want or chan}
+            rid = mu.runtime_install_image(row, quiet=False)
+            if not rid:
+                return 500, {"error": "安装失败（下载/校验/激活）", "id": row.get("id")}
+            return 200, {"ok": True, "id": rid}
+        if name == "runtime_activate":
+            rid = str(body.get("id") or "").strip()
+            if not rid:
+                return 400, {"error": "id required"}
+            if rid not in mu.runtime_ids():
+                return 404, {"error": "运行时未安装", "id": rid}
+            if not mu.runtime_activate(rid):
+                return 500, {"error": "激活失败（镜像损坏或缺 pty.node）", "id": rid}
+            mu.sync_all(mu.load_state())
+            return 200, {"ok": True, "id": rid}
+        if name == "runtime_channels_refresh":
+            force = str((query.get("refresh") or ["1"])[0]).lower() in ("1", "true", "yes")
+            doc = mu.runtime_channels(force=force, timeout=6.0)
+            return 200, {"ok": doc is not None, "doc": doc,
+                         "state": mu.runtime_channels_state()}
+        if name == "runtime_download":
+            rid = str(body.get("id") or body.get("dsh") or "").strip()
+            url = str(body.get("url") or "").strip()
+            if not rid or not url:
+                return 400, {"error": "需要 id + url（由浏览器从 channels.json 读出来）"}
+            try:
+                job = mu.runtime_download_async(
+                    {"id": rid, "dsh": body.get("dsh") or rid, "rev": int(body.get("rev") or 0),
+                     "url": url, "sha256": str(body.get("sha256") or "")},
+                    activate=bool(body.get("activate", True)))
+            except Exception as exc:  # noqa: BLE001
+                return 500, {"error": str(exc)[:200]}
+            return 200, {"ok": True, "job": job, "id": rid}
+        if name == "runtime_downloads_clear":
+            return 200, {"ok": True, "removed": mu.runtime_downloads_clear()}
+        if name == "runtime_downloads":
+            return 200, {"jobs": mu.runtime_downloads()}
+        if name == "runtime_download_status":
+            job = str(groups[0] if groups else "").strip()
+            st = mu.runtime_download_status(job)
+            if not st:
+                return 404, {"error": "没有这个下载任务", "job": job}
+            return 200, st
+        if name == "runtime_set_default":
+            rid = str(body.get("id") or "").strip()
+            if rid not in mu.runtime_ids():
+                return 404, {"error": "运行时未安装", "id": rid}
+            try:
+                res = mu.set_default_runtime(rid)
+            except ValueError as exc:
+                return 400, {"error": str(exc), "id": rid}
+            return 200, {"ok": True, "default": rid,
+                         "followers": res["followers"],
+                         "restarted": res["restarted"],
+                         "failed": res["failed"],
+                         "detail": ("跟随默认的实例已重启对齐" if res["restarted"]
+                                    else "没有运行中的跟随实例需要重启")}
+        if name == "runtime_assign":
+            inst_name = str(body.get("instance") or "").strip()
+            rid = str(body.get("id") or "").strip()
+            st_now = mu.load_state()
+            if inst_name not in st_now["instances"]:
+                return 404, {"error": "实例不存在", "instance": inst_name}
+            if rid and rid not in mu.runtime_ids():
+                return 404, {"error": "运行时未安装", "id": rid}
+            # 产品规则：运行中改运行时 → 立即重启；已停止 → 只改配置，不启动 ✓
+            # restart=false：**只保存配置** ✓ 重启由页面显式发起并显示进度 ✓
+            # （以前这里同步重启 ✗ 一次 assign 要 30+ 秒 ✗ 页面无反馈 ✗）
+            want_restart = bool(body.get("restart", False))
+            try:
+                res = mu.apply_instance_runtime(inst_name, rid, restart=want_restart)
+            except ValueError as exc:
+                return 400, {"error": str(exc)}
+            return 200, {"ok": True, "instance": inst_name, "runtime": rid,
+                         "effective": res["effective"],
+                         "was_running": res["was_running"],
+                         "restarted": res["restarted"],
+                         "started": res["started"],
+                         "detail": ("已重启以应用新运行时" if res["restarted"]
+                                    else "实例处于停止态：已保存配置，未启动")}
+        if name == "runtime_verify":
+            rid = str(body.get("id") or mu.runtime_current_id() or "").strip()
+            if not rid:
+                return 400, {"error": "没有可校验的运行时（未配置）"}
+            d = mu.runtime_dir(rid)
+            man = mu.runtime_manifest(rid)
+            issues = []
+            if not mu.runtime_ready(rid):
+                issues.append("目录里没有 node_modules/@deepseek-ai/dsh")
+            pty = f"{d}/node_modules/node-pty/build/Release/pty.node"
+            if not os.path.exists(pty):
+                issues.append("缺 node-pty 的 pty.node（终端会坏）")
+            if not man:
+                issues.append("缺 MANIFEST.json")
+            parsed = mu.parse_runtime_id(rid)
+            if man and parsed and man.get("dsh") and man["dsh"] != parsed["dsh"]:
+                issues.append(f"MANIFEST.dsh={man['dsh']} 与 id 不一致")
+            node_ver = mu.installed_node_version()
+            return 200, {"id": rid, "ok": not issues, "issues": issues,
+                         "manifest": man, "node_build": node_ver,
+                         "mode": "mounted" if mu._is_mounted(d) else "extracted"}
+        if name == "runtime_delete":
+            rid = str(groups[0] if groups else "").strip()
+            if not rid:
+                return 400, {"error": "id required"}
+            # 产品规则（删除运行时）：
+            #  ① 被标为「实例默认」的运行时 → 不可删 ✓
+            #  ② 有**运行中**的实例在用它 → 不可删 ✓
+            #  ③ 只有**已停止**的实例在用 → 可以删；删的同时把这些实例的运行时改回「默认」✓
+            if rid == mu.runtime_default_id():
+                return 409, {"error": "这是实例默认运行时，先把默认切走再删", "id": rid}
+            st_del = mu.load_state()
+            holders = [n for n, i in st_del["instances"].items()
+                       if str(i.get("runtime") or "") == rid]
+            running_holders = [n for n in holders
+                               if str((st_del["instances"][n] or {}).get("state") or "") == "running"]
+            if running_holders:
+                return 409, {"error": f"{len(running_holders)} 个运行中的实例正在用它，停掉或改掉再删",
+                             "id": rid, "instances": running_holders}
+            for n in holders:
+                st_del["instances"][n].pop("runtime", None)   # ③ 回落到「默认」
+            if holders:
+                mu.save_state(st_del)
+                mu.sync_all(mu.load_state())
+            if mu._is_mounted(mu.runtime_dir(rid)):
+                mu.run(["umount", mu.runtime_dir(rid)], check=False, capture=True)
+            shutil.rmtree(mu.runtime_dir(rid), ignore_errors=True)
+            for f in (mu.runtime_image(rid), f"{mu.RUNTIMES}/dsh-{rid}.manifest.json"):
+                with contextlib.suppress(OSError):
+                    os.unlink(f)
+            return 200, {"ok": True, "id": rid}
         if name == "usage_view":
             # 用量视图（只读）：today / users / models / series
             view = str((query.get("view") or ["today"])[0]).lower()
@@ -2385,7 +2725,11 @@ class Handler(BaseHTTPRequestHandler):
                     return 400, {"error": "cannot move the port", "detail": mu_exc_message(exc)}
                 return 200, {"instance": instance_view(mu.load_state(), target),
                              "port_change": result,
-                             "detail": "port changed; restart to apply"}
+                             "was_running": result.get("was_running"),
+                             "restarted": result.get("restarted"),
+                             "started": result.get("started", False),
+                             "detail": result.get("detail")
+                                       or "port changed"}
 
             cores, mem, pids = pick("cpu_cores", "cpu"), pick("mem_mb", "mem"), pick("pids_num", "pids")
             if cores is None and mem is None and pids is None:
@@ -2449,6 +2793,7 @@ def main(argv=None) -> int:
         _thread_cls = globals()["threading"].Thread
         _thread_cls(target=serve_resp, daemon=True).start()
         _thread_cls(target=_warm_doctor_cache, daemon=True).start()
+        _thread_cls(target=_warm_channels_cache, daemon=True).start()
         _thread_cls(target=_serve_resp_unix,
                     args=(os.environ.get("DSH_MU_RESP_SOCK") or "/run/dsh-mu/resp.sock",),
                     daemon=True).start()
@@ -2480,6 +2825,7 @@ def main(argv=None) -> int:
           f"(token={'yes' if os.path.exists(TOKEN_PATH) else 'no'})", flush=True)
     if args.self_check:
         import threading
+        import urllib.parse
         import urllib.request
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
