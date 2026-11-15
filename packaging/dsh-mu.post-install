@@ -12,4 +12,8 @@ cat <<'TXT'
   Instance data lives in /var/lib/dsh-mu; `apk del` never removes either directory.
 
 TXT
+# 还没 install 过时 sync 会失败 ✗ 忽略即可 ✓（安装完成后再跑 install 就会渲染好 ✓）
+if [ -f /etc/dsh-mu/dsh-mu.conf ] && command -v dsh-muctl >/dev/null 2>&1; then
+    /usr/local/sbin/dsh-muctl sync >/dev/null 2>&1 || true
+fi
 exit 0

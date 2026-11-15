@@ -800,6 +800,8 @@ def ensure_tls_dir():
 
 def render_gateway(st: dict):
     ensure_tls_dir()
+    with contextlib.suppress(Exception):
+        prepare_gateway_tmp()
     """Write the two read-only JSON views the OpenResty workers consume."""
     users = {
         name: {
@@ -1277,6 +1279,26 @@ def reconcile_instances(st: dict) -> list[str]:
         run(["/sbin/rc-service", f"dsh-mu-{name}", "start"], check=False)
         started.append(name)
     return started
+
+
+def prepare_gateway_tmp() -> None:
+    """让 jail 里的 nginx 能写自己的临时目录 ✓
+
+    openresty 在 jail 里用另一个 uid 运行 ✗ root:root 0700 的
+    /var/tmp/nginx/proxy 写不进去 → 大响应（admin 页 ~400 KB）落盘失败 →
+    上游响应被截断 → 浏览器报 NS_ERROR_NET_PARTIAL_TRANSFER ✗（.70 上真踩过）
+    """
+    base = os.path.join(gateway_paths().get("rootfs", ""), "var/tmp/nginx")
+    if not os.path.isdir(base):
+        return
+    for dirpath, dirnames, _files in os.walk(base):
+        with contextlib.suppress(OSError):
+            os.chmod(dirpath, 0o1777)
+        for name in dirnames:
+            with contextlib.suppress(OSError):
+                os.chmod(os.path.join(dirpath, name), 0o1777)
+    with contextlib.suppress(OSError):
+        os.chmod(base, 0o1777)
 
 
 def ensure_instance_autostart(st: dict):
@@ -1764,6 +1786,11 @@ def sync_all(st: dict):
     # （以前只在执行了 reload 时才记 ✗ 于是 doctor 永远报 stale ✗）
     with contextlib.suppress(Exception):
         mark_lua_reloaded()
+        # nginx 启动时会按自己的配置重建 proxy_temp 目录（0700 ✗）
+        # → 重启之后再修一次权限 ✓
+        with contextlib.suppress(Exception):
+            prepare_gateway_tmp()
+
     if str(st["config"].get("gateway_mode") or "host") == "jail":
         with contextlib.suppress(OSError):
             sync_gateway_etc()
@@ -4417,6 +4444,11 @@ def cmd_install(args):
     info(f"log rotation: {rot}" if rot else
          "log rotation: logrotate not present; schedule `dsh-muctl logs rotate` yourself "
          "(apk add logrotate for the daily drop-in)")
+    # 网关刚启动时会用自己配置里的 0700 重建 proxy_temp ✗
+    # → 起完服务再修一次权限 ✓（虽然我们现在给足了内存缓冲、不让它落盘 ✓
+    #    但重启/大响应等边缘情况仍可能用到临时文件 ✓ 保险起见）
+    with contextlib.suppress(Exception):
+        prepare_gateway_tmp()
     # 新装/升级后强制落一次 egress 表 ✓ 否则 doctor 会一直 WARN
     # "policy=no-intranet but no nft table is loaded" ✗（新手会以为装坏了 ✗）
     with contextlib.suppress(Exception):
@@ -9601,6 +9633,7 @@ def restart_admin_if_stale(quiet: bool = False) -> bool:
     if not quiet:
         info("admin backend is running the previous build; restarting it")
     run(["/sbin/rc-service", "dsh-mud", "restart"], check=False)
+    mark_admin_restarted()
     return True
 
 
@@ -13658,7 +13691,7 @@ def cmd_selftest(args):
     script = f"{LIB}/tests/selftest.mjs"
     if not os.path.exists(script):
         die(f"selftest script missing: {script}")
-    argv = ["node", script]
+    argv = []
     if args.host:
         argv += ["--host", args.host]
     if args.user:
@@ -13667,7 +13700,37 @@ def cmd_selftest(args):
         argv += ["--pass", args.password]
     if args.ws_hold:
         argv += ["--ws-hold", str(args.ws_hold)]
-    os.execvp("node", argv)
+    # jail 模式的宿主**没有 node** ✗（node 在网关 rootfs 里 ✓）
+    # 以前直接 execvp("node") → FileNotFoundError ✗ 自测在正路上根本跑不起来 ✗
+    # ops token 由这里传进去 ✓（chroot 里读不到 /etc/dsh-mu/admin.token ✗）
+    with contextlib.suppress(OSError):
+        os.environ["DSH_MU_OPS_TOKEN"] = read_text(f"{ETC}/admin.token").strip()
+    # 网关配置在 jail 里（chroot 里 `nginx -T` 读的是编译默认路径 ✗ 看不到我们的 conf ✗）
+    # → 这里把宿主上的真实配置读出来，通过环境变量交给自测 ✓
+    with contextlib.suppress(Exception):
+        parts = []
+        conf_dir = gateway_paths().get("conf", "")
+        for sub in ("", "conf.d", "http.d"):
+            base = os.path.join(conf_dir, sub) if sub else conf_dir
+            for name in sorted(os.listdir(base)):
+                if name.endswith(".conf"):
+                    parts.append(read_text(os.path.join(base, name)) or "")
+        if parts:
+            os.environ["DSH_MU_NGINX_CONF"] = "\n".join(parts)
+    if shutil.which("node"):
+        os.execvp("node", ["node", script] + argv)
+    rootfs = gateway_paths().get("rootfs", "")
+    inner_node = f"{rootfs}/usr/bin/node"
+    if not os.path.exists(inner_node):
+        die("selftest needs node: install it in the gateway template "
+            "(dsh-muctl install) or run with a host node")
+    inner_script = f"{rootfs}/tmp/dsh-selftest.mjs"
+    os.makedirs(os.path.dirname(inner_script), exist_ok=True)
+    shutil.copy2(script, inner_script)
+    with contextlib.suppress(OSError):
+        os.chmod(inner_script, 0o755)
+    info("selftest: host has no node, running inside the gateway rootfs")
+    os.execvp("chroot", ["chroot", rootfs, "/usr/bin/node", "/tmp/dsh-selftest.mjs"] + argv)
 
 
 def cmd_acceptance(args):
@@ -14339,21 +14402,36 @@ def doctor_checks(st: dict) -> list[dict]:
                 f"v{manifest.get('version')} running on 127.0.0.1:{port or '-'}")
 
     # ------------------------------------------------------ admin backend freshness
+    # 这两条**自愈** ✓ 以前只报 WARN ✗ 用户装完包打开自检就看到两条黄条 ✗
+    # 而"重启 admin / 重载网关"都是 1–3 秒、对实例无影响的安全动作 ✓ 直接做掉 ✓
     if admin_backend_pid():
         if stale_admin_code():
-            add("admin backend", DOCTOR_WARN,
-                "running the previous build (dshmuctl.py changed after it started)",
-                "dsh-muctl admin restart   (dsh-muctl sync also does it)")
+            run(["/sbin/rc-service", "dsh-mud", "restart"], check=False, capture=True)
+            mark_admin_restarted()
+            time.sleep(1.5)
+            if stale_admin_code():
+                add("admin backend", DOCTOR_WARN,
+                    "仍在使用旧代码（自动重启后依然落后）",
+                    "dsh-muctl admin restart")
+            else:
+                add("admin backend", DOCTOR_PASS,
+                    "已自动重启以使用新代码（安装新版本后无需手动处理）")
         else:
             add("admin backend", DOCTOR_PASS, "running the installed code")
     # ------------------------------------------------------- gateway lua freshness
     stale = stale_lua_files()
+    if stale:
+        with contextlib.suppress(Exception):
+            reload_gateway_if_stale(quiet=True)
+            mark_lua_reloaded()
+            time.sleep(1.5)
+        stale = stale_lua_files()
     if not stale:
         add("gateway lua", DOCTOR_PASS, "workers are running the installed Lua")
     else:
         add("gateway lua", DOCTOR_WARN,
             "stale after upgrade: " + ", ".join(os.path.basename(p) for p in stale),
-            "dsh-muctl sync   (reloads the gateway when a shipped .lua is newer)")
+            "dsh-muctl sync")
 
     # ------------------------------------------------------------------ state
     if os.path.exists(STATE_PATH):
@@ -14611,6 +14689,10 @@ def doctor_checks(st: dict) -> list[dict]:
     stale = []
     for iname, iinst in sorted((load_state().get("instances") or {}).items()):
         ppath = f"{INSTANCES_DIR}/{iname}/home/.dsh/profiles/web/cordis.patch.yml"
+        # 只有**在跑**的实例才存在"读的是不是当前 patch"的问题 ✓
+        # 停着的实例下次启动自然会读到最新 ✓（以前会把它们也列进来 ✗ 平白无故报 WARN ✗）
+        if str(iinst.get("state") or "") != "running":
+            continue
         started = int(iinst.get("started_at") or 0)
         if started and os.path.exists(ppath) and os.path.getmtime(ppath) > started + 5:
             stale.append(iname)

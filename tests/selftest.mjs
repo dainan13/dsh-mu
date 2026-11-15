@@ -154,7 +154,8 @@ if (!session) {
   if (r5b.status !== 401 && r5b.status !== 403) ok('5b /api fence accepts proxied request', `status ${r5b.status}`);
   else bad('5b /api fence accepts proxied request', `status ${r5b.status}`);
 
-  const injected = r5.body.includes('id="dshmu-panel-root"') && r5.body.includes('/mu-static/panel.js');
+  const injected = r5.body.includes('id="dshmu-panel-root"')
+    && (r5.body.includes('/mu-static/mu-shell.js') || r5.body.includes('/mu-static/panel.js'));
   if (injected) ok('5c index carries the injected user panel');
   else bad('5c index carries the injected user panel', 'marker missing');
 
@@ -233,12 +234,21 @@ if (!session || !WebSocket) {
 }
 
 // 6b --------------------- the effective configuration carries the long timeouts
+// CLI 会把渲染好的网关配置文本传进来（jail 模式下 nginx -T 看不到 ✗）
+const confFromEnv = String(process.env.DSH_MU_NGINX_CONF || '');
+
 // `nginx -T` shows what the running server actually loaded (including includes),
 // which is the only way to check the timeout value itself: the WebSocket check
 // above only proves that a *busy* connection survives.
 if (typeof process.getuid === 'function' && process.getuid() === 0 && session) {
   let conf = '';
-  try {
+  if (confFromEnv) {
+    const n = (confFromEnv.match(/proxy_read_timeout\s+3600s/g) || []).length;
+    if (n >= 1) ok('6b effective nginx config has proxy_read_timeout 3600s', `${n} occurrence(s)`);
+    else bad('6b effective nginx config lacks proxy_read_timeout 3600s', 'not in the rendered config');
+    conf = String(n);
+  }
+  if (!confFromEnv) try {
     conf = execSync(`sh -c '` +
       `if [ -n "$DSH_MU_CONF_DIR" ] && [ -f "$DSH_MU_CONF_DIR/nginx.conf" ]; then ` +
       `cat "$DSH_MU_CONF_DIR/nginx.conf" "$DSH_MU_CONF_DIR"/conf.d/*.conf "$DSH_MU_CONF_DIR"/http.d/*.conf 2>/dev/null; ` +
@@ -246,12 +256,14 @@ if (typeof process.getuid === 'function' && process.getuid() === 0 && session) {
       `cat /etc/dsh-mu-gateway/nginx.conf /etc/dsh-mu-gateway/conf.d/*.conf /etc/dsh-mu-gateway/http.d/*.conf 2>/dev/null; ` +
       `elif [ -f /var/lib/dsh-mu/gateway/conf/nginx.conf ]; then ` +
       `cat /var/lib/dsh-mu/gateway/conf/nginx.conf /var/lib/dsh-mu/gateway/conf/conf.d/*.conf /var/lib/dsh-mu/gateway/conf/http.d/*.conf 2>/dev/null; ` +
-      `else nginx -T 2>/dev/null; fi | grep -c "proxy_read_timeout *3600s" || true'`,
+      `else /usr/sbin/nginx -T 2>/dev/null || nginx -T 2>/dev/null; fi | grep -c "proxy_read_timeout *3600s" || true'`,
                     { encoding: 'utf8' }).trim();
   } catch { conf = ''; }
-  const n = Number(conf);
-  if (Number.isFinite(n) && n >= 1) ok('6b effective nginx config has proxy_read_timeout 3600s', `${n} occurrence(s) in nginx -T`);
-  else bad('6b effective nginx config lacks proxy_read_timeout 3600s', `nginx -T count=${conf || 'none'}`);
+  if (!confFromEnv) {
+    const n = Number(conf);
+    if (Number.isFinite(n) && n >= 1) ok('6b effective nginx config has proxy_read_timeout 3600s', `${n} occurrence(s) in nginx -T`);
+    else bad('6b effective nginx config lacks proxy_read_timeout 3600s', `nginx -T count=${conf || 'none'}`);
+  }
 } else {
   skip('6b effective nginx timeouts', session ? 'needs root to run nginx -T' : 'no session');
 }
@@ -287,10 +299,15 @@ if (session) {
         `cat /etc/dsh-mu-gateway/nginx.conf /etc/dsh-mu-gateway/conf.d/*.conf /etc/dsh-mu-gateway/http.d/*.conf 2>/dev/null; ` +
         `elif [ -f /var/lib/dsh-mu/gateway/conf/nginx.conf ]; then ` +
         `cat /var/lib/dsh-mu/gateway/conf/nginx.conf /var/lib/dsh-mu/gateway/conf/conf.d/*.conf /var/lib/dsh-mu/gateway/conf/http.d/*.conf 2>/dev/null; ` +
-        `else nginx -T 2>/dev/null; fi | ` +
+        `else /usr/sbin/nginx -T 2>/dev/null || nginx -T 2>/dev/null; fi | ` +
         `grep -o "client_max_body_size *[0-9a-z]*" | sort -u | tr "\\n" " " || true'`,
                       { encoding: 'utf8' }).trim();
     } catch { size = ''; }
+    if (confFromEnv) {
+      const m = confFromEnv.match(/client_max_body_size\s+[0-9a-z]+/g) || [];
+      const uniq = [...new Set(m)].join(' ');
+      size = uniq;
+    }
     if (/512m/.test(size)) ok('6c effective config sets client_max_body_size 512m', size);
     else bad('6c effective config does not set 512m', size || 'nginx -T gave nothing');
   } else {
@@ -321,7 +338,9 @@ if (session) {
     return out;
   })();
   let r7 = { status: 0, body: '' };
-  for (const tok of opsTokens.length ? opsTokens : ['']) {
+  const envTokens = (process.env.DSH_MU_OPS_TOKEN || '').trim();
+  const allOps = envTokens ? [envTokens, ...opsTokens] : opsTokens;
+  for (const tok of allOps.length ? allOps : ['']) {
     r7 = await request({ path: `/mu-api/status?t=${encodeURIComponent(tok)}`, hostHeader: '127.0.0.1' });
     if (r7.status === 200) break;
   }

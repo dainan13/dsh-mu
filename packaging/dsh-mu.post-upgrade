@@ -1,3 +1,16 @@
 #!/bin/sh
-echo "dsh-mu upgraded. Re-run 'dsh-muctl install' to refresh services and nginx fragments;"
+# 升级后：
+#   ① 立刻 sync 一次，让"网关 lua / admin 后端跑的是上一个构建"这两条自检告警
+#      不会出现 ✓（用户装完包直接打开 admin 就是新版本 ✓）
+#   ② 任何失败都不影响安装（没配置 / 没初始化时 sync 会报错 ✗ 但不该挡住升级 ✓）
+echo "dsh-mu upgraded; syncing the gateway fragments and admin backend ..."
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+LOG=/var/log/dsh-mu/apk-hook.log
+mkdir -p /var/log/dsh-mu 2>/dev/null || true
+{
+    echo "=== $(date) post-upgrade sync ==="
+    /usr/local/sbin/dsh-muctl sync 2>&1 | tail -20
+    echo "exit=$?"
+} >>"$LOG" 2>&1 || true
 echo "state schema migrations run automatically on the next dsh-muctl command."
+exit 0
