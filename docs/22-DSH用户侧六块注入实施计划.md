@@ -227,10 +227,20 @@ admin ： 运行 → 运行时
 ### C.6 端口与运行时的一致性规则
 
 ```
-实例在运行  → 改端口 / 改运行时后 **立即重启**（应用新值）
+实例在运行  → 改端口 / 改单台运行时后 **立即重启**（应用新值）
 实例已停止  → 只保存配置，**不启动**（何时拉起由运维决定）
-改「实例默认运行时」→ 跟随默认的运行中实例**全部重启对齐**；默认没变时是幂等 no-op ✓
+改「实例默认运行时」→ **不重启任何实例** ✓ 只改指针 + 重写各实例配置，
+                响应里返回 pending_restart（哪些运行中的实例"重启后才生效"）
+                需要立刻生效：`dsh-muctl instance restart <name>`，
+                或显式批量：`dsh-muctl runtime use <id> --restart`
 ```
+（1.9.95 起改的：以前"设默认"会同步重启所有跟随实例 ✗ 11 台要 8–10 分钟 ✗
+ HTTP 必然超时 ✗ 客户机上真踩到 400，且用户会在无人告知时被逐个踢下线 ✗）
+
+**兜底守护 `dsh-mu-watchdog`**：每 60 秒扫一遍"该跑但端口不通"的实例并重启它 ✓
+openrc 的 `supervise-daemon` 偶尔会自己退出（`rc-service status` 显示 `unsupervised` ✗
+但进程还在跑 ✓ 崩了没人拉起 ✗），有 watchdog 后自愈不再依赖 openrc ✓
+手动：`dsh-muctl watchdog --once --dry-run`。详见 `docs/24-升级与运行时切换手册.md`。
 实现位置（同一份逻辑，不是页面逻辑）：`apply_instance_runtime()` / `change_instance_port()` /
 `set_default_runtime()`，CLI 与 admin 都走它们。
 

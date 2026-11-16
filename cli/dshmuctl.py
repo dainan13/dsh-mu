@@ -1143,6 +1143,47 @@ def render_runtimes_service(register: bool = True) -> None:
             capture=True)
 
 
+WATCHDOG_INIT = """#!/sbin/openrc-run
+# 兜底守护：实例"该跑但端口不通"就重启它 ✓
+# openrc 的 supervise-daemon 偶尔会自己退出（客户机上出现过 ✗）
+# 有了它，自愈不再依赖 openrc 的行为 ✓
+description="dsh-mu instance watchdog"
+
+command="/usr/local/sbin/dsh-muctl"
+command_args="watchdog --interval 60"
+command_user="root:root"
+pidfile="/run/dsh-mu-watchdog.pid"
+output_log="/var/log/dsh-mu/watchdog.log"
+error_log="/var/log/dsh-mu/watchdog.err.log"
+
+supervisor="supervise-daemon"
+respawn_delay=10
+respawn_max=0
+respawn_period=300
+
+depend() {
+	need net
+	need dsh-mu-cgroup
+	after dsh-mud
+}
+
+start_pre() {
+	checkpath --directory --mode 0755 /var/log/dsh-mu
+}
+"""
+
+
+def render_watchdog_service(register: bool = True) -> None:
+    """写入 /etc/init.d/dsh-mu-watchdog 并登记到 default runlevel（幂等）✓"""
+    atomic_write("/etc/init.d/dsh-mu-watchdog", WATCHDOG_INIT, mode=0o755)
+    if register:
+        run(["/sbin/rc-update", "add", "dsh-mu-watchdog", "default"], check=False,
+            capture=True)
+    with contextlib.suppress(Exception):
+        if not os.path.exists("/run/dsh-mu-watchdog.pid"):
+            run(["/sbin/rc-service", "dsh-mu-watchdog", "start"], check=False, capture=True)
+
+
 def render_cgroup_service(register: bool = True):
     mounted, why = ensure_cgroup2_mounted()
     if not mounted:
@@ -1780,6 +1821,8 @@ def sync_all(st: dict):
         else:
             restart_admin_if_stale()
     ensure_instance_autostart(st)
+    with contextlib.suppress(Exception):
+        render_watchdog_service()
     apply_egress(st)
     render_gateway(st)
     # 无论走哪条路径，sync 之后 lua 都已经是"当前版本"✓ 记录时间戳 ✓
@@ -2564,6 +2607,23 @@ def free_instance_port(name: str) -> list[int]:
     return killers
 
 
+def unit_is_supervised(unit: str) -> bool:
+    """该服务现在是否真的被 supervise-daemon 盯着 ✓（"unsupervised" = 崩了不会自动拉起 ✗）"""
+    want = f"supervise-daemon dsh-mu-{unit}"
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                argv = [x.decode("utf-8", "replace") for x in fh.read().split(b"\0") if x]
+        except OSError:
+            continue
+        if len(argv) >= 2 and argv[0].endswith("supervise-daemon") and argv[1] == f"dsh-mu-{unit}":
+            return True
+    del want
+    return False
+
+
 def service_action(name: str, action: str, check: bool = True):
     svc = f"dsh-mu-{name}"
     if not os.path.exists(f"/etc/init.d/{svc}"):
@@ -2580,6 +2640,20 @@ def service_action(name: str, action: str, check: bool = True):
             with contextlib.suppress(Exception):
                 free_instance_port(unit_name)
     run(["/sbin/rc-service", svc, action], check=check)
+    if is_instance and action in ("start", "restart"):
+        # openrc 有时把"已启动"记在 state 里但 supervisor 已经不在了 ✗
+        # → 进程在跑 ✓ 端口在听 ✓ 但**崩了没人拉起** ✗（客户机上出现过 ✗）
+        # 这里补一次：stop + start，让它重新被 supervise-daemon 接管 ✓
+        time.sleep(1.0)
+        if not unit_is_supervised(unit_name):
+            warn(f"{svc}: not supervised after {action}; re-registering it")
+            run(["/sbin/rc-service", svc, "stop"], check=False)
+            time.sleep(0.6)
+            run(["/sbin/rc-service", svc, "start"], check=False)
+            time.sleep(1.0)
+            if not unit_is_supervised(unit_name):
+                warn(f"{svc}: still unsupervised — instances keep running but will not "
+                     f"auto-restart; check /var/log/openrc or the init script")
     if is_instance and action in ("stop", "restart"):
         time.sleep(0.7)
         with contextlib.suppress(Exception):
@@ -7281,12 +7355,17 @@ def instance_is_running(name: str) -> bool:
     return False
 
 
-def set_default_runtime(rid: str) -> dict:
-    """改「实例默认运行时」，并把**所有跟随默认的实例**一次性对齐 ✓
+def set_default_runtime(rid: str, restart: bool = False) -> dict:
+    """改「实例默认运行时」。
 
-    为什么必须重启：默认是全局指针 ✓ conf 会被 sync 改写 ✓
-    如果只改指针不重启，就会出现"配置写的是新默认、进程还跑旧的" ✗
-    → 所以这里直接重启所有跟随者（显式运行时的不动 ✓）
+    默认**不重启任何实例** ✓（原来同步重启所有跟随者 ✗
+      · 11 台机器要 8–10 分钟 ✗ HTTP 必然超时 ✗ 客户机上真的踩了 400 ✗
+      · 而且用户会在操作者完全不知情的时候被逐个踢下线 ✗）
+    语义改为：
+      · 只改指针（+ 重写 conf ✓ 让"下次启动"就是用新默认 ✓）
+      · 运行中的实例继续跑旧运行时 ✓ 直到**你决定重启**它们 ✓
+      · 返回 running_followers 让你知道"哪些实例需要重启才生效" ✓
+    restart=True 时才做原来那件事（CLI 显式要求时 ✓）
     """
     if rid not in runtime_ids():
         raise ValueError(f"runtime {rid} is not installed")
@@ -7304,6 +7383,9 @@ def set_default_runtime(rid: str) -> dict:
     running = [n for n in followers if str((st["instances"][n] or {}).get("state") or "") == "running"]
     sync_all(load_state())
     restarted, failed = [], []
+    if not restart:
+        return {"default": rid, "followers": followers, "running_followers": running,
+                "restarted": [], "failed": [], "noop": False, "pending": running}
     for name in running:
         try:
             st2 = load_state()
@@ -7312,8 +7394,8 @@ def set_default_runtime(rid: str) -> dict:
             (restarted if ok else failed).append(name)
         except Exception:  # noqa: BLE001
             failed.append(name)
-    return {"default": rid, "followers": followers,
-            "restarted": restarted, "failed": failed, "noop": False}
+    return {"default": rid, "followers": followers, "running_followers": running,
+            "restarted": restarted, "failed": failed, "noop": False, "pending": []}
 
 
 def apply_instance_runtime(name: str, rid: str, restart: bool = True) -> dict:
@@ -8061,17 +8143,28 @@ def cmd_runtime(args):
             return 0
         if want not in runtime_ids():
             die(f"runtime {want} is not installed (have: {', '.join(runtime_ids()) or 'none'})")
+        # 默认**不动**运行中的实例 ✓ 需要显式 --restart 才逐个重启 ✓
+        # （客户机上"设默认=重启 11 台"必然超时 ✗ 也是那次 400 的来源 ✗）
+        do_restart = bool(getattr(args, "restart", False))
         try:
-            res = set_default_runtime(want)
+            res = set_default_runtime(want, restart=do_restart)
         except ValueError as exc:
             die(str(exc))
         info(f"default runtime: {want}")
-        if res["restarted"]:
-            info(f"restarted followers: {', '.join(res['restarted'])}")
-        if res["failed"]:
-            warn(f"these followers did not come back: {', '.join(res['failed'])}")
-        if not res["restarted"] and not res["failed"]:
-            info("no running instance follows the default; nothing to restart")
+        pending = res.get("pending") or []
+        if do_restart:
+            if res["restarted"]:
+                info(f"restarted followers: {', '.join(res['restarted'])}")
+            if res["failed"]:
+                warn(f"these followers did not come back: {', '.join(res['failed'])}")
+            if not res["restarted"] and not res["failed"]:
+                info("no running instance follows the default; nothing to restart")
+        elif pending:
+            warn(f"{len(pending)} 个跟随实例仍在旧运行时上运行；它们下次重启时才会用新默认")
+            info("  需要现在就切：dsh-muctl runtime use " + want + " --restart")
+            info("  或逐个：dsh-muctl instance restart <name>")
+        else:
+            info("没有运行中的跟随实例（新默认对新建/下次启动生效）")
         return 0
 
     if action == "ensure-mounted":
@@ -9688,6 +9781,69 @@ def reload_gateway_if_stale(quiet: bool = False) -> bool:
         run(["/sbin/rc-service", "openresty", "reload"], check=False)
     mark_lua_reloaded()
     return True
+
+
+WATCHDOG_INTERVAL = 60
+
+
+def watchdog_scan(heal: bool = True) -> dict:
+    """扫一遍所有"应该跑"的实例：端口不通 → 重启它 ✓；supervisor 丢了 → 顺手修 ✓
+
+    为什么需要它：openrc 的 supervise-daemon 偶尔会自己退出（客户机上出现过 ✗）
+    → 进程还在跑 ✓ 但崩了没人拉起 ✗ 而且 `rc-service status` 显示 unsupervised ✗
+    有了 watchdog，兜底逻辑不再依赖 openrc 的行为 ✓
+    """
+    st = load_state()
+    bad, fixed, failed = [], [], []
+    for name, inst in sorted((st.get("instances") or {}).items()):
+        if str((inst or {}).get("state") or "") != "running":
+            continue
+        port = int((inst or {}).get("port") or 0)
+        if not port:
+            continue
+        alive = False
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=3):
+                alive = True
+        except OSError:
+            alive = False
+        if alive:
+            if heal and not unit_is_supervised(name):
+                with contextlib.suppress(Exception):
+                    run(["/sbin/rc-service", f"dsh-mu-{name}", "stop"], check=False, capture=True)
+                    run(["/sbin/rc-service", f"dsh-mu-{name}", "start"], check=False, capture=True)
+            continue
+        bad.append(name)
+        if not heal:
+            continue
+        info(f"watchdog: {name} (port {port}) is not listening — restarting it")
+        try:
+            st2 = load_state()
+            stop_instance(st2, name, mark=False)
+            ok = start_with_cookie_retry(load_state(), name, timeout=180.0)
+            (fixed if ok else failed).append(name)
+        except Exception as exc:  # noqa: BLE001
+            warn(f"watchdog: {name}: {exc}"[:200])
+            failed.append(name)
+    return {"down": bad, "fixed": fixed, "failed": failed}
+
+
+def cmd_watchdog(args):
+    ensure_root()
+    interval = int(getattr(args, "interval", WATCHDOG_INTERVAL) or WATCHDOG_INTERVAL)
+    if getattr(args, "once", False):
+        res = watchdog_scan(heal=not getattr(args, "dry_run", False))
+        print(json.dumps(res, ensure_ascii=False))
+        return 0
+    info(f"watchdog: every {interval}s (Ctrl-C to stop)")
+    while True:
+        with contextlib.suppress(Exception):
+            res = watchdog_scan(heal=True)
+            if res["fixed"]:
+                info(f"watchdog: restarted {', '.join(res['fixed'])}")
+            if res["failed"]:
+                warn(f"watchdog: could not restart {', '.join(res['failed'])}")
+        time.sleep(interval)
 
 
 def cmd_sync(args):
@@ -14205,7 +14361,17 @@ def doctor_checks(st: dict) -> list[dict]:
     # ------------------------------------------------- runtime image (squashfs)
     try:
         rid = runtime_current_id()
-        if not rid:
+        legacy = dsh_runtime_dir(cfg)
+        legacy_ok = os.path.exists(f"{legacy}/package.json")
+        if not rid and legacy_ok:
+            # 从 1.8.x 升上来的机器就是这种形态 ✓ 实例跑得好好的 ✗ 不能报"起不来" ✗
+            ver = ""
+            with contextlib.suppress(Exception):
+                ver = str(json.loads(read_text(f"{legacy}/package.json")).get("version") or "")
+            add("runtime", DOCTOR_PASS,
+                f"使用旧的 npm 树 @deepseek-ai/dsh@{ver or '?'}（{legacy}）"
+                "；建议固化成镜像（dsh-muctl runtime pack / admin 上传）")
+        elif not rid:
             add("runtime", DOCTOR_WARN, "没有配置运行时（实例起不来）",
                 "dsh-muctl runtime use <id>，或从 admin「运行时」页安装/上传")
         else:
@@ -14234,10 +14400,15 @@ def doctor_checks(st: dict) -> list[dict]:
         # 而 pty.node 在**运行时根**的 node_modules 下 (.../node_modules/node-pty/...) ✓
         # 旧代码直接 join(rt, PTY_REL) → 去 dsh/node_modules 里找 ✗ 永远找不到 ✗ 一直误报 ✗
         rts = dsh_runtime_dirs()
-        def _pty_of(dsh_dir: str) -> str:
-            nm = os.path.dirname(os.path.dirname(dsh_dir))   # .../node_modules
-            return os.path.join(nm, "node-pty", "build", "Release", "pty.node")
-        missing = [rt for rt in rts if not os.path.exists(_pty_of(rt))]
+        def _pty_paths(dsh_dir: str) -> list[str]:
+            """pty.node 的两个可能位置：
+               ① 镜像布局：<runtime>/node_modules/node-pty/...（顶层 hoist ✓）
+               ② 旧 npm 树：<dsh>/node_modules/node-pty/...（嵌套 ✓ 1.8.x 升上来是这样）
+            """
+            nm = os.path.dirname(os.path.dirname(dsh_dir))
+            return [os.path.join(nm, "node-pty", "build", "Release", "pty.node"),
+                    os.path.join(dsh_dir, "node_modules", "node-pty", "build", "Release", "pty.node")]
+        missing = [rt for rt in rts if not any(os.path.exists(p) for p in _pty_paths(rt))]
         if not rts:
             add("dsh native modules", DOCTOR_PASS, "没有可用的运行时，跳过")
         elif missing:
@@ -14699,6 +14870,25 @@ def doctor_checks(st: dict) -> list[dict]:
     add("instance patch freshness", DOCTOR_WARN if stale else DOCTOR_PASS,
         ("stale: " + ", ".join(stale) + "; run: dsh-muctl instance restart <name>")
         if stale else "every running instance read the current patch")
+    # 崩了会不会自动拉起？"unsupervised" 的实例不会 ✗（客户机上出现过 ✓ 现在 start 时自愈）
+    loose = [n for n in sorted(st["instances"])
+             if (st["instances"][n] or {}).get("state") == "running"
+             and not unit_is_supervised(n)]
+    watchdog_ok = os.path.exists("/run/dsh-mu-watchdog.pid") and unit_is_supervised("watchdog")
+    if not loose:
+        add("instance supervision", DOCTOR_PASS, "every running instance is supervised")
+    elif watchdog_ok:
+        # openrc 的 supervisor 会自己溜走 ✗ 但 watchdog 每 60 秒兜底 ✓
+        # 这种情况不该让用户看到"崩了不会自动拉起" ✗（已经不成立了 ✓）
+        add("instance supervision", DOCTOR_PASS,
+            f"{len(loose)} 个实例没有 openrc supervisor，但 watchdog 在跑（每 60 秒兜底 ✓）："
+            + ", ".join(loose[:4]) + (" …" if len(loose) > 4 else ""))
+    else:
+        add("instance supervision", DOCTOR_WARN,
+            f"{len(loose)} 个实例没有 supervisor（崩了不会自动拉起）："
+            + ", ".join(loose[:4]) + (" …" if len(loose) > 4 else ""),
+            "dsh-muctl sync   # 会拉起 dsh-mu-watchdog 兜底")
+
     tree_here = os.path.isdir("/sys/fs/cgroup/dsh-mu")
     add("instance cgroup tree", DOCTOR_PASS if tree_here else DOCTOR_FAIL,
         "/sys/fs/cgroup/dsh-mu" if tree_here else
@@ -15365,6 +15555,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("version", nargs="?", help="with `install`: dsh version, e.g. 0.2.1-rc.5")
     sp.add_argument("--dry-run", dest="dry_run", action="store_true",
                     help="migrate-ids: 只打印计划（现在默认就是预演 ✓ 保留此参数兼容）")
+    sp.add_argument("--restart", dest="restart", action="store_true",
+                    help="use: 设为默认后**立刻逐个重启**跟随的实例（默认不动它们 ✓）")
     sp.add_argument("--yes", dest="yes", action="store_true",
                     help="migrate-ids: 真的执行（会停/重启受影响的实例 ✗ 危险）")
     sp.add_argument("--from", dest="from_dir", default="",
@@ -15511,6 +15703,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="usage 视图（配合 action=usage）")
     sp.add_argument("--days", type=int, default=7, help="usage 视图的时间窗口（天）")
     sp.set_defaults(func=cmd_relay)
+    sp = sub.add_parser("watchdog", help="keep instances alive (restart the ones that stopped listening)")
+    sp.add_argument("--once", action="store_true", help="run one pass and exit")
+    sp.add_argument("--dry-run", action="store_true", help="only report, do not restart")
+    sp.add_argument("--interval", type=int, default=WATCHDOG_INTERVAL)
+    sp.set_defaults(func=cmd_watchdog)
     sp = sub.add_parser("doctor", help="diagnose host prerequisites (run this first on a new machine)")
     sp.add_argument("--json", action="store_true", help="machine-readable report (for the admin backend)")
     sp.add_argument("--fix", action="store_true", help="apply the safe fixes it knows (gateway install, sync, cgroup)")

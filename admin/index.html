@@ -6537,9 +6537,20 @@ html.wiring .side-stack .flags { visibility: hidden; }
   };
 
   window.rtSetDefault = async function (id) {
+    // 只改指针 ✓ **不会重启任何实例** ✓（前端也不用等 ✗ 以前这个请求要跑 8–10 分钟 ✗）
     try {
-      await apiJ('api/runtimes/default', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
-      toast('ok', '已设为实例默认', id + '；实例选「默认」时用它（重启后生效）');
+      const r = await apiJ('api/runtimes/default', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      });
+      const pending = (r && r.pending_restart) || [];
+      if (pending.length) {
+        toast('ok', '已设为实例默认',
+          `${id}；${pending.length} 个运行中的实例仍跑旧运行时，重启后生效：` +
+          pending.slice(0, 4).join('、') + (pending.length > 4 ? ' …' : ''));
+      } else {
+        toast('ok', '已设为实例默认', id + '；当前没有运行中的跟随实例');
+      }
       window.wireRuntime();
     } catch (e) { toast('err', '设置失败', e.message); }
   };

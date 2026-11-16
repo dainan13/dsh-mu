@@ -2117,15 +2117,21 @@ class Handler(BaseHTTPRequestHandler):
             if rid not in mu.runtime_ids():
                 return 404, {"error": "运行时未安装", "id": rid}
             try:
-                res = mu.set_default_runtime(rid)
+                # **不重启任何实例** ✓（原来同步重启所有跟随者 ✗ 客户机上 11 台
+                # 要 8–10 分钟 ✗ HTTP 超时 → 400 ✗ 用户还被逐个踢下线 ✗）
+                # 现在只改指针 + 重写 conf ✓ 返回"哪些实例需要重启才生效" ✓
+                res = mu.set_default_runtime(rid, restart=False)
             except ValueError as exc:
                 return 400, {"error": str(exc), "id": rid}
+            pending = res.get("pending") or []
             return 200, {"ok": True, "default": rid,
                          "followers": res["followers"],
-                         "restarted": res["restarted"],
-                         "failed": res["failed"],
-                         "detail": ("跟随默认的实例已重启对齐" if res["restarted"]
-                                    else "没有运行中的跟随实例需要重启")}
+                         "running_followers": res.get("running_followers") or [],
+                         "pending_restart": pending,
+                         "restarted": [], "failed": [],
+                         "detail": (f"已设为默认；{len(pending)} 个运行中的实例将在下次重启后使用它"
+                                    if pending else
+                                    "已设为默认；当前没有运行中的跟随实例")}
         if name == "runtime_assign":
             inst_name = str(body.get("instance") or "").strip()
             rid = str(body.get("id") or "").strip()
