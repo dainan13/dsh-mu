@@ -63,6 +63,8 @@ fi
 : "${DSH_LAUNCH_ARGS:=}"
 : "${EXTRA_MOUNTS:=}"
 : "${RO_PATHS:=}"
+: "${BUNDLED_PLUGINS_HOST:=}"
+BUNDLED_PLUGINS_JAIL=/opt/dsh-mu-plugins
 
 [ -d "$ROOTFS" ] || { echo "dsh-mu-jail: rootfs missing: $ROOTFS" >&2; exit 1; }
 
@@ -233,6 +235,20 @@ if [ -n "${EXTRA_MOUNTS:-}" ]; then
 	IFS=$OLDIFS
 fi
 
+# 平台自带的插件目录：挂到 /opt/dsh-mu-plugins（只读）
+# profile 的 package.json 里用 `file:/opt/dsh-mu-plugins/<name>` 声明依赖 ✓
+# 这样 **pnpm install 不会把内置插件当"多余包"删掉** ✓
+# （客户机上出现过：用户在实例里装插件 → pnpm 把 @dsh-mu/dsh-client-models 挪进
+#   .ignored → DSH 启动时 bundle 解析失败 → 端口永远不监听 ✗）
+if [ -n "${BUNDLED_PLUGINS_HOST:-}" ] && [ -d "$BUNDLED_PLUGINS_HOST" ]; then
+	mkdir -p "$ROOTFS$BUNDLED_PLUGINS_JAIL" 2>/dev/null || true
+	if mount --rbind "$BUNDLED_PLUGINS_HOST" "$ROOTFS$BUNDLED_PLUGINS_JAIL" 2>/dev/null 		&& mount -o remount,ro,bind "$ROOTFS$BUNDLED_PLUGINS_JAIL" 2>/dev/null; then
+		echo "[jail] bundled plugins (ro): $BUNDLED_PLUGINS_HOST -> $BUNDLED_PLUGINS_JAIL" >&2
+	else
+		echo "[jail] could not mount bundled plugins" >&2
+	fi
+fi
+
 # Plugins the platform protects: mount each package directory read-only onto itself
 # inside this mount namespace, so the instance can neither delete nor replace it.
 # Enforced by the kernel (EROFS), and CAP_SYS_ADMIN is dropped, so it cannot umount.
@@ -332,6 +348,7 @@ setup_cgroup
 export DSHMU_NAME="$NAME" DSHMU_MODE="$MODE" DSHMU_CMD="$CMD" \
 	ROOTFS INSTANCE_HOME INSTANCE_WORK PORT INST_UID INST_GID \
 	CGROUP_PATH DSH_HOST DSH_EXTRA_ARGS DSH_WORK_IN_JAIL EXTRA_MOUNTS RO_PATHS \
+	BUNDLED_PLUGINS_HOST BUNDLED_PLUGINS_JAIL \
 	DSH_RUNTIME_DIR DSH_RUNTIME_IN_JAIL DSH_HOME_IN_JAIL DSH_PERMISSION_MODE DSH_LAUNCH_ARGS KEEP_CAPS
 export HOME=/home/dsh
 export DSH_HOME="$DSH_HOME_IN_JAIL"

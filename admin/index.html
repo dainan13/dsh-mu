@@ -1286,7 +1286,7 @@ html.wiring .side-stack .flags { visibility: hidden; }
           </div>
           <table class="data compact">
             <thead><tr>
-              <th>插件包</th><th>来源</th><th>受保护<span class="th-sub">只读挂载</span></th><th>预装</th><th>推送</th>
+              <th>插件包</th><th>来源</th><th>受管<span class="th-sub">随扩展/只读</span></th><th>预装</th><th>推送</th>
               <th>安装矩阵<span class="th-sub">点方块只看一个实例</span></th><th class="num">操作</th>
             </tr></thead>
             <tbody id="pluginBody">
@@ -5671,10 +5671,14 @@ function wireDoctorBadge(summary) {
       sub: '预装 = 新建实例自动装；推送 = 每次重启补齐；受保护 = 只读挂载，装了就删不掉。',
       size: 'sm',
       body:
-        (managed ? `<div class="notice warn"><svg class="i"><use href="#i-alert"/></svg><div class="body"><b>由扩展 ${esc(managed)} 提供</b><span>策略仍可调，但卸载要卸扩展包。</span></div></div>` : '') +
+        (managed ? `<div class="notice warn"><svg class="i"><use href="#i-alert"/></svg><div class="body"><b>受管：由扩展 ${esc(managed)} 提供</b><span>策略仍可调，但这一个包不能单独删除/升级 —— 卸载要卸扩展包。</span></div></div>` : '') +
         `<label class="check"><input type="checkbox" id="pePre"${pol.preinstall ? ' checked' : ''}> 预装（新建实例自动装）</label>
          <label class="check"><input type="checkbox" id="pePush"${pol.push ? ' checked' : ''}> 推送（重启时补齐）</label>
          <label class="check"><input type="checkbox" id="peProt"${pol.protected ? ' checked' : ''}> 受保护（只读挂载）</label>
+         <div class="faint" style="font-size:11.5px;margin-top:6px">
+           当前：预装 ${pol.preinstall ? '开' : '关'} · 推送 ${pol.push ? '开' : '关'} ·
+           受保护 ${pol.protected ? '开' : '关'} · 受管 ${managed ? '是（随扩展）' : '否'}
+         </div>
          <label class="field" style="margin-top:10px"><span class="label">备注</span><input class="input" id="peNote" value="${esc(pol.note || '')}" placeholder="为什么这么配（会记进审计）"></label>`,
       foot: `<button class="btn ghost" onclick="closeModal()">取消</button>
              <button class="btn primary" onclick="submitPolicyEdit('${esc(name)}')">保存</button>`,

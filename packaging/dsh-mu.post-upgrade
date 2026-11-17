@@ -13,4 +13,17 @@ mkdir -p /var/log/dsh-mu 2>/dev/null || true
     echo "exit=$?"
 } >>"$LOG" 2>&1 || true
 echo "state schema migrations run automatically on the next dsh-muctl command."
+
+
+# apk 升级会把服务停掉 ✗ 而且在钩子里**直接 restart 会失败** ✗（apk 还在跑）
+# （客户机上就是"装完包 admin 根本进不去" ✗）→ 改成**延迟重启**：装完再动 ✓
+# 注意 ① 不要重启 dsh-mu-cgroup ✗ 它一重启，所有实例的 cgroup 会被清掉 ✗
+#      ② watchdog 必须 restart（它是常驻进程，否则永远跑旧代码 ✗）
+setsid sh -c 'sleep 5
+    for svc in dsh-mu-runtimes dsh-mu-gateway dsh-mud dsh-mu-watchdog; do
+        [ -x "/etc/init.d/$svc" ] || continue
+        /sbin/rc-service "$svc" restart >/dev/null 2>&1 || \
+            /sbin/rc-service "$svc" start >/dev/null 2>&1 || true
+    done' >/dev/null 2>&1 &
+
 exit 0

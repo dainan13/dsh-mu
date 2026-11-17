@@ -992,6 +992,7 @@ def render_instance_conf(st: dict, name: str):
         f"EXTRA_MOUNTS=\"{','.join(x for x in (str(inst.get('extra_mounts') or ''), ext_instance_mounts()) if x)}\"" ,
         # read-only, same-path binds for protected plugins (kernel-enforced EROFS)
         f"RO_PATHS=\"{','.join(protected_paths(name))}\"",
+        f"BUNDLED_PLUGINS_HOST=\"{BUNDLED_PLUGINS_DIR}\"",
 
         "",
     ]
@@ -1813,6 +1814,12 @@ def sync_all(st: dict):
             market_cache_dependency_tree(names)
     with contextlib.suppress(Exception):
         ext_reload(quiet=True)
+    with contextlib.suppress(Exception):
+        probe = run(["/sbin/rc-service", "dsh-mud", "status"], check=False, capture=True)
+        if "started" not in ((probe.stdout or "") + (probe.stderr or "")):
+            info("admin backend: not running → starting it")
+            run(["/sbin/rc-service", "dsh-mud", "start"], check=False)
+            time.sleep(1.0)
     with contextlib.suppress(Exception):
         if stale_admin_code():
             info("admin backend: code changed → restarting dsh-mud")
@@ -2945,6 +2952,10 @@ def start_instance(st: dict, name: str, timeout: float = 900.0):
         install_phase(st, name, {"push"})
     with contextlib.suppress(Exception):
         for change in reconcile_protected_plugins(st, name):
+            info(f"{name}: {change}")
+    # 声明了但文件不在了的 bundle 会让 DSH 在绑端口前退出 ✗ 启动前清掉 ✓
+    with contextlib.suppress(Exception):
+        for change in prune_stale_bundles(st, name):
             info(f"{name}: {change}")
     service_action(name, "start")
     inst["state"] = "running"
@@ -4815,8 +4826,120 @@ def create_instance(st: dict, name: str, user: str, cpu, mem, pids, port,
     # 新实例要立刻有自己的 nft 链 ✓ 否则 doctor 会报 "egress rules: no chain for <name>" ✗
     with contextlib.suppress(Exception):
         apply_egress(load_state())
+    # relay.json 也要立刻带上这个实例的 token ✓
+    # （客户机上踩到：删实例后重建 → relay.json 里没有它的 token → doctor FAIL ✗）
+    with contextlib.suppress(Exception):
+        write_relay_document(load_state())
     info(f"instance {name} created: port={iport} uid={uid} disk={size}MB")
     return inst
+
+
+def prune_stale_bundles(st: dict, name: str) -> list[str]:
+    """把 profile 里"声明了但文件不在"的 bundle 删掉 ✓
+
+    踩过的坑：用户在插件策略里取消一个"预装+推送"的插件 ✗
+    → 平台删掉了它的文件 ✓ 但 package.json 的 dsh.profile.bundles 里还留着 ✗
+    → DSH 启动时 "cannot resolve profile bundle" → **在绑定端口前退出** ✗
+    → 实例看起来"启动着"，端口永远 000 ✗（客户机 wukai 就是这么坏的）
+    """
+    prof_dir = f"{instance_home(name)}/.dsh/profiles/{instance_profile(name)}"
+    pkg_path = f"{prof_dir}/package.json"
+    doc = {}
+    with contextlib.suppress(ValueError):
+        doc = json.loads(read_text(pkg_path) or "{}")
+    prof = ((doc.get("dsh") or {}).get("profile") or {})
+    bundles = prof.get("bundles")
+    if not isinstance(bundles, list) or not bundles:
+        return []
+    kept, dropped = [], []
+    for bundle in bundles:
+        if bundle.startswith("@deepseek-ai/"):
+            kept.append(bundle)            # 这些由运行时提供 ✓
+            continue
+        if os.path.isdir(f"{prof_dir}/node_modules/{bundle}"):
+            kept.append(bundle)
+        else:
+            dropped.append(bundle)
+    if not dropped:
+        return []
+    prof["bundles"] = kept
+    doc.setdefault("dsh", {})["profile"] = prof
+    # 依赖里若还留着它，也一并去掉（否则 pnpm 又会尝试安装 ✗）
+    deps = doc.get("dependencies") or {}
+    for bundle in dropped:
+        deps.pop(bundle, None)
+    if deps or doc.get("dependencies"):
+        doc["dependencies"] = deps
+    atomic_write(pkg_path, json.dumps(doc, indent=2) + "\n", mode=0o600)
+    inst = st["instances"].get(name) or {}
+    with contextlib.suppress(OSError):
+        os.chown(pkg_path, int(inst.get("uid", 0)), int(inst.get("gid", inst.get("uid", 0))))
+    return [f"{b}: bundle dropped (files gone)" for b in dropped]
+
+
+def instance_repair(name: str, restart: bool = False) -> dict:
+    """把实例的 profile 修回"能启动"的状态 ✓
+
+    · 内置插件（@dsh-mu/...）重新落进 profile 的 node_modules ✓
+    · 重新声明 file: 依赖 ✓（以后 pnpm install 不会再删它们 ✓）
+    · 清掉 node_modules/.ignored 里的内置插件副本 ✓（pnpm 的垃圾箱）
+    · 不动用户自己装的插件 ✓
+    """
+    st = load_state()
+    if name not in st["instances"]:
+        raise KeyError(name)
+    changes = prune_stale_bundles(st, name)
+    changes += ensure_bundled_plugins(st, name)
+    changes += prune_stale_bundles(st, name)
+    save_state(st)
+    prof_dir = f"{instance_home(name)}/.dsh/profiles/{instance_profile(name)}"
+    ignored = f"{prof_dir}/node_modules/.ignored/@dsh-mu"
+    removed = 0
+    if os.path.isdir(ignored):
+        for entry in os.listdir(ignored):
+            with contextlib.suppress(OSError):
+                shutil.rmtree(f"{ignored}/{entry}")
+                removed += 1
+    missing = []
+    with contextlib.suppress(Exception):
+        doc = json.loads(read_text(f"{prof_dir}/package.json") or "{}")
+        bundles = ((doc.get("dsh") or {}).get("profile") or {}).get("bundles") or []
+        for bundle in bundles:
+            if os.path.isdir(f"{prof_dir}/node_modules/{bundle}"):
+                continue
+            if bundle.startswith("@deepseek-ai/"):
+                continue          # 这些从运行时解析 ✓
+            missing.append(bundle)
+    restarted = False
+    if restart:
+        st2 = load_state()
+        stop_instance(st2, name, mark=False)
+        restarted = bool(start_with_cookie_retry(load_state(), name, timeout=300.0))
+    return {"instance": name, "changes": changes, "ignored_removed": removed,
+            "unresolved_bundles": missing, "restarted": restarted}
+
+
+def cmd_instance_repair(args):
+    ensure_root()
+    try:
+        res = instance_repair(args.name, restart=bool(getattr(args, "restart", False)))
+    except KeyError:
+        die(f"no such instance: {args.name}")
+    for change in res["changes"]:
+        info(f"  {change}")
+    if res["ignored_removed"]:
+        info(f"  removed {res['ignored_removed']} stale .ignored entr(ies)")
+    if res["unresolved_bundles"]:
+        warn("这些 bundle 仍然解析不了（缺文件，需要重新安装该插件）："
+             + ", ".join(res["unresolved_bundles"]))
+    if not res["changes"] and not res["ignored_removed"] and not res["unresolved_bundles"]:
+        info(f"{args.name}: nothing to repair ✓")
+    if res["restarted"]:
+        info(f"{args.name}: restarted ✓")
+    elif getattr(args, "restart", False):
+        warn(f"{args.name}: restart did not bring it up; check "
+             f"/var/log/dsh-mu/{args.name}.err.log")
+    return 0
 
 
 def cmd_instance_create(args):
@@ -5508,14 +5631,37 @@ def ext_reload(quiet: bool = False) -> dict:
         # came from the appliance" to /ext-api, and an extension without an admin page
         # would otherwise never have one minted.
         ext_admin_token(name, manifest)
-        atomic_write(ext_jail_conf(name), render_ext_conf(manifest), mode=0o644)
-        atomic_write(f"{EXT_CONF}/{name}.json",
-                     json.dumps({k: v for k, v in manifest.items() if not k.startswith("_")},
-                                indent=2, sort_keys=True) + "\n", mode=0o644)
-        atomic_write(ext_service(name), render_ext_service(manifest), mode=0o755)
+        # 只有配置**真的变了**才重启 ✓
+        # （以前每次 sync 都无条件 restart ✗ 客户机上表现为 ext-ssh 反复收到 SIGTERM ✗，
+        #   落在重启窗口里的实例启动会连不上它的 socket → 卡住不绑端口 ✗）
+        conf_text = render_ext_conf(manifest)
+        conf_path = ext_jail_conf(name)
+        conf_changed = (read_text(conf_path) or "") != conf_text
+        atomic_write(conf_path, conf_text, mode=0o644)
+        meta_text = json.dumps({k: v for k, v in manifest.items() if not k.startswith("_")},
+                               indent=2, sort_keys=True) + "\n"
+        meta_path = f"{EXT_CONF}/{name}.json"
+        meta_changed = (read_text(meta_path) or "") != meta_text
+        atomic_write(meta_path, meta_text, mode=0o644)
+        svc_text = render_ext_service(manifest)
+        svc_path = ext_service(name)
+        svc_changed = (read_text(svc_path) or "") != svc_text
+        atomic_write(svc_path, svc_text, mode=0o755)
         run(["/sbin/rc-update", "add", f"dsh-mu-ext-{name}", "default"], check=False)
-        run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "restart"], check=False)
-        time.sleep(1.0)
+        running = ext_status(name) == "running"
+        supervised = unit_is_supervised(f"ext-{name}")
+        if conf_changed or meta_changed or svc_changed or not running or not supervised:
+            reason = ("config changed" if (conf_changed or meta_changed or svc_changed)
+                      else ("not running" if not running else "not supervised"))
+            info(f"extension {name}: restarting ({reason})")
+            if not running or not supervised:
+                with contextlib.suppress(Exception):
+                    run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "zap"], check=False,
+                        capture=True)
+            run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "restart"], check=False)
+            time.sleep(1.0)
+        else:
+            report.setdefault("unchanged", []).append(name)
         if ext_status(name) != "running":
             # A restart issued while the gateway/admin backend are still cycling leaves
             # the broker dead with no supervisor, and nothing retried it. Start it once
@@ -9795,8 +9941,71 @@ def watchdog_scan(heal: bool = True) -> dict:
     """
     st = load_state()
     bad, fixed, failed = [], [], []
+    # 平台自身：admin 后端 / 网关 停了就拉起来 ✓
+    # （客户机上踩到：装完 apk 后 dsh-mud 处于 stopped ✗ 整个 admin 打不开 ✗）
+    for svc in ("dsh-mud", "dsh-mu-gateway"):
+        if not os.path.exists(f"/etc/init.d/{svc}"):
+            continue
+        st_now = run(["/sbin/rc-service", svc, "status"], check=False, capture=True)
+        text = (st_now.stdout or "") + (st_now.stderr or "")
+        if "started" in text:
+            continue
+        if not heal:
+            bad.append(svc)
+            continue
+        info(f"watchdog: {svc} is not running — starting it")
+        with contextlib.suppress(Exception):
+            run(["/sbin/rc-service", svc, "zap"], check=False, capture=True)
+            run(["/sbin/rc-service", svc, "start"], check=False)
+            time.sleep(2.0)
+        text2 = run(["/sbin/rc-service", svc, "status"], check=False, capture=True)
+        if "started" in ((text2.stdout or "") + (text2.stderr or "")):
+            fixed.append(svc)
+        else:
+            failed.append(svc)
+
+    # 扩展设备（ext appliance）也归它管 ✓
+    # 客户机上踩到：ext-ssh 被反复重启后留下 unsupervised ✗ 没人再拉起 ✗
+    # → 依赖它的实例启动时连不上 socket，卡在 epoll 不绑端口 ✗
+    for name in sorted(ext_manifests()):
+        svc = f"dsh-mu-ext-{name}"
+        if not os.path.exists(f"/etc/init.d/{svc}"):
+            continue
+        # 注意：扩展"unsupervised"但进程还在时**不要**动它 ✓
+        # （我第一版在这里按 supervision 判，结果 watchdog 每 60 秒给它发一次 SIGTERM ✗
+        #   扩展被反复重启 ✗ 依赖它的实例又跟着卡住 ✗ —— 正是这次踩的坑）
+        status = ext_status(name)
+        if status in ("running", "unsupervised"):
+            continue
+        if not heal:
+            bad.append(f"ext-{name}")
+            continue
+        info(f"watchdog: extension {name} is not healthy — restarting it")
+        with contextlib.suppress(Exception):
+            run(["/sbin/rc-service", svc, "zap"], check=False, capture=True)
+            run(["/sbin/rc-service", svc, "restart"], check=False)
+            time.sleep(1.5)
+        if ext_status(name) in ("running", "unsupervised"):
+            fixed.append(f"ext-{name}")
+        else:
+            failed.append(f"ext-{name}")
+    # 连续失败计数：**必须连续 2 次**探测不到才重启 ✓
+    # 而且启动后 grace 期内一律不管 ✓
+    # （踩过的坑：实例正在冷启动 20–40 秒 ✗ watchdog 60 秒扫一次就把它重启了 ✗
+    #   而 stop 会写 cgroup.kill → 正启动的实例被当场杀掉 ✗ → 永远起不来 ✗）
+    grace = int(os.environ.get("DSHMU_WATCHDOG_GRACE") or 240)
+    state_path = "/run/dsh-mu/watchdog.json"
+    try:
+        misses = json.loads(read_text(state_path) or "{}")
+    except Exception:  # noqa: BLE001
+        misses = {}
+    now = int(time.time())
     for name, inst in sorted((st.get("instances") or {}).items()):
         if str((inst or {}).get("state") or "") != "running":
+            continue
+        started = int((inst or {}).get("started_at") or 0)
+        if started and now - started < grace:
+            misses.pop(name, None)
             continue
         port = int((inst or {}).get("port") or 0)
         if not port:
@@ -9808,12 +10017,18 @@ def watchdog_scan(heal: bool = True) -> dict:
         except OSError:
             alive = False
         if alive:
+            misses[name] = 0
             if heal and not unit_is_supervised(name):
                 with contextlib.suppress(Exception):
                     run(["/sbin/rc-service", f"dsh-mu-{name}", "stop"], check=False, capture=True)
                     run(["/sbin/rc-service", f"dsh-mu-{name}", "start"], check=False, capture=True)
             continue
         bad.append(name)
+        misses[name] = int(misses.get(name) or 0) + 1
+        if misses[name] < 2:
+            warn(f"watchdog: {name} (port {port}) not listening "
+                 f"({misses[name]}/2) — waiting one more check")
+            continue
         if not heal:
             continue
         info(f"watchdog: {name} (port {port}) is not listening — restarting it")
@@ -9822,10 +10037,14 @@ def watchdog_scan(heal: bool = True) -> dict:
             stop_instance(st2, name, mark=False)
             ok = start_with_cookie_retry(load_state(), name, timeout=180.0)
             (fixed if ok else failed).append(name)
+            misses[name] = 0
         except Exception as exc:  # noqa: BLE001
             warn(f"watchdog: {name}: {exc}"[:200])
             failed.append(name)
-    return {"down": bad, "fixed": fixed, "failed": failed}
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        atomic_write(state_path, json.dumps(misses), mode=0o644)
+    return {"down": bad, "fixed": fixed, "failed": failed, "misses": misses}
 
 
 def cmd_watchdog(args):
@@ -12435,6 +12654,7 @@ def split_plans_patch(yaml: str) -> tuple[str, str]:
 
 
 BUNDLED_PLUGINS_DIR = f"{LIB}/plugins"
+BUNDLED_PLUGINS_JAIL = "/opt/dsh-mu-plugins"
 
 
 def ensure_bundled_plugins(st: dict, name: str) -> list[str]:
@@ -12498,6 +12718,14 @@ def ensure_bundled_plugins(st: dict, name: str) -> list[str]:
         if pkg_name not in bundles:
             bundles.append(pkg_name)
             changed.append(f"{pkg_name}: bundle added")
+        # **关键**：只放进 node_modules + bundles 是不够的 ✗
+        # 用户一跑 pnpm install，它就被当"多余包"挪到 .ignored/ ✗ → 实例起不来 ✗
+        # 声明成 file: 依赖（jail 内只读挂载）后 pnpm 会保留它 ✓
+        deps = doc.setdefault("dependencies", {})
+        want_dep = f"file:{BUNDLED_PLUGINS_JAIL}/{plugin}"
+        if deps.get(pkg_name) != want_dep:
+            deps[pkg_name] = want_dep
+            changed.append(f"{pkg_name}: dependency declared ({want_dep})")
         with contextlib.suppress(OSError):
             os.chown(dst, uid, uid)
         # Marked `bundled`, not `protected`: a protected plugin gets a read-only bind
@@ -14870,6 +15098,27 @@ def doctor_checks(st: dict) -> list[dict]:
     add("instance patch freshness", DOCTOR_WARN if stale else DOCTOR_PASS,
         ("stale: " + ", ".join(stale) + "; run: dsh-muctl instance restart <name>")
         if stale else "every running instance read the current patch")
+    # 实例 profile 里的 bundle 是否都能解析？（客户机上出过：pnpm install 把内置插件
+    # 挪进 .ignored → DSH 启动时 bundle 解析失败 → 端口永远不监听 ✗）
+    broken = []
+    for iname in sorted(st["instances"]):
+        prof_dir = f"{instance_home(iname)}/.dsh/profiles/{instance_profile(iname)}"
+        with contextlib.suppress(Exception):
+            doc = json.loads(read_text(f"{prof_dir}/package.json") or "{}")
+            bundles = ((doc.get("dsh") or {}).get("profile") or {}).get("bundles") or []
+            for bundle in bundles:
+                if bundle.startswith("@deepseek-ai/"):
+                    continue
+                if not os.path.isdir(f"{prof_dir}/node_modules/{bundle}"):
+                    broken.append(f"{iname}:{bundle}")
+    if not broken:
+        add("profile bundles", DOCTOR_PASS, "every instance can resolve its profile bundles")
+    else:
+        add("profile bundles", DOCTOR_WARN,
+            f"{len(broken)} bundle(s) 缺文件（实例可能起不来）："
+            + ", ".join(broken[:3]) + (" …" if len(broken) > 3 else ""),
+            "dsh-muctl instance-repair <name> --restart   # 或让用户重装该插件")
+
     # 崩了会不会自动拉起？"unsupervised" 的实例不会 ✗（客户机上出现过 ✓ 现在 start 时自愈）
     loose = [n for n in sorted(st["instances"])
              if (st["instances"][n] or {}).get("state") == "running"
@@ -15703,6 +15952,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="usage 视图（配合 action=usage）")
     sp.add_argument("--days", type=int, default=7, help="usage 视图的时间窗口（天）")
     sp.set_defaults(func=cmd_relay)
+    sp = sub.add_parser("instance-repair",
+                        help="restore an instance's built-in profile bundles "
+                             "(fixes 'cannot resolve profile bundle')")
+    sp.add_argument("name")
+    sp.add_argument("--restart", action="store_true", help="restart it after repairing")
+    sp.set_defaults(func=cmd_instance_repair)
     sp = sub.add_parser("watchdog", help="keep instances alive (restart the ones that stopped listening)")
     sp.add_argument("--once", action="store_true", help="run one pass and exit")
     sp.add_argument("--dry-run", action="store_true", help="only report, do not restart")
