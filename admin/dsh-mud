@@ -706,6 +706,9 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("GET", re.compile(r"^/api/instances/([\w-]+)/logs$"), "instance_logs"),
     ("GET", re.compile(r"^/api/events$"), "events"),
     ("GET", re.compile(r"^/api/upgrade-job$"), "upgrade_job"),
+    ("GET", re.compile(r"^/api/upgrades$"), "upgrade_candidates"),
+    ("POST", re.compile(r"^/api/upgrade/start$"), "upgrade_start"),
+    ("POST", re.compile(r"^/api/upgrade/cancel$"), "upgrade_cancel"),
     ("GET", re.compile(r"^/api/instances/([\w-]+)/patch$"), "instance_patch"),
     ("GET", re.compile(r"^/api/instances/([\w-]+)$"), "instance"),
     ("GET", re.compile(r"^/api/doctor$"), "doctor"),
@@ -2406,6 +2409,60 @@ class Handler(BaseHTTPRequestHandler):
             if groups[0] not in st["instances"]:
                 return 404, {"error": "no such instance", "instance": groups[0]}
             return 200, {"instance": instance_view(st, groups[0])}
+        if name == "upgrade_candidates":
+            rows = []
+            for folder in ("/root", "/var/lib/dsh-mu/upgrades", "/tmp"):
+                with contextlib.suppress(OSError):
+                    for entry in sorted(os.listdir(folder)):
+                        if not entry.endswith(".apk") or not entry.startswith("dsh-mu-"):
+                            continue
+                        path = os.path.join(folder, entry)
+                        try:
+                            stat = os.stat(path)
+                        except OSError:
+                            continue
+                        rows.append({"apk": path, "name": entry,
+                                     "mb": round(stat.st_size / 1048576, 1),
+                                     "mtime": int(stat.st_mtime)})
+            rows.sort(key=lambda row: row["mtime"], reverse=True)
+            return 200, {"candidates": rows[:20]}
+        if name == "upgrade_start":
+            apk = str(body.get("apk") or "").strip()
+            if not apk or not os.path.isfile(apk):
+                return 400, {"error": "apk not found", "apk": apk}
+            argv = ["/usr/local/sbin/dsh-muctl", "upgrade", apk, "--worker"]
+            for flag in ("previous", "snapshot"):
+                value = str(body.get(flag) or "").strip()
+                if value:
+                    argv += [f"--{flag}", value]
+            if body.get("restart_stale"):
+                argv.append("--restart-stale")
+            log_path = f"{mu.LOGS}/upgrade.log"
+            with contextlib.suppress(OSError):
+                os.makedirs(mu.LOGS, exist_ok=True)
+                with open(log_path, "ab") as log:
+                    child = subprocess.Popen(argv, stdout=log, stderr=log,
+                                             start_new_session=True, close_fds=True)
+                mu.atomic_write("/run/dsh-mu/upgrade-job.json",
+                                json.dumps({"id": int(time.time()), "phase": "starting",
+                                            "apk": apk, "pid": child.pid,
+                                            "started": int(time.time())},
+                                           indent=2, ensure_ascii=False) + "\n", mode=0o644)
+                return 202, {"ok": True, "pid": child.pid, "apk": apk}
+            return 500, {"error": "could not start the upgrade worker"}
+        if name == "upgrade_cancel":
+            path = "/run/dsh-mu/upgrade-job.json"
+            job = {}
+            with contextlib.suppress(Exception):
+                job = json.loads(mu.read_text(path) or "{}")
+            phase = str(job.get("phase") or "")
+            pid = int(job.get("pid") or 0)
+            if phase in ("installing", "install", "installed", "verify", "rollback"):
+                return 409, {"error": f"cannot cancel during {phase}; let it finish or roll back"}
+            if pid:
+                with contextlib.suppress(OSError):
+                    os.kill(pid, 15)
+            return 200, {"ok": True, "cancelled_pid": pid}
         if name == "upgrade_job":
             path = "/run/dsh-mu/upgrade-job.json"
             payload = {"job": None, "installed_at": 0, "version": VERSION}

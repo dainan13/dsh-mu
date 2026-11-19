@@ -1116,6 +1116,12 @@ depend() {
 	after openresty
 }
 
+# 说明（P2-1 阶段 3c）：
+#   · 判活与重启决策以 cell（cgroup + 端口）为准 —— `dsh-muctl cell list`
+#   · 手动操作请用 `dsh-muctl instance start|stop|restart <name>`
+#   · 本 init 脚本只负责"开机自启 + supervise-daemon 崩溃重拉"
+#   （曾尝试把 rc-service 转发给 dsh-muctl，但 openrc 的 restart 是 stop+start 两段式，
+#     与 exec 转发冲突，实测 "failed to start" ✗ → 不做转发，保持极简）
 start_pre() {
 	checkpath --directory --mode 0755 /var/log/dsh-mu
 	checkpath --directory --mode 0755 @BASE@
@@ -1909,6 +1915,24 @@ def sync_all(st: dict):
         ext_reload(quiet=True)
     with contextlib.suppress(Exception):
         probe = run(["/sbin/rc-service", "dsh-mud", "status"], check=False, capture=True)
+        # 「started」可能是假的 ✗：端口被上一代 python 占着（客户机上占了 15 小时）
+        # → 只有"端口持有者 == 当前 supervisor 的子进程"才算真的在跑 ✓
+        port_now = admin_port()
+        owners = listening_pids(port_now)
+        children = service_child_pids("dsh-mud")
+        stale_owner = bool(owners) and not set(owners) <= children
+        # 更强的判据：端口持有者的**启动时间早于后端文件** → 一定在跑旧代码 ✓
+        code_stale = admin_code_stale(port_now)
+        if code_stale:
+            info(f"admin backend: pid {code_stale} predates {os.path.basename('/usr/local/sbin/dsh-mud')}"
+                 f" — restarting it")
+            stale_owner = True
+        if stale_owner:
+            info(f"admin backend: port {port_now} is held by {owners} (not supervised) — reclaiming")
+            ensure_port_free(port_now)
+            run(["/sbin/rc-service", "dsh-mud", "zap"], check=False, capture=True)
+            run(["/sbin/rc-service", "dsh-mud", "start"], check=False)
+            time.sleep(1.5)
         if "started" not in ((probe.stdout or "") + (probe.stderr or "")):
             info("admin backend: not running → starting it")
             ensure_port_free(admin_port(), keep=service_child_pids("dsh-mud"))
@@ -2738,9 +2762,8 @@ def service_action(name: str, action: str, check: bool = True):
     unit_name = svc[len("dsh-mu-"):]
     is_instance = unit_name in load_state()["instances"]
     if action in ("start", "restart"):
-        reaped = reap_stale_supervisors(svc)
-        if reaped:
-            info(f"{svc}: cleaned up {len(reaped)} stale supervisor(s) before {action}")
+        # P2-1 阶段 3b：不再依赖 pidfile 判断"哪个 supervisor 是多余的" ✗
+        # 重复 supervisor 的清理改成显式命令 `instance reap-supervisors`（按 cgroup 判据）✓
         if is_instance:
             with contextlib.suppress(Exception):
                 free_instance_port(unit_name)
@@ -3211,6 +3234,37 @@ def instance_drift(st: dict, name: str) -> dict:
     out["items"]["want_id"] = want_id
     out["needs_restart"] = any(bool(out["items"][k]) for k in ("patch", "plugins", "probe", "runtime"))
     return out
+
+
+def proc_start_epoch(pid: int) -> float:
+    """/proc/<pid>/stat 的 starttime + 系统 btime（进程真实启动时间 ✓）。"""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            fields = fh.read().rsplit(")", 1)[1].split()
+        starttime = float(fields[19])
+        ticks = float(os.sysconf("SC_CLK_TCK") or 100)
+        btime = 0.0
+        for line in tail_file("/proc/stat", 400):
+            if line.startswith("btime"):
+                btime = float(line.split()[1])
+                break
+        return btime + starttime / ticks if btime else 0.0
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def admin_code_stale(port: int, binary: str = "/usr/local/sbin/dsh-mud") -> list[int]:
+    """占着端口、但启动时间早于后端文件的进程（= 跑着旧代码 ✗）"""
+    stale = []
+    try:
+        file_mtime = os.path.getmtime(binary)
+    except OSError:
+        return stale
+    for pid in listening_pids(port):
+        started = proc_start_epoch(pid)
+        if started and started + 1.0 < file_mtime:
+            stale.append(pid)
+    return stale
 
 
 def listening_pids(port: int) -> list[int]:
@@ -5912,8 +5966,42 @@ def cmd_instance_del(args):
     info(f"instance {args.name} deleted" + ("" if args.purge else "; data kept under " + f"{INSTANCES_DIR}/{args.name}"))
 
 
+RESTART_JOB = "/run/dsh-mu/restart-stale-job.json"
+RESTART_JOB_LOG = f"{LOGS}/restart-stale.log"
+
+
+def restart_job_write(job: dict) -> None:
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(RESTART_JOB), exist_ok=True)
+        atomic_write(RESTART_JOB, json.dumps(job, indent=2, ensure_ascii=False) + "\n", mode=0o644)
+
+
+def restart_job_read() -> dict:
+    with contextlib.suppress(Exception):
+        return json.loads(read_text(RESTART_JOB) or "{}")
+    return {}
+
+
 def cmd_instance_restart_stale(args):
-    """把"文件已新、进程仍旧"的实例重启一遍（升级后的收尾动作 ✓）。"""
+    """把"文件已新、进程仍旧"的实例重启一遍（升级后的收尾动作 ✓）。
+
+    默认是**后台 job**：立即返回，进度写 /run/dsh-mu/restart-stale-job.json
+    （9 台要 8–10 分钟 ✗ 不能让终端/页面一直卡着）
+      · --wait    等它跑完（脚本/自动化用）
+      · --status  只看进度
+      · --worker  内部用（真正的执行者）
+    """
+    if getattr(args, "status", False):
+        job = restart_job_read()
+        if not job:
+            info("no restart-stale job has run yet")
+            return 0
+        done, failed = job.get("done") or [], job.get("failed") or []
+        print(json.dumps(job, indent=2, ensure_ascii=False) if getattr(args, "json", False) else
+              f"job {job.get('id')}: phase={job.get('phase')} "
+              f"{len(done)}/{job.get('total')} done, {len(failed)} failed")
+        return 0
+
     st = load_state()
     targets = []
     for name in sorted(st.get("instances") or {}):
@@ -5934,23 +6022,53 @@ def cmd_instance_restart_stale(args):
     if args.dry_run:
         return 0
 
+    if not getattr(args, "worker", False) and not getattr(args, "wait", False):
+        job = {"id": int(time.time()), "started": int(time.time()), "phase": "starting",
+               "total": len(targets), "done": [], "failed": [],
+               "targets": [n for n, _w in targets]}
+        restart_job_write(job)
+        argv = [sys.executable, os.path.abspath(__file__), "instance", "restart-stale",
+                "--worker", "--concurrency", str(int(args.concurrency or 3)),
+                "--timeout", str(float(args.timeout))]
+        if args.instance:
+            argv.append(args.instance)
+        with contextlib.suppress(OSError):
+            os.makedirs(LOGS, exist_ok=True)
+            with open(RESTART_JOB_LOG, "ab") as log:
+                subprocess.Popen(argv, stdout=log, stderr=log, start_new_session=True,
+                                 close_fds=True)
+        info(f"restart-stale started in the background ({len(targets)} instance(s))")
+        info(f"  watch: dsh-muctl instance restart-stale --status   |  log: {RESTART_JOB_LOG}")
+        return 0
+
     import concurrent.futures
     results = {}
 
-    def one(name: str) -> tuple[bool, str]:
+    def one(name: str, attempt: int = 1) -> tuple[bool, str]:
         try:
             cur = load_state()
             stop_instance(cur, name)
             start_instance(cur, name, timeout=float(args.timeout))
             return True, ""
         except SystemExit as exc:            # die() 走的是 SystemExit ✓
-            return False, str(exc.code or "start failed")[:200]
+            err = str(exc.code or "start failed")[:200]
         except Exception as exc:             # noqa: BLE001
-            return False, str(exc)[:200]
+            err = str(exc)[:200]
+        # 并发重启偶发失败（历史现象）→ 重试一次；重启本身是幂等的 ✓
+        if attempt < 2:
+            info(f"  {name}: attempt {attempt} failed ({err[:60]}), retrying once")
+            time.sleep(5.0)
+            return one(name, attempt + 1)
+        return False, err
 
     # 状态层已原子化 ✓；重启已改走 cell（kill → 等 populated=0 → 起 → 等端口）✓
     # 这两条到位后，并发重启是安全的（P2-1 阶段 3b 的验收项之一）
     workers = max(1, min(int(args.concurrency or 3), len(targets)))
+    job = restart_job_read() or {"id": int(time.time()), "started": int(time.time()),
+                                 "total": len(targets), "done": [], "failed": []}
+    job.update({"phase": "running", "total": len(targets),
+                "targets": [n for n, _w in targets], "done": [], "failed": []})
+    restart_job_write(job)
     info(f"restarting {len(targets)} instance(s) with concurrency {workers}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(one, name): name for name, _why in targets}
@@ -5961,8 +6079,16 @@ def cmd_instance_restart_stale(args):
             except Exception as exc:         # noqa: BLE001
                 ok, err = False, str(exc)[:200]
             results[name] = (ok, err)
+            if ok:
+                job["done"].append(name)
+            else:
+                job["failed"].append({"instance": name, "error": err})
+            job["phase"] = "running"
+            restart_job_write(job)
             info(f"  {name}: {'ok' if ok else 'FAILED ' + err}")
     failed = [n for n, (ok, _e) in results.items() if not ok]
+    job.update({"phase": "done" if not failed else "failed", "finished": int(time.time())})
+    restart_job_write(job)
     if failed:
         warn(f"{len(failed)} instance(s) failed to restart: {', '.join(sorted(failed))}")
         return 1
@@ -11498,7 +11624,77 @@ def upgrade_job_step(job: dict, phase: str, detail: str = "") -> None:
         info(f"[{phase}] {detail}" if detail else f"[{phase}]")
 
 
+UPGRADE_LOG = f"{LOGS}/upgrade.log"
+
+
 def cmd_upgrade(args):
+    """升级入口：默认起后台 job（页面/终端都不该被 1–3 分钟阻塞 ✗）。
+
+      · 默认        后台执行，立即返回，进度写 /run/dsh-mu/upgrade-job.json
+      · --wait      前台执行并等待（脚本/验收用）
+      · --worker    内部：真正的执行者
+      · --cancel    取消（只在预检/快照阶段允许；安装之后不允许中断 ✗）
+    """
+    if getattr(args, "cancel", False):
+        job = json.loads(read_text(UPGRADE_JOB) or "{}") if os.path.exists(UPGRADE_JOB) else {}
+        phase = str(job.get("phase") or "")
+        pid = int(job.get("pid") or 0)
+        if phase in ("installing", "install", "installed", "verify", "rollback"):
+            die(f"不能取消：已经进入 {phase} 阶段（中断安装可能留下半装状态），"
+                f"请等它跑完或自动回滚")
+        if pid:
+            with contextlib.suppress(OSError):
+                os.kill(pid, 15)
+            info(f"upgrade job {job.get('id')} cancelled (pid {pid})")
+        else:
+            info("no running upgrade job")
+        return 0
+    if not getattr(args, "worker", False) and not getattr(args, "wait", False):
+        path = os.path.abspath(args.apk)
+        if not os.path.isfile(path):
+            die(f"no such apk: {path}")
+        argv = [sys.executable, os.path.abspath(__file__), "upgrade", path, "--worker"]
+        for flag in ("previous", "snapshot"):
+            val = getattr(args, flag, "")
+            if val:
+                argv += [f"--{flag}", str(val)]
+        argv += ["--min-free-gb", str(float(args.min_free_gb)),
+                 "--verify-timeout", str(float(args.verify_timeout))]
+        if getattr(args, "force", False):
+            argv.append("--force")
+        if getattr(args, "skip_doctor", False):
+            argv.append("--skip-doctor")
+        if getattr(args, "restart_stale", False):
+            argv.append("--restart-stale")
+        if getattr(args, "no_restore_state", False):
+            argv.append("--no-restore-state")
+        with contextlib.suppress(OSError):
+            os.makedirs(LOGS, exist_ok=True)
+            with open(UPGRADE_LOG, "ab") as log:
+                child = subprocess.Popen(argv, stdout=log, stderr=log,
+                                         start_new_session=True, close_fds=True)
+            restart_job_write({"id": int(time.time()), "phase": "starting", "apk": path,
+                               "pid": child.pid, "started": int(time.time())})
+        info(f"upgrade started in the background: {path}")
+        info(f"  watch: dsh-muctl upgrade --status   |  log: {UPGRADE_LOG}")
+        return 0
+    if getattr(args, "status", False):
+        if not os.path.exists(UPGRADE_JOB):
+            info("no upgrade job has run yet")
+            return 0
+        job = json.loads(read_text(UPGRADE_JOB) or "{}")
+        if getattr(args, "json", False):
+            print(json.dumps(job, indent=2, ensure_ascii=False))
+        else:
+            print(f"job {job.get('id')}: phase={job.get('phase')} "
+                  f"ok={job.get('ok')} rolled_back={job.get('rolled_back')}")
+            for step in (job.get("steps") or [])[-6:]:
+                print(f"  [{step.get('phase')}] {str(step.get('detail') or '')[:120]}")
+        return 0
+    return _upgrade_run(args)
+
+
+def _upgrade_run(args):
     """升级 = 预检 → 快照 → 安装 → 验证 →（失败自动回滚）
 
     以前升级靠人手：装完才发现 admin 打不开、实例起不来 ✗
@@ -11514,6 +11710,7 @@ def cmd_upgrade(args):
     current = _platform_version()
     prev_apk = args.previous or latest_other_apk(path)
     job = {"id": int(time.time()), "apk": path, "expected": expected, "from": current,
+           "pid": os.getpid(),
            "previous_apk": prev_apk, "started": int(time.time()), "ok": None,
            "quiet": bool(getattr(args, "json", False))}
 
@@ -11652,7 +11849,8 @@ def cmd_upgrade(args):
         if drift and getattr(args, "restart_stale", False):
             upgrade_job_step(job, "restart-stale", f"{len(drift)} instance(s)")
             rc = cmd_instance_restart_stale(argparse.Namespace(
-                instance="", dry_run=False, concurrency=1, timeout=180.0))
+                instance="", dry_run=False, concurrency=1, timeout=180.0,
+                wait=True, status=False, worker=False, json=False))
             upgrade_job_step(job, "restart-stale-done", "ok" if rc == 0 else "some failed")
             st_after = load_state()
             drift = [n for n in sorted(st_after.get("instances") or {})
@@ -15651,6 +15849,111 @@ def _landlock_abi() -> int:
         return -1
 
 
+# ---------------------------------------------------------------- 人话词表
+# 分组：blocking（必须修）/ suggestion（能改善）/ info（正常现象，可忽略）
+DOCTOR_HUMAN: dict[str, tuple[str, str, str]] = {
+    "admin backend": ("页面服务（后台）", "blocking", "dsh-muctl sync"),
+    "admin port owner": ("页面服务的进程归属", "suggestion", "dsh-muctl sync"),
+    "gateway lua": ("网关脚本版本", "suggestion", "dsh-muctl sync"),
+    "gateway jail answering": ("网关（jail）是否响应", "blocking", "dsh-muctl doctor --fix"),
+    "gateway jail config": ("网关（jail）配置", "suggestion", "dsh-muctl sync"),
+    "gateway jail configuration": ("网关（jail）配置", "suggestion", "dsh-muctl sync"),
+    "gateway jail rootfs": ("网关（jail）根文件系统", "blocking", "dsh-muctl install"),
+    "gateway views in sync": ("网关路由是否最新", "suggestion", "dsh-muctl sync"),
+    "nginx configuration": ("nginx 主配置", "blocking", "dsh-muctl doctor --fix"),
+    "nginx fragments": ("nginx 片段", "blocking", "dsh-muctl doctor --fix"),
+    "nginx managed include": ("nginx 托管引入", "blocking", "dsh-muctl doctor --fix"),
+    "nginx runtime": ("nginx 运行环境", "blocking", "dsh-muctl doctor --fix"),
+    "nginx temp dirs": ("网关临时目录权限", "blocking", "dsh-muctl doctor --fix"),
+    "lua_shared_dict dshmu": ("网关共享内存", "suggestion", "dsh-muctl sync"),
+    "cgroup v2 mounted": ("资源限制（cgroup）已挂载", "blocking", "dsh-muctl doctor --fix"),
+    "cgroup controllers": ("资源限制控制器", "blocking", "dsh-muctl doctor --fix"),
+    "cgroup delegation": ("资源限制委派", "blocking", "dsh-muctl doctor --fix"),
+    "cgroup limits writable": ("资源限制可写", "blocking", "dsh-muctl doctor --fix"),
+    "cgroup service at boot": ("资源限制服务开机自启", "blocking", "dsh-muctl doctor --fix"),
+    "instance cgroup tree": ("实例资源限额已生效", "blocking", "dsh-muctl sync"),
+    "disk space": ("磁盘余量", "blocking", "dsh-muctl logs rotate；或删除旧运行时镜像"),
+    "log usage": ("日志占用", "suggestion", "dsh-muctl logs rotate"),
+    "log rotation": ("日志轮转配置", "suggestion", "dsh-muctl doctor --fix"),
+    "instance drift": ("有实例需要重启才能用上新版本", "suggestion",
+                       "dsh-muctl instance restart-stale"),
+    "instance patch freshness": ("实例的模型/计划配置是否最新", "suggestion",
+                                 "dsh-muctl instance restart <实例名>"),
+    "profile bundles": ("实例缺插件包", "blocking", "dsh-muctl instance-repair <实例名>"),
+    "instance supervision": ("实例守护（崩溃后会自动拉起）", "suggestion",
+                             "dsh-muctl instance restart <实例名>"),
+    "supervisors": ("重复的守护进程", "info", "dsh-muctl instance reap-supervisors"),
+    "cell view": ("状态记录不一致（服务其实正常）", "info",
+                  "可忽略；想清零就 dsh-muctl instance restart <实例名>"),
+    "runtime": ("DSH 运行时", "blocking", "dsh-muctl doctor --fix"),
+    "global dsh runtime": ("全局 DSH 运行时", "blocking", "dsh-muctl doctor --fix"),
+    "shared dsh runtime": ("共享 DSH 运行时", "blocking", "dsh-muctl doctor --fix"),
+    "runtime pty": ("实例终端所需的原生模块", "blocking", "dsh-muctl runtime ensure-mounted"),
+    "dsh native modules": ("DSH 原生模块", "blocking", "dsh-muctl runtime ensure-mounted"),
+    "relay tokens": ("模型转发凭据", "blocking", "dsh-muctl sync"),
+    "model relay": ("模型转发", "suggestion", "dsh-muctl sync"),
+    "web search plan": ("联网搜索计划", "suggestion", "dsh-muctl plan sync"),
+    "models page": ("模型设置页", "suggestion", "dsh-muctl sync"),
+    "models lock": ("模型设置页锁定", "suggestion", "dsh-muctl sync"),
+    "plan ↔ instance patch": ("计划与实例配置是否一致", "suggestion", "dsh-muctl plan sync"),
+    "egress nft": ("出网规则表", "suggestion", "dsh-muctl sync"),
+    "egress policy": ("出网策略", "suggestion", "dsh-muctl sync"),
+    "egress rules": ("实例出网规则", "suggestion", "dsh-muctl sync"),
+    "ext ssh": ("SSH 扩展", "blocking", "dsh-muctl ext restart ssh"),
+    "ext ports": ("扩展端口", "blocking", "dsh-muctl ext status <名称>"),
+    "ext ui": ("扩展管理页", "suggestion", "dsh-muctl ext restart <名称>"),
+    "accounts without instance": ("有账号没有可用实例", "suggestion",
+                                  "dsh-muctl instance bind-user <实例> <账号>"),
+    "orphan instances": ("有实例没有对应账号", "suggestion",
+                         "dsh-muctl instance bind-user <实例> <账号>"),
+    "HTTPS": ("HTTPS 配置", "suggestion", "dsh-muctl tls status"),
+    "HTTPS certificate": ("HTTPS 证书", "suggestion", "dsh-muctl tls status"),
+    "HTTPS certificate expiry": ("HTTPS 证书有效期", "suggestion", "dsh-muctl tls renew"),
+    "HTTPS listening on 443": ("HTTPS 端口 443", "suggestion", "dsh-muctl tls status"),
+    "platform config": ("平台配置", "blocking", "dsh-muctl config list"),
+    "platform state": ("平台状态文件", "blocking", "dsh-muctl sync-state"),
+    "session secret": ("会话密钥", "blocking", "dsh-muctl doctor --fix"),
+    "jail template": ("实例模板", "blocking", "dsh-muctl install --force-template"),
+    "mount+UTS namespace": ("实例隔离（命名空间）", "blocking", "dsh-muctl doctor --fix"),
+    "bind/tmpfs mount in namespace": ("实例挂载能力", "blocking", "dsh-muctl doctor --fix"),
+    "capability drop (setpriv)": ("权限收敛（drop capabilities）", "blocking",
+                                  "dsh-muctl doctor --fix"),
+    "landlock LSM": ("Landlock 内核保护", "info", "可忽略（内核未启用）"),
+    "unprivileged user namespace": ("非特权用户命名空间", "info", "可忽略（内核限制）"),
+    "plugin packages": ("插件包", "suggestion", "dsh-muctl plugin list"),
+    "plugin policy": ("插件策略", "suggestion", "dsh-muctl plugin policy"),
+    "market feed": ("插件市场源", "info", "可忽略"),
+    "required commands": ("必需的命令行工具", "blocking", "dsh-muctl install"),
+    "alpine release": ("系统版本", "blocking", "升级系统后重试"),
+    "alpine mirror": ("系统软件源", "info", "可忽略（离线机器正常）"),
+    "community repository": ("系统社区源", "info", "可忽略（离线机器正常）"),
+    "npm registry": ("npm 源可达性", "info", "可忽略（离线机器正常）"),
+    "configured alpine version": ("配置里的系统版本", "info", "可忽略"),
+}
+
+GROUP_LABEL = {"blocking": "必须处理", "suggestion": "建议处理", "info": "提示（可忽略）"}
+GROUP_ORDER = ("blocking", "suggestion", "info")
+
+
+def humanize_check(check: dict) -> dict:
+    """给一条检查补上中文标题 / 分组 / 怎么办（内部 check 名保留 ✓）"""
+    name = str(check.get("check") or "")
+    title, group, advice = DOCTOR_HUMAN.get(name, ("", "", ""))
+    if not title:
+        title = name
+    if not group:
+        group = {"FAIL": "blocking", "WARN": "suggestion", "SKIP": "info"}.get(
+            str(check.get("status")), "pass")
+    if str(check.get("status")) == DOCTOR_PASS:
+        group = "pass"
+    if not advice:
+        advice = "" if group == "pass" else str(check.get("fix") or "").replace("fix: ", "")
+    check["title"] = title
+    check["group"] = group
+    check["advice"] = advice
+    return check
+
+
 def doctor_checks(st: dict) -> list[dict]:
     cfg = st["config"]
     checks: list[dict] = []
@@ -16782,6 +17085,8 @@ def doctor_checks(st: dict) -> list[dict]:
         f"{os.path.basename(biggest['file'])} {biggest['mb']}MB；启动报告 "
         f"{usage['startup_reports']} 份 {usage['startup_reports_mb']}MB（阈值 {max_mb}MB/文件）",
         volume_fix)
+    for _c in checks:
+        humanize_check(_c)
     return checks
 
 
@@ -16844,17 +17149,45 @@ def cmd_doctor(args):
         print(json.dumps({"checks": checks, "summary": counts,
                           "config_file": CONF_PATH, "version": VERSION}, indent=2, sort_keys=True))
     else:
-        width = max(len(c["check"]) for c in checks) if checks else 10
-        for c in checks:
-            line = f"{c['status']:4}  {c['check']:<{width}}  {c['detail']}"
-            print(line)
-            if c["fix"] and c["status"] in (DOCTOR_FAIL, DOCTOR_WARN):
-                print(f"      {'':<{width}}  fix: {c['fix']}")
-        print()
-        print(f"doctor: {counts[DOCTOR_PASS]} PASS, {counts[DOCTOR_WARN]} WARN, {counts[DOCTOR_FAIL]} FAIL")
+        # 人话 + 分组：必须处理 → 建议处理 → 提示（默认折叠 PASS 与提示项 ✓）
+        verbose = bool(getattr(args, "verbose", False))
+        for group in GROUP_ORDER:
+            rows = [c for c in checks if c.get("group") == group
+                    and (group != "info" or verbose)]
+            if group == "info" and not verbose:
+                hidden = len([c for c in checks if c.get("group") == "info"])
+                if hidden:
+                    print(f"（{hidden} 条提示项已折叠：正常现象，可忽略；用 --verbose 查看）")
+                    print()
+                continue
+            if not rows:
+                continue
+            print(f"── {GROUP_LABEL[group]} " + "─" * max(4, 40 - len(GROUP_LABEL[group])))
+            for c in rows:
+                mark = {DOCTOR_FAIL: "✗", DOCTOR_WARN: "!", DOCTOR_PASS: "✓",
+                        DOCTOR_SKIP: "-"}.get(c["status"], "?")
+                print(f"  {mark} {c.get('title') or c['check']}")
+                detail = str(c.get("detail") or "").strip()
+                if detail and (verbose or c["status"] != DOCTOR_PASS):
+                    print(f"      {detail}")
+                advice = str(c.get("advice") or "").strip()
+                if advice and c["status"] != DOCTOR_PASS:
+                    print(f"      怎么办：{advice}")
+            print()
+        if verbose:
+            passed = [c for c in checks if c.get("group") == "pass"]
+            if passed:
+                print(f"── 已通过（{len(passed)} 项）".ljust(48, "─"))
+                for c in passed:
+                    print(f"  ✓ {c.get('title') or c['check']}")
+                print()
+        print(f"doctor: {counts[DOCTOR_PASS]} PASS, {counts[DOCTOR_WARN]} WARN, "
+              f"{counts[DOCTOR_FAIL]} FAIL")
         if counts[DOCTOR_FAIL]:
-            print("doctor: blocking problems found — fix them before installing instances "
-                  "(try: dsh-muctl doctor --fix)")
+            print("存在必须处理的问题：按上面每条的\"怎么办\"执行；"
+                  "也可以先试 dsh-muctl doctor --fix")
+        elif counts[DOCTOR_WARN]:
+            print("没有阻断问题；建议项可以按需处理。")
     return 1 if counts[DOCTOR_FAIL] else 0
 
 
@@ -16974,6 +17307,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="restart instances whose files changed on disk (after an upgrade)")
     a.add_argument("instance", nargs="?", default="", help="only this instance")
     a.add_argument("--dry-run", action="store_true")
+    a.add_argument("--wait", action="store_true", help="run in the foreground and wait")
+    a.add_argument("--status", action="store_true", help="print the background job state")
+    a.add_argument("--worker", action="store_true", help="internal: the background worker")
+    a.add_argument("--json", action="store_true")
     a.add_argument("--concurrency", type=int, default=3)
     a.add_argument("--timeout", type=float, default=180.0)
     a.set_defaults(func=cmd_instance_restart_stale)
@@ -17202,6 +17539,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", action="store_true", help="reinstall the same version")
     sp.add_argument("--skip-doctor", action="store_true", help="ignore doctor FAILs in preflight")
     sp.add_argument("--no-restore-state", action="store_true")
+    sp.add_argument("--wait", action="store_true", help="run in the foreground and wait")
+    sp.add_argument("--worker", action="store_true", help="internal: the background worker")
+    sp.add_argument("--status", action="store_true", help="print the job state")
+    sp.add_argument("--cancel", action="store_true", help="cancel a queued upgrade (preflight only)")
     sp.add_argument("--restart-stale", action="store_true",
                     help="after a successful upgrade, restart the instances whose files changed")
     sp.add_argument("--json", action="store_true")
@@ -17250,6 +17591,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--interval", type=int, default=WATCHDOG_INTERVAL)
     sp.set_defaults(func=cmd_watchdog)
     sp = sub.add_parser("doctor", help="diagnose host prerequisites (run this first on a new machine)")
+    sp.add_argument("--verbose", action="store_true",
+                   help="show every check, including the folded informational ones")
     sp.add_argument("--json", action="store_true", help="machine-readable report (for the admin backend)")
     sp.add_argument("--fix", action="store_true", help="apply the safe fixes it knows (gateway install, sync, cgroup)")
     sp.set_defaults(func=cmd_doctor)

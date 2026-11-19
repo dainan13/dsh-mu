@@ -1525,9 +1525,17 @@ html.wiring .side-stack .flags { visibility: hidden; }
           <div class="panel-body">
             <div class="row-wrap" style="gap:18px;align-items:center">
               <div><div class="faint" style="font-size:11.5px">当前版本</div><div class="mono strong" id="upgVersion">—</div></div>
-              <div><div class="faint" style="font-size:11.5px">上次升级</div><div id="upgResult">—</div></div>
-              <div><div class="faint" style="font-size:11.5px">待重启实例</div><div id="upgDrift">—</div></div>
-              <div><div class="faint" style="font-size:11.5px">阻断项</div><div id="upgFail">—</div></div>
+              <div><div class="faint" style="font-size:11.5px">上次升级结果</div><div id="upgResult">—</div></div>
+              <div><div class="faint" style="font-size:11.5px">需要重启才生效的实例</div><div id="upgDrift">—</div></div>
+              <div><div class="faint" style="font-size:11.5px">需要处理的问题</div><div id="upgFail">—</div></div>
+            </div>
+            <div class="row-wrap" style="gap:10px;align-items:flex-end;margin-top:10px">
+              <label class="field" style="min-width:320px"><span class="label">要安装的升级包（服务器上的 apk）</span>
+                <select class="select sm" id="upgApk"><option value="">（扫描中…）</option></select>
+              </label>
+              <label class="switch"><input type="checkbox" id="upgRestartStale" checked><span>升级后自动重启受影响的实例</span></label>
+              <button class="btn primary sm" onclick="startUpgrade()">开始升级</button>
+              <button class="btn sm ghost" onclick="cancelUpgrade()">取消</button>
             </div>
             <div class="faint" id="upgSteps" style="font-size:11.5px;margin-top:8px"></div>
           </div>
@@ -1537,6 +1545,15 @@ html.wiring .side-stack .flags { visibility: hidden; }
           <div class="panel-head">
             <h2>实例事件</h2><span class="sub" id="eventSub">最近 100 条</span>
             <span class="spacer"></span>
+            <select class="select sm" id="evKind" style="width:150px" onchange="loadEvents()">
+              <option value="">全部类型</option>
+              <option value="instance.start">实例启动</option>
+              <option value="instance.stop">实例停止</option>
+              <option value="instance.failure">实例失败</option>
+            </select>
+            <select class="select sm" id="evInst" style="width:150px" onchange="loadEvents()">
+              <option value="">全部实例</option>
+            </select>
             <button class="btn sm ghost" onclick="loadEvents()"><svg class="i i-sm"><use href="#i-refresh"/></svg>刷新</button>
           </div>
           <div class="panel-scroll" style="max-height:260px">
@@ -4308,6 +4325,50 @@ function wireDoctorBadge(summary) {
   }
 
   // 实例事件：平台侧的结构化历史（start/stop/failure），和文本日志互补 ✓
+  // 升级：候选包列表 + 开始/取消（真正调用后端，不是演示）
+  window.loadUpgradeCandidates = async function () {
+    const sel = document.getElementById('upgApk');
+    if (!sel) return;
+    try {
+      const d = await api('upgrades');
+      const rows = d.candidates || [];
+      sel.innerHTML = rows.length
+        ? rows.map(r => `<option value="${esc(r.apk)}">${esc(r.name)} · ${r.mb}MB · ${new Date(r.mtime * 1000).toLocaleDateString()}</option>`).join('')
+        : '<option value="">服务器上没有找到 dsh-mu-*.apk</option>';
+    } catch (e) {
+      sel.innerHTML = `<option value="">读取失败：${esc(e.message)}</option>`;
+    }
+  };
+  window.startUpgrade = async function () {
+    const sel = document.getElementById('upgApk');
+    const apk = (sel || {}).value || '';
+    if (!apk) { toast('err', '先选择升级包', '把 apk 放到服务器的 /root 下再刷新'); return; }
+    const restart = !!((document.getElementById('upgRestartStale') || {}).checked);
+    askConfirm({
+      title: '开始升级？', sub: apk,
+      body: '<p style="margin:0;font-size:12px;line-height:18px;color:var(--ink-2)">' +
+        '升级会先做体检与快照，失败会自动退回当前版本。升级过程中页面可能短暂不可用。</p>',
+      okText: '开始升级',
+      onOk: async () => {
+        const r = await act('upgrade/start', { method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ apk, restart_stale: restart }) });
+        toast('ok', '升级已开始', `pid ${r.pid || '?'} · 进度见下方`);
+        if (window.loadUpgradeJob) window.loadUpgradeJob();
+      },
+    });
+  };
+  window.cancelUpgrade = async function () {
+    try {
+      const r = await act('upgrade/cancel', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      toast('ok', '已请求取消', r.cancelled_pid ? `pid ${r.cancelled_pid}` : '没有正在跑的任务');
+      if (window.loadUpgradeJob) window.loadUpgradeJob();
+    } catch (e) {
+      toast('err', '取消失败', e.message);
+    }
+  };
+
   // 升级状态：版本 / 上次升级结果 / 漂移 / 阻断项（都来自真实接口 ✓）
   window.loadUpgradeJob = async function () {
     const set = (id, text, cls) => {
@@ -4321,6 +4382,7 @@ function wireDoctorBadge(summary) {
         api('upgrade-job').catch(() => ({})),
         api('doctor-summary').catch(() => ({})),
       ]);
+      if (window.loadUpgradeCandidates) window.loadUpgradeCandidates();
       set('upgVersion', doc.version || job.version || '—', 'mono strong');
       const j = job.job;
       if (!j) {
@@ -4328,13 +4390,21 @@ function wireDoctorBadge(summary) {
         set('upgSteps', '');
       } else {
         const when = new Date((j.finished || j.started || 0) * 1000).toLocaleString();
-        const text = j.ok ? '成功' : (j.rolled_back ? '失败 · 已自动回滚' : '失败');
+        const text = j.ok ? '成功' : (j.rolled_back ? '失败，已自动退回旧版本' : '失败，需要处理');
         set('upgResult', `${text} · ${when}`, j.ok ? 'badge ok sm' : (j.rolled_back ? 'badge warn sm' : 'badge err sm'));
         const steps = (j.steps || []).slice(-6).map(s => s.phase).join(' → ');
-        set('upgSteps', steps ? `步骤：${steps}` : '');
+        let hint = '';
+        if (!j.ok && j.rolled_back) {
+          hint = '升级没有完成，系统已自动退回原版本，现在可以正常使用；若再次出现请把 /run/dsh-mu/upgrade-job.json 发给我们。';
+        } else if (!j.ok) {
+          hint = '升级没有完成且没有回滚，请打开「自检」页按提示处理。';
+        }
+        set('upgSteps', [hint, steps ? `步骤：${steps}` : ''].filter(Boolean).join('　'));
       }
       const drift = (j && j.drift) || [];
-      set('upgDrift', drift.length ? `${drift.length} 台（${drift.slice(0, 4).join(', ')}…）` : '0 台',
+      set('upgDrift', drift.length
+          ? `${drift.length} 台（运行 dsh-muctl instance restart-stale 重启即可）`
+          : '0 台',
           drift.length ? 'badge warn sm' : 'badge ok sm');
       const summary = doc.summary || {};
       const fail = summary.FAIL || 0;
@@ -4348,12 +4418,22 @@ function wireDoctorBadge(summary) {
     const body = document.getElementById('eventBody');
     if (!body) return;
     try {
-      const d = await api('events?limit=100');
+      const kind = (document.getElementById('evKind') || {}).value || '';
+      const inst = (document.getElementById('evInst') || {}).value || '';
+      const qs = ['limit=100'];
+      if (kind) qs.push('kind=' + encodeURIComponent(kind));
+      if (inst) qs.push('instance=' + encodeURIComponent(inst));
+      const d = await api('events?' + qs.join('&'));
       const rows = d.events || [];
       const sub = document.getElementById('eventSub');
       if (sub) sub.textContent = `最近 ${rows.length} 条 / 共 ${d.total || 0} 条`;
       const tone = (kind) => String(kind).includes('failure') ? 'err'
         : String(kind).includes('stop') ? 'warn' : 'ok';
+      const sel = document.getElementById('evInst');
+      if (sel && sel.options.length <= 1 && (window.__muInstances || []).length) {
+        sel.innerHTML = '<option value="">全部实例</option>' +
+          window.__muInstances.map(i => `<option value="${esc(i.name)}">${esc(i.name)}</option>`).join('');
+      }
       body.innerHTML = rows.length ? rows.map(row => {
         const when = new Date((row.at || 0) * 1000).toLocaleString();
         return `<tr>
@@ -5495,18 +5575,34 @@ function wireDoctorBadge(summary) {
   function paint() {
     const body = document.getElementById('doctorBody');
     if (!body) return;
-    const rows = state.onlyProblems
-      ? state.checks.filter(c => c.status !== 'PASS')
-      : state.checks;
-    body.innerHTML = rows.length ? rows.map(c => {
-      const [kind, label] = KIND[c.status] || ['outline', c.status];
-      return `<tr class="row-${kind === 'ok' ? 'ok' : kind}" data-issue="${c.status === 'PASS' ? 0 : 1}">
-        <td><span class="badge ${kind}"><span class="dot ${kind}"></span>${esc(label)}</span></td>
-        <td class="strong">${esc(c.check)}</td>
-        <td class="muted" style="white-space:normal">${esc(c.detail || '')}</td>
-        <td class="mono faint" style="white-space:normal;font-size:11.5px">${esc(c.fix || '—')}</td>
-      </tr>`;
-    }).join('') : '<tr><td colspan="4" class="muted">没有检查项。</td></tr>';
+    // 人话 + 分组：必须处理 → 建议处理 → 提示（默认折叠 ✓）
+    // 文案来自后端（title / advice），页面不再自己造词
+    const groups = [['blocking', '必须处理'], ['suggestion', '建议处理'], ['info', '提示（可忽略）']];
+    const mark = { FAIL: ['err', '✗ 需要处理'], WARN: ['warn', '! 建议'], PASS: ['ok', '✓ 通过'], SKIP: ['outline', '- 跳过'] };
+    let html = '';
+    for (const [key, label] of groups) {
+      const rows = state.checks.filter(c => (c.group || 'suggestion') === key
+        && (!state.onlyProblems || c.status !== 'PASS'));
+      if (!rows.length) continue;
+      if (key === 'info' && !window.__muShowInfo) {
+        html += `<tr><td colspan="4" class="faint">${label}：${rows.length} 条已折叠（正常现象，可忽略）
+          <button class="btn sm ghost" onclick="window.__muShowInfo=true;window.dshmuDoctorPaint&&window.dshmuDoctorPaint()">展开</button></td></tr>`;
+        continue;
+      }
+      html += `<tr><td colspan="4" class="strong" style="background:var(--bg-2)">${label}（${rows.length}）</td></tr>`;
+      for (const c of rows) {
+        const [kind, label2] = mark[c.status] || ['outline', c.status];
+        const advice = c.status === 'PASS' ? '' : (c.advice || c.fix || '');
+        html += `<tr class="row-${kind === 'ok' ? 'ok' : kind}" data-issue="${c.status === 'PASS' ? 0 : 1}">
+          <td><span class="badge ${kind}">${esc(label2)}</span></td>
+          <td class="strong">${esc(c.title || c.check)}</td>
+          <td class="muted" style="white-space:normal">${esc(c.detail || '')}</td>
+          <td class="faint" style="white-space:normal;font-size:11.5px">${advice ? '怎么办：' + esc(advice) : '—'}</td>
+        </tr>`;
+      }
+    }
+    body.innerHTML = html || '<tr><td colspan="4" class="muted">没有检查项。</td></tr>';
+    window.dshmuDoctorPaint = paint;
 
     const s = {};
     state.checks.forEach(c => { s[c.status] = (s[c.status] || 0) + 1; });
