@@ -705,6 +705,7 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("GET", re.compile(r"^/api/instances$"), "instances"),
     ("GET", re.compile(r"^/api/instances/([\w-]+)/logs$"), "instance_logs"),
     ("GET", re.compile(r"^/api/events$"), "events"),
+    ("GET", re.compile(r"^/api/upgrade-job$"), "upgrade_job"),
     ("GET", re.compile(r"^/api/instances/([\w-]+)/patch$"), "instance_patch"),
     ("GET", re.compile(r"^/api/instances/([\w-]+)$"), "instance"),
     ("GET", re.compile(r"^/api/doctor$"), "doctor"),
@@ -2405,6 +2406,14 @@ class Handler(BaseHTTPRequestHandler):
             if groups[0] not in st["instances"]:
                 return 404, {"error": "no such instance", "instance": groups[0]}
             return 200, {"instance": instance_view(st, groups[0])}
+        if name == "upgrade_job":
+            path = "/run/dsh-mu/upgrade-job.json"
+            payload = {"job": None, "installed_at": 0, "version": VERSION}
+            with contextlib.suppress(Exception):
+                payload["installed_at"] = int(os.path.getmtime(f"{mu.LIB}/.installed_at"))
+            with contextlib.suppress(Exception):
+                payload["job"] = json.loads(mu.read_text(path) or "null")
+            return 200, payload
         if name == "events":
             want = int((query.get("limit") or ["100"])[0] or 100)
             kind = str((query.get("kind") or [""])[0])

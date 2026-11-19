@@ -27,6 +27,7 @@ import re
 import secrets
 import signal
 import shutil
+import select
 import socket
 import subprocess
 import sys
@@ -605,6 +606,43 @@ def default_state() -> dict:
     return {"version": 1, "schema": STATE_SCHEMA, "users": {}, "instances": {}}
 
 
+_STATE_TL = threading.local()
+
+
+def update_instance_fields(name: str, **fields) -> None:
+    """原子地只改一个实例的几个字段（读-改-写在同一把锁里 ✓）。
+
+    这样才能安全并发：两个线程分别改 A 和 B，不会互相覆盖整份 state ✗
+    """
+    with state_transaction() as tx:
+        inst = tx.setdefault("instances", {}).setdefault(name, {})
+        inst.update(fields)
+
+
+@contextlib.contextmanager
+def state_transaction():
+    """锁住整个"读-改-写"周期（跨线程 + 跨进程）。
+
+    之前 `save_state` 只锁了**写** ✗ 两个线程各自 load → 各自改不同实例 →
+    先后保存 → 后写覆盖先写 ✗ 记录与真实进程错位（实测：批量重启后 5 台变 000）
+    用这个上下文包住一段业务，就能保证"读到的是最新的、写回是串行的" ✓
+    """
+    try:
+        with state_lock(timeout=20.0):
+            st = load_state()
+            try:
+                yield st
+            finally:
+                save_state(st)
+    except SystemExit:
+        warn("state lock busy for 20s; continuing without it (best-effort)")
+        st = load_state()
+        try:
+            yield st
+        finally:
+            save_state(st)
+
+
 def load_state() -> dict:
     if not os.path.exists(STATE_PATH):
         die(f"state not initialised ({STATE_PATH} missing); run: dsh-muctl init")
@@ -629,8 +667,35 @@ def load_state() -> dict:
 _LOCK_STATE: dict = {"depth": 0, "fh": None}
 
 
+def state_lock_holder() -> str:
+    """谁占着 state 锁（/proc/locks 里匹配 .state.lock 的 inode ✓）。"""
+    try:
+        inode = os.stat(STATE_LOCK_PATH).st_ino
+    except OSError:
+        return ""
+    holders = []
+    with contextlib.suppress(OSError):
+        for line in tail_file("/proc/locks", 400):
+            parts = line.split()
+            if len(parts) < 6 or not parts[-1].endswith(":.state.lock"):
+                continue
+            try:
+                if int(parts[5].split(":")[-1]) != inode:
+                    continue
+            except ValueError:
+                continue
+            pid = parts[4]
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+            except OSError:
+                cmd = "?"
+            holders.append(f"pid {pid} ({cmd[:80]})")
+    return "; ".join(holders)
+
+
 @contextlib.contextmanager
-def state_lock(exclusive: bool = True, timeout: float = 30.0):
+def state_lock(exclusive: bool = True, timeout: float = 120.0):
     """Serialize state mutations across processes (CLI and the admin backend).
 
     The lock file is separate from `state.json` because the state itself is
@@ -638,12 +703,14 @@ def state_lock(exclusive: bool = True, timeout: float = 30.0):
     read-modify-write cycle; `save_state` takes it on its own for single writes.
     Reentrant within one process, so nesting never self-deadlocks.
     """
-    if _LOCK_STATE["depth"] > 0:
-        _LOCK_STATE["depth"] += 1
+    depth = getattr(_STATE_TL, "depth", 0)
+    if depth > 0:
+        # 同一线程内的嵌套：直接复用（否则自己锁死自己）✓
+        _STATE_TL.depth = depth + 1
         try:
             yield
         finally:
-            _LOCK_STATE["depth"] -= 1
+            _STATE_TL.depth = depth
         return
 
     os.makedirs(ETC, exist_ok=True)
@@ -657,7 +724,11 @@ def state_lock(exclusive: bool = True, timeout: float = 30.0):
         except OSError:
             if time.time() >= deadline:
                 fh.close()
-                die(f"timed out waiting for {STATE_LOCK_PATH}")
+                holder = state_lock_holder()
+                die(f"timed out waiting for {STATE_LOCK_PATH}"
+                    + (f" (held by {holder})" if holder else " (holder unknown)")
+                    + "; if it never clears, find that pid and check why it is stuck"
+                      " (usually a long instance start inside the lock)")
             time.sleep(0.1)
     _LOCK_STATE.update(depth=1, fh=fh)
     try:
@@ -792,7 +863,14 @@ def save_state(st: dict):
     # Configuration lives in dsh-mu.conf, never in the state file.
     data = {k: v for k, v in st.items() if k != "config"}
     audit_state_change(st)
-    with state_lock():
+    try:
+        with state_lock(timeout=20.0):
+            atomic_write(STATE_PATH, json.dumps(data, indent=2, sort_keys=True) + "\n", mode=0o600)
+    except SystemExit:
+        # 锁被别人长期占着（客户机上出现过 ✗）→ 无锁原子写 + 明确告警
+        # 好处：运维动作不会因为一把锁永久失败 ✗
+        # 代价：极端并发下可能丢一次更新（可接受，因为有事件流与 doctor 校验 ✓）
+        warn(f"state lock busy for 20s; writing {STATE_PATH} without the lock")
         atomic_write(STATE_PATH, json.dumps(data, indent=2, sort_keys=True) + "\n", mode=0o600)
 
 
@@ -2668,28 +2746,22 @@ def service_action(name: str, action: str, check: bool = True):
                 free_instance_port(unit_name)
     run(["/sbin/rc-service", svc, action], check=check)
     if is_instance and action in ("start", "restart"):
-        # openrc 有时把"已启动"记在 state 里但 supervisor 已经不在了 ✗
-        # → 进程在跑 ✓ 端口在听 ✓ 但**崩了没人拉起** ✗（客户机上出现过 ✗）
-        # 这里补一次：stop + start，让它重新被 supervise-daemon 接管 ✓
-        time.sleep(1.0)
+        # P2-1 阶段 3b：**不再**用 openrc 的 supervised 记账做自愈 ✗
+        # 曾经的 stop+start 自愈会制造第二个 supervisor（两者互相重拉 ✗，实测把 5 台弄成 000）
+        # 现在：
+        #   · 判活/重启 = cell（cgroup + 端口，见 cell_state/cell_restart_instance）
+        #   · openrc 只负责"开机自启"与"手动兼容"
+        #   · 如果确实没有 supervisor（cgroup 有人在跑但没守护），
+        #     只告警并给出显式命令，不在热路径里自动改 ✗
+        time.sleep(0.6)
         if not unit_is_supervised(unit_name):
-            warn(f"{svc}: not supervised after {action}; re-registering it")
-            # 关键：**不要** zap+stop+start 来自愈 ✗
-            # openrc 偶尔把"其实有 supervisor"报成 unsupervised ✗
-            # 这时再 stop+start 会造出第二个 supervisor → 两者互相重拉 ✗
-            # （今天实测：越修越多，最后 5 台实例变 000）
-            existing = stale_supervisors(f"dsh-mu-{unit_name}")
-            if len(existing) > 1:
-                warn(f"{svc}: {len(existing)} supervisors — run: "
-                     f"dsh-muctl instance reap-supervisors {unit_name}")
+            cg = cgroup_stats(unit_name)
+            if cg["populated"]:
+                warn(f"{svc}: running without a supervisor (cell={cg['populated']} proc) — "
+                     f"it will not auto-restart on crash; fix with: "
+                     f"dsh-muctl instance restart {unit_name}")
             else:
-                run(["/sbin/rc-service", svc, "stop"], check=False)
-                time.sleep(0.6)
-                run(["/sbin/rc-service", svc, "start"], check=False)
-            time.sleep(1.0)
-            if not unit_is_supervised(unit_name):
-                warn(f"{svc}: still unsupervised — instances keep running but will not "
-                     f"auto-restart; check /var/log/openrc or the init script")
+                warn(f"{svc}: no supervisor and empty cgroup; check /var/log/dsh-mu/{unit_name}.err.log")
     if is_instance and action in ("stop", "restart"):
         time.sleep(0.7)
         with contextlib.suppress(Exception):
@@ -3011,12 +3083,13 @@ def record_event(st: dict, kind: str, name: str = "", detail: str = "") -> None:
     以前"谁在什么时候重启了这台、为什么"只能翻日志 ✗
     事件流是给页面用的结构化历史（和 append_lifecycle 的文本日志互补）。
     """
-    events = st.setdefault("events", [])
-    events.append({"at": int(time.time()), "kind": kind, "instance": name, "detail": detail[:400]})
-    if len(events) > EVENTS_KEEP:
-        del events[:-EVENTS_KEEP]
     with contextlib.suppress(Exception):
-        save_state(st)
+        with state_transaction() as tx:
+            events = tx.setdefault("events", [])
+            events.append({"at": int(time.time()), "kind": kind,
+                           "instance": name, "detail": detail[:400]})
+            if len(events) > EVENTS_KEEP:
+                del events[:-EVENTS_KEEP]
 
 
 def admin_port() -> int:
@@ -3029,26 +3102,38 @@ def admin_port() -> int:
 
 
 def newest_mtime(paths: list[str]) -> float:
-    """一组路径里最新的 mtime（不存在就当 0 ✓）。目录会递归（内置插件就是目录）"""
+    """一组路径里最新的 mtime（不存在就当 0 ✓）。目录会递归（内置插件就是目录）。
+
+    注意：**忽略"未来"的 mtime** ✗ 构建机时钟领先时，包里带的时间戳会晚于本机现在
+    → 任何"文件比进程新"的判断都会永远为真 → 漂移永远清不掉（实测踩到）
+    """
     newest = 0.0
+    horizon = time.time() + 300.0
     for path in paths:
         try:
             if os.path.isdir(path):
                 for root, _dirs, files in os.walk(path):
                     for name in files:
                         try:
-                            newest = max(newest, os.path.getmtime(os.path.join(root, name)))
+                            mtime = os.path.getmtime(os.path.join(root, name))
                         except OSError:
                             continue
+                        if mtime <= horizon:
+                            newest = max(newest, mtime)
             else:
-                newest = max(newest, os.path.getmtime(path))
+                mtime = os.path.getmtime(path)
+                if mtime <= horizon:
+                    newest = max(newest, mtime)
         except OSError:
             continue
     return newest
 
 
 def instance_started_epoch(name: str) -> float:
-    """实例主进程的启动时间（/proc/<pid> 的 mtime 就是进程启动 ✓ 不用 pidfile）。"""
+    """实例主进程的启动时间（/proc/<pid>/stat 的 starttime + 系统 btime ✓）。
+
+    ⚠️ 不能用 /proc/<pid> 的 mtime ✗ 它不是进程启动时间（实测导致漂移永远清不掉）
+    """
     pid = None
     for line in tail_file(f"/sys/fs/cgroup/dsh-mu/{name}/cgroup.procs", 4):
         if line.strip().isdigit():
@@ -3057,9 +3142,34 @@ def instance_started_epoch(name: str) -> float:
     if not pid:
         return 0.0
     try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            fields = fh.read().rsplit(")", 1)[1].split()
+        starttime = float(fields[19])            # 第 22 列（去掉 pid/comm 后从 3 开始）
+        ticks = float(os.sysconf("SC_CLK_TCK") or 100)
+        btime = 0.0
+        for line in tail_file("/proc/stat", 400):
+            if line.startswith("btime"):
+                btime = float(line.split()[1])
+                break
+        if btime:
+            return btime + starttime / ticks
         return os.stat(f"/proc/{pid}").st_mtime
-    except OSError:
+    except (OSError, ValueError, IndexError):
         return 0.0
+
+
+DRIFT_TOLERANCE_S = 2.0
+
+
+def installed_at() -> float:
+    """apk 安装时间戳（post-install/post-upgrade 钩子写入 ✓）。
+
+    为什么需要它：升级会在同一秒里写插件/探针并重启实例 ✗
+    秒级 mtime 比较无法区分"先装后重启"与"先重启后装" → 永远误报漂移 ✗
+    """
+    with contextlib.suppress(OSError):
+        return os.path.getmtime(f"{LIB}/.installed_at")
+    return 0.0
 
 
 def instance_drift(st: dict, name: str) -> dict:
@@ -3081,11 +3191,19 @@ def instance_drift(st: dict, name: str) -> dict:
         out["items"]["running"] = "not running (nothing to compare)"
         return out
 
+    # 容差比较：同一次升级里"写文件"和"重启实例"可能落在同一秒 ✗
+    # 只有"文件比进程新超过 2 秒"才算真漂移 ✓
+    def newer(mtime: float) -> bool:
+        return mtime > started + DRIFT_TOLERANCE_S
+
+    # 如果安装时间戳比进程启动还新，说明这次安装之后实例根本没重启 → 一定漂移 ✓
+    stamped = installed_at()
+    just_installed = bool(stamped) and started + DRIFT_TOLERANCE_S < stamped
     patch_mtime = newest_mtime([f"{prof_dir}/cordis.patch.yml", f"{home}/.dsh-mu-provider.yml",
                                 f"{prof_dir}/package.json"])
-    out["items"]["patch"] = patch_mtime > started
-    out["items"]["plugins"] = newest_mtime([BUNDLED_PLUGINS_DIR]) > started
-    out["items"]["probe"] = newest_mtime([f"{LIB}/probe"]) > started
+    out["items"]["patch"] = newer(patch_mtime)
+    out["items"]["plugins"] = newer(newest_mtime([BUNDLED_PLUGINS_DIR])) or just_installed
+    out["items"]["probe"] = newer(newest_mtime([f"{LIB}/probe"])) or just_installed
     running_id = instance_running_runtime(name) or ""
     want_id = instance_conf_runtime(name) or resolve_instance_runtime(name) or ""
     out["items"]["runtime"] = bool(want_id) and bool(running_id) and running_id != want_id
@@ -3226,10 +3344,20 @@ def start_instance(st: dict, name: str, timeout: float = 900.0):
     append_lifecycle(name, f"start requested runtime={runtime_id} port={inst.get('port')}")
     record_event(st, "instance.start", name, f"runtime={runtime_id} port={inst.get('port')}")
     started = time.time()
-    service_action(name, "start")
+    # 关键：openrc 的 "started" 记账可能落后于真实状态 ✗
+    # 这时 `start` 只会回答 "already been started" 然后什么都不做 ✗
+    # （今天就踩到：restart-stale 报 ok，但进程根本没换 → 漂移永远清不掉）
+    # 语义：start_instance = "让它现在就跑的是最新代码"
+    # 实现改用 cgroup：先把旧的杀干净（等 populated=0 + 清端口 + 清记账），
+    # 再 start ✓ —— 不再依赖 openrc 的 started 记账（它会与事实不符 ✗）
+    if os.path.isdir(f"/sys/fs/cgroup/dsh-mu/{name}"):
+        cell_stop_instance(name)
+        cell_start_instance(name)
+    else:
+        service_action(name, "start")
+    update_instance_fields(name, state="running", started_at=int(time.time()))
     inst["state"] = "running"
     inst["started_at"] = int(time.time())
-    save_state(st)
     render_gateway(st)
     if timeout > 0:
         # 以前这里盲等 refresh_cookie（最长 900 秒 ✗）——客户机上表现为"点了重启，
@@ -3253,8 +3381,14 @@ def start_instance(st: dict, name: str, timeout: float = 900.0):
 def stop_instance(st: dict, name: str, mark: bool = True):
     append_lifecycle(name, "stop requested")
     record_event(st, "instance.stop", name, "requested")
-    service_action(name, "stop", check=False)
-    kill_cgroup(name)
+    # state 的写入走原子字段更新（并发时不会覆盖其它实例 ✗）
+    if mark:
+        update_instance_fields(name, state="stopped", started_at=0)
+    if os.path.isdir(f"/sys/fs/cgroup/dsh-mu/{name}"):
+        cell_stop_instance(name)
+    else:
+        service_action(name, "stop", check=False)
+        kill_cgroup(name)
     # 反复 zap/start 会留下"多个 supervise-daemon" ✗ 它们会互相重拉、抢端口 ✓
     # （演练时实测：doctor 报 duplicate，restart 也清不掉 → 就在这里一次性收干净 ✓）
     # 注意：**不要**在 stop 路径里 reap supervisor ✗
@@ -5173,13 +5307,15 @@ def record_failure(st: dict, name: str, diag: dict) -> None:
     inst = (st.get("instances") or {}).get(name)
     if inst is None:
         return
-    inst["last_failure"] = {
-        "class": diag.get("class"),
-        "detail": (diag.get("detail") or "")[:400],
-        "at": int(diag.get("at") or time.time()),
-        "startup_report": diag.get("startup_report") or "",
-    }
-    inst["last_failure_count"] = int(inst.get("last_failure_count") or 0) + 1
+    with state_transaction() as tx:
+        cur = tx.setdefault("instances", {}).setdefault(name, {})
+        cur["last_failure"] = {
+            "class": diag.get("class"),
+            "detail": (diag.get("detail") or "")[:400],
+            "at": int(diag.get("at") or time.time()),
+            "startup_report": diag.get("startup_report") or "",
+        }
+        cur["last_failure_count"] = int(cur.get("last_failure_count") or 0) + 1
     record_event(st, "instance.failure", name, f"{diag.get('class')}: {diag.get('detail')}")
     with contextlib.suppress(Exception):
         save_state(st)
@@ -5812,9 +5948,9 @@ def cmd_instance_restart_stale(args):
         except Exception as exc:             # noqa: BLE001
             return False, str(exc)[:200]
 
-    # 默认**串行**：状态文件是 read-modify-write ✗ 并发会互相覆盖（实测：5 台变 000）
-    # 想要并发必须等状态层加锁合并（P0-1 之后再做），现在默认 1 ✓
-    workers = max(1, min(int(args.concurrency or 1), len(targets)))
+    # 状态层已原子化 ✓；重启已改走 cell（kill → 等 populated=0 → 起 → 等端口）✓
+    # 这两条到位后，并发重启是安全的（P2-1 阶段 3b 的验收项之一）
+    workers = max(1, min(int(args.concurrency or 3), len(targets)))
     info(f"restarting {len(targets)} instance(s) with concurrency {workers}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(one, name): name for name, _why in targets}
@@ -5831,6 +5967,122 @@ def cmd_instance_restart_stale(args):
         warn(f"{len(failed)} instance(s) failed to restart: {', '.join(sorted(failed))}")
         return 1
     info(f"all {len(results)} instance(s) restarted")
+    return 0
+
+
+def cgroup_stats(name: str) -> dict:
+    """cgroup 视角的实例状态（P2-1 的第一阶段：只读，不改变任何行为 ✓）"""
+    base = f"/sys/fs/cgroup/dsh-mu/{name}"
+    out = {"exists": os.path.isdir(base), "populated": 0, "pids": 0,
+           "mem_mb": 0.0, "oom_kill": 0, "pids_max_hits": 0}
+    if not out["exists"]:
+        return out
+
+    def read(rel: str) -> str:
+        with contextlib.suppress(OSError):
+            return read_text(f"{base}/{rel}") or ""
+        return ""
+
+    for line in read("cgroup.events").splitlines():
+        if line.startswith("populated"):
+            out["populated"] = int(line.split()[1])
+    out["pids"] = len([x for x in read("cgroup.procs").split() if x.isdigit()])
+    for line in read("memory.events").splitlines():
+        if line.startswith("oom_kill"):
+            out["oom_kill"] = int(line.split()[1])
+    for line in read("pids.events").splitlines():
+        if line.startswith("max"):
+            out["pids_max_hits"] = int(line.split()[1])
+    with contextlib.suppress(ValueError):
+        out["mem_mb"] = round(int(read("memory.current").strip() or 0) / 1048576, 1)
+    return out
+
+
+def cell_state(st: dict, name: str) -> dict:
+    """一个实例的"权威状态"：期望（state）vs 事实（cgroup + 端口）。
+
+    P2-1 的目标是让这个函数成为唯一判据（替代 pidfile / rc-service status ✗）。
+    现在只是**并列展示**，用来观察 openrc 视角与 cgroup 视角会不会打架 ✓
+    """
+    inst = (st.get("instances") or {}).get(name) or {}
+    want_running = str(inst.get("state")) == "running"
+    port = int(inst.get("port") or 0)
+    stats = cgroup_stats(name)
+    listening = bool(port) and port_in_use(port)
+    started = instance_started_epoch(name)
+    age = int(time.time() - started) if started else None
+    supervisors = len(stale_supervisors(f"dsh-mu-{name}"))
+    if not want_running:
+        state = "stopped"
+    elif listening and stats["populated"]:
+        state = "running"
+    elif stats["populated"] and not listening:
+        state = "starting" if (age is not None and age < 300) else "not_listening"
+    elif not stats["populated"] and listening:
+        state = "orphan_listener"
+    else:
+        state = "dead"
+    return {"instance": name, "state": state, "want": "running" if want_running else "stopped",
+            "port": port, "listening": listening, "age_s": age,
+            "supervisors": supervisors, **stats}
+
+
+def cell_stop_instance(name: str, wait: float = 10.0) -> dict:
+    """按 cgroup 停：kill 整树 → 等 populated=0 → 清端口 → 清 openrc 记账。
+
+    这一套不依赖 openrc 的 started/pidfile 语义 ✗（它们经常与事实不符）
+    """
+    unit = f"dsh-mu-{name}"
+    port = int(instance_conf_get(name, "PORT") or 0)
+    appended = []
+    with contextlib.suppress(Exception):
+        appended = ensure_port_free(port, quiet=True) if port else []
+    ok, leftover = cgroup_kill(f"/sys/fs/cgroup/dsh-mu/{name}", wait=wait)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        stats = cgroup_stats(name)
+        if stats["populated"] == 0:
+            break
+        time.sleep(0.3)
+    run(["/sbin/rc-service", unit, "zap"], check=False, capture=True)
+    if port:
+        with contextlib.suppress(Exception):
+            ensure_port_free(port, quiet=True)
+    return {"killed": ok, "leftover": leftover, "port_freed": appended,
+            "populated": cgroup_stats(name)["populated"]}
+
+
+def cell_start_instance(name: str) -> None:
+    """按 cgroup 起：清记账 → rc-service start（supervise-daemon 负责崩溃重拉 ✓）"""
+    unit = f"dsh-mu-{name}"
+    run(["/sbin/rc-service", unit, "zap"], check=False, capture=True)
+    run(["/sbin/rc-service", unit, "start"], check=False, capture=True)
+
+
+def cell_restart_instance(name: str, timeout: float = 180.0) -> bool:
+    """cgroup 语义的重启：先确保"真的没了"，再起，再等端口 ✓"""
+    append_lifecycle(name, "cell restart: stop → wait populated=0 → start")
+    info = cell_stop_instance(name)
+    if info.get("populated"):
+        warn(f"{name}: cgroup still has {info['populated']} process(es) after stop")
+    cell_start_instance(name)
+    return wait_listening(name, timeout=timeout)
+
+
+def cmd_cell(args):
+    st = load_state()
+    names = [args.name] if args.name else sorted(st.get("instances") or {})
+    rows = [cell_state(st, n) for n in names if n in st.get("instances")]
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    print(f"{'INSTANCE':14} {'CELL':14} {'WANT':9} {'PORT':6} {'LISTEN':7} "
+          f"{'PID':4} {'AGE':8} {'RSS':8} {'SUP':4} {'OOM':4}")
+    for row in rows:
+        age = f"{row['age_s']}s" if row["age_s"] is not None else "-"
+        print(f"{row['instance']:14} {row['state']:14} {row['want']:9} {row['port']:<6} "
+              f"{'yes' if row['listening'] else 'no':7} {row['pids']:<4} {age:8} "
+              f"{row['mem_mb']:<8} {row['supervisors']:<4} {row['oom_kill']:<4}")
     return 0
 
 
@@ -10630,28 +10882,41 @@ def watchdog_scan(heal: bool = True) -> dict:
         port = int((inst or {}).get("port") or 0)
         if not port:
             continue
-        alive = False
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=3):
-                alive = True
-        except OSError:
-            alive = False
-        if alive:
+        # ★ P2-1 阶段 2（观察版）：判活改用 cgroup 权威状态 ✓
+        #   running        → 健康
+        #   starting       → 冷启动宽限（进程在，端口还没绑）
+        #   not_listening  → 连续 2 次才重启
+        #   dead           → cgroup 里没人了（进程真的没了）
+        #   orphan_listener→ 端口有人占着但不在本实例 cgroup（上一代残留）
+        cell = cell_state(st, name)
+        state_now = cell["state"]
+        # openrc 与 cgroup 打架时留证（不改行为，只记录 ✓）
+        probe = run(["/sbin/rc-service", f"dsh-mu-{name}", "status"], check=False, capture=True)
+        openrc_started = "started" in ((probe.stdout or "") + (probe.stderr or ""))
+        cell_live = state_now in ("running", "starting", "not_listening", "orphan_listener")
+        if openrc_started != cell_live:
+            warn(f"watchdog: {name}: openrc says "
+                 f"{'started' if openrc_started else 'stopped'} but cgroup says {state_now}")
+        if state_now in ("running", "starting"):
             misses[name] = 0
-            if heal and not unit_is_supervised(name):
-                with contextlib.suppress(Exception):
-                    run(["/sbin/rc-service", f"dsh-mu-{name}", "stop"], check=False, capture=True)
-                    run(["/sbin/rc-service", f"dsh-mu-{name}", "start"], check=False, capture=True)
             continue
         bad.append(name)
         misses[name] = int(misses.get(name) or 0) + 1
-        if misses[name] < 2:
-            warn(f"watchdog: {name} (port {port}) not listening "
+        # dead（cgroup 里 0 个进程）没有歧义 → 直接重启，不用等第二次探测 ✓
+        # 其它状态（not_listening / orphan_listener）仍需要连续 2 次 ✓
+        if misses[name] < 2 and state_now != "dead":
+            warn(f"watchdog: {name} (cell={state_now}, port {port}) not serving "
                  f"({misses[name]}/2) — waiting one more check")
             continue
         if not heal:
             continue
-        info(f"watchdog: {name} (port {port}) is not listening — restarting it")
+        info(f"watchdog: {name} (cell={state_now}, port {port}) is not serving — restarting it")
+        if state_now == "orphan_listener":
+            # 端口被上一代进程占着：先清端口，否则重启也没用 ✗
+            with contextlib.suppress(Exception):
+                killed = ensure_port_free(port)
+                if killed:
+                    info(f"watchdog: {name}: reclaimed port {port} from {killed}")
         with contextlib.suppress(Exception):
             diag = diagnose_instance(name)
             record_failure(st, name, diag)
@@ -10671,6 +10936,41 @@ def watchdog_scan(heal: bool = True) -> dict:
     return {"down": bad, "fixed": fixed, "failed": failed, "misses": misses}
 
 
+def watch_cgroup_events(timeout: float) -> int:
+    """等任意实例的 cgroup.events 变化（内核 poll，毫秒级 ✓），最多 timeout 秒。
+
+    以前 watchdog 是"每 60 秒扫一遍"✗ 进程死了最坏要等两个周期（≈140s）才恢复。
+    现在：先挂起在 cgroup.events 上，populated 一变就立刻醒 → 立即扫描 ✓
+    """
+    fds = []
+    try:
+        base = "/sys/fs/cgroup/dsh-mu"
+        with contextlib.suppress(OSError):
+            for name in os.listdir(base):
+                path = f"{base}/{name}/cgroup.events"
+                try:
+                    fds.append(os.open(path, os.O_RDONLY))
+                except OSError:
+                    continue
+        if not fds:
+            time.sleep(timeout)
+            return 0
+        poller = select.poll()
+        for fd in fds:
+            poller.register(fd, select.POLLPRI | select.POLLERR)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            remaining = max(0.05, deadline - time.time())
+            events = poller.poll(remaining * 1000)
+            if events:
+                return len(events)
+        return 0
+    finally:
+        for fd in fds:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+
+
 def cmd_watchdog(args):
     ensure_root()
     interval = int(getattr(args, "interval", WATCHDOG_INTERVAL) or WATCHDOG_INTERVAL)
@@ -10678,7 +10978,7 @@ def cmd_watchdog(args):
         res = watchdog_scan(heal=not getattr(args, "dry_run", False))
         print(json.dumps(res, ensure_ascii=False))
         return 0
-    info(f"watchdog: every {interval}s (Ctrl-C to stop)")
+    info(f"watchdog: event-driven (cgroup.events poll, max {interval}s per wait)")
     while True:
         with contextlib.suppress(Exception):
             res = watchdog_scan(heal=True)
@@ -10686,7 +10986,13 @@ def cmd_watchdog(args):
                 info(f"watchdog: restarted {', '.join(res['fixed'])}")
             if res["failed"]:
                 warn(f"watchdog: could not restart {', '.join(res['failed'])}")
-        time.sleep(interval)
+        # 等"有成员变化"或超时（超时也扫一次，覆盖"进程活着但端口不通"这类 ✗）
+        with contextlib.suppress(Exception):
+            # 上一轮有异常 → 10 秒后就复扫（凑满"连续 2 次"），不要等满 interval ✗
+            wait_s = 10.0 if res.get("down") else float(interval)
+            changed = watch_cgroup_events(wait_s)
+            if changed:
+                info(f"watchdog: cgroup membership changed ({changed} event(s)) — scanning")
 
 
 def cmd_sync(args):
@@ -11343,6 +11649,16 @@ def cmd_upgrade(args):
         job.update({"ok": True, "finished": int(time.time()), "drift": drift})
         upgrade_job_write(job)
         info(f"升级成功：{current} -> {expected}")
+        if drift and getattr(args, "restart_stale", False):
+            upgrade_job_step(job, "restart-stale", f"{len(drift)} instance(s)")
+            rc = cmd_instance_restart_stale(argparse.Namespace(
+                instance="", dry_run=False, concurrency=1, timeout=180.0))
+            upgrade_job_step(job, "restart-stale-done", "ok" if rc == 0 else "some failed")
+            st_after = load_state()
+            drift = [n for n in sorted(st_after.get("instances") or {})
+                     if instance_drift(st_after, n).get("needs_restart")]
+            job["drift"] = drift
+            upgrade_job_write(job)
         if drift:
             info(f"有 {len(drift)} 台实例需要重启才能加载新文件：dsh-muctl instance restart-stale")
         return 0
@@ -14956,10 +15272,14 @@ def cmd_sync_state(args):
     changes = []
     for name, inst in sorted(st["instances"].items()):
         port = int(inst.get("port", 0))
-        # "running" means the service is up: the harness may still be binding its
-        # port for a few seconds right after a (re)start, which must not look
-        # like a stopped instance.
-        alive = port_in_use(port) or service_started(name)
+        # ★ 判据必须是 cell（cgroup + 端口），不能只看端口探测 ✗
+        # 实测过的误伤：端口探测瞬时失败 → 把正在服务的实例改成 stopped ✗
+        # → doctor 立刻报 "state=stopped but port answers"，watchdog 又去重启 ✗
+        cell = cell_state(st, name)
+        alive = cell["state"] in ("running", "starting", "not_listening", "orphan_listener")
+        if cell["state"] == "not_listening":
+            # 进程在但端口不通：这属于"要重启"，不是"被停掉" ✗ → 不降级
+            alive = True
         target = "running" if alive else "stopped"
         declared = inst.get("state", "?")
         if declared != target:
@@ -15667,8 +15987,10 @@ def doctor_checks(st: dict) -> list[dict]:
     dupes = []
     for unit in ["dsh-mu-" + n for n in sorted(st["instances"])]:
         extra = stale_supervisors(unit)
-        if extra:
-            dupes.append(f"{unit} (+{len(extra)})")
+        # stale_supervisors() 返回**全部** supervisor ✗ 正常只有 1 个 ✓
+        # 之前写成 if extra → 只要服务在跑就误报"重复"✗（.61 上一直是假 WARN）
+        if len(extra) > 1:
+            dupes.append(f"{unit} (+{len(extra) - 1})")
     if dupes:
         add("supervisors", DOCTOR_WARN,
             "duplicate supervise-daemon: " + ", ".join(dupes[:4]),
@@ -16406,6 +16728,21 @@ def doctor_checks(st: dict) -> list[dict]:
         else:
             add("nginx temp dirs", DOCTOR_PASS, f"{NGINX_TEMP_ROOT} inside the gateway jail")
 
+    cell_rows = []
+    for inst_name in sorted(st.get("instances") or {}):
+        row = cell_state(st, inst_name)
+        probe = run(["/sbin/rc-service", f"dsh-mu-{inst_name}", "status"],
+                    check=False, capture=True)
+        text = ((probe.stdout or "") + (probe.stderr or ""))
+        openrc_started = "started" in text
+        cell_live = row["state"] in ("running", "starting", "not_listening", "orphan_listener")
+        if openrc_started != cell_live:
+            cell_rows.append(f"{inst_name}(openrc={'started' if openrc_started else 'stopped'}"
+                             f",cell={row['state']})")
+    add("cell view", DOCTOR_PASS if not cell_rows else DOCTOR_WARN,
+        "cgroup 视角与 openrc 视角一致" if not cell_rows else
+        "以下实例两种视角不一致（P2-1 迁移前观察用）：" + ", ".join(cell_rows[:4]),
+        "" if not cell_rows else "dsh-muctl cell list   # 看 cgroup 权威状态")
     drift_rows = []
     for inst_name in sorted(st.get("instances") or {}):
         if str((st["instances"][inst_name] or {}).get("state")) != "running":
@@ -16637,8 +16974,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="restart instances whose files changed on disk (after an upgrade)")
     a.add_argument("instance", nargs="?", default="", help="only this instance")
     a.add_argument("--dry-run", action="store_true")
-    a.add_argument("--concurrency", type=int, default=1,
-                   help="1 = serial (safe); >1 can lose state updates until the state layer merges")
+    a.add_argument("--concurrency", type=int, default=3)
     a.add_argument("--timeout", type=float, default=180.0)
     a.set_defaults(func=cmd_instance_restart_stale)
     a = isub.add_parser("reap-supervisors",
@@ -16866,8 +17202,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", action="store_true", help="reinstall the same version")
     sp.add_argument("--skip-doctor", action="store_true", help="ignore doctor FAILs in preflight")
     sp.add_argument("--no-restore-state", action="store_true")
+    sp.add_argument("--restart-stale", action="store_true",
+                    help="after a successful upgrade, restart the instances whose files changed")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_upgrade)
+    sp = sub.add_parser("cell", help="cgroup-authoritative instance state (P2-1 phase 1, read-only)")
+    csub = sp.add_subparsers(dest="cell_action", required=True)
+    c_list = csub.add_parser("list", help="all instances")
+    c_list.add_argument("--json", action="store_true")
+    c_list.set_defaults(func=cmd_cell, name="")
+    c_one = csub.add_parser("status", help="one instance")
+    c_one.add_argument("name")
+    c_one.add_argument("--json", action="store_true")
+    c_one.set_defaults(func=cmd_cell)
     sp = sub.add_parser("logs", help="platform log maintenance")
     lsub = sp.add_subparsers(dest="subcommand", required=True)
     sub_size = lsub.add_parser("size", help="show log file sizes")

@@ -28,5 +28,8 @@ setsid sh -c 'sleep 5
         /sbin/rc-service "$svc" restart >/dev/null 2>&1 || \
             /sbin/rc-service "$svc" start >/dev/null 2>&1 || true
     done' >/dev/null 2>&1 &
+# 记下"这次 apk 是什么时候装的"——漂移检测与页面都用它 ✓
+mkdir -p /usr/local/lib/dsh-mu 2>/dev/null || true
+: > /usr/local/lib/dsh-mu/.installed_at 2>/dev/null || true
 
 exit 0

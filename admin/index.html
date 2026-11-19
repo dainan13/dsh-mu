@@ -1518,6 +1518,23 @@ html.wiring .side-stack .flags { visibility: hidden; }
 
         <div class="panel" style="margin-bottom:14px">
           <div class="panel-head">
+            <h2>升级状态</h2><span class="sub" id="upgSub">读取中…</span>
+            <span class="spacer"></span>
+            <button class="btn sm ghost" onclick="loadUpgradeJob()"><svg class="i i-sm"><use href="#i-refresh"/></svg>刷新</button>
+          </div>
+          <div class="panel-body">
+            <div class="row-wrap" style="gap:18px;align-items:center">
+              <div><div class="faint" style="font-size:11.5px">当前版本</div><div class="mono strong" id="upgVersion">—</div></div>
+              <div><div class="faint" style="font-size:11.5px">上次升级</div><div id="upgResult">—</div></div>
+              <div><div class="faint" style="font-size:11.5px">待重启实例</div><div id="upgDrift">—</div></div>
+              <div><div class="faint" style="font-size:11.5px">阻断项</div><div id="upgFail">—</div></div>
+            </div>
+            <div class="faint" id="upgSteps" style="font-size:11.5px;margin-top:8px"></div>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:14px">
+          <div class="panel-head">
             <h2>实例事件</h2><span class="sub" id="eventSub">最近 100 条</span>
             <span class="spacer"></span>
             <button class="btn sm ghost" onclick="loadEvents()"><svg class="i i-sm"><use href="#i-refresh"/></svg>刷新</button>
@@ -4291,6 +4308,42 @@ function wireDoctorBadge(summary) {
   }
 
   // 实例事件：平台侧的结构化历史（start/stop/failure），和文本日志互补 ✓
+  // 升级状态：版本 / 上次升级结果 / 漂移 / 阻断项（都来自真实接口 ✓）
+  window.loadUpgradeJob = async function () {
+    const set = (id, text, cls) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = text;
+      el.className = cls || '';
+    };
+    try {
+      const [job, doc] = await Promise.all([
+        api('upgrade-job').catch(() => ({})),
+        api('doctor-summary').catch(() => ({})),
+      ]);
+      set('upgVersion', doc.version || job.version || '—', 'mono strong');
+      const j = job.job;
+      if (!j) {
+        set('upgResult', '没有升级记录', 'faint');
+        set('upgSteps', '');
+      } else {
+        const when = new Date((j.finished || j.started || 0) * 1000).toLocaleString();
+        const text = j.ok ? '成功' : (j.rolled_back ? '失败 · 已自动回滚' : '失败');
+        set('upgResult', `${text} · ${when}`, j.ok ? 'badge ok sm' : (j.rolled_back ? 'badge warn sm' : 'badge err sm'));
+        const steps = (j.steps || []).slice(-6).map(s => s.phase).join(' → ');
+        set('upgSteps', steps ? `步骤：${steps}` : '');
+      }
+      const drift = (j && j.drift) || [];
+      set('upgDrift', drift.length ? `${drift.length} 台（${drift.slice(0, 4).join(', ')}…）` : '0 台',
+          drift.length ? 'badge warn sm' : 'badge ok sm');
+      const summary = doc.summary || {};
+      const fail = summary.FAIL || 0;
+      set('upgFail', fail ? `${fail} 项` : '0 项', fail ? 'badge err sm' : 'badge ok sm');
+    } catch (e) {
+      set('upgSub', `读取失败：${e.message}`, 'faint');
+    }
+  };
+
   window.loadEvents = async function () {
     const body = document.getElementById('eventBody');
     if (!body) return;
@@ -4626,7 +4679,7 @@ function wireDoctorBadge(summary) {
     if (on('v-ext')) add(window.syncExt);
     if (on('v-platform')) add(window.wirePlatform);
     if (on('v-doctor')) add(window.wireDoctor);
-    if (on('v-audit')) { add(window.wireAudit); add(window.loadEvents ? window.loadEvents() : Promise.resolve()); }
+    if (on('v-audit')) { add(window.wireAudit); add(window.loadEvents ? window.loadEvents() : Promise.resolve()); add(window.loadUpgradeJob ? window.loadUpgradeJob() : Promise.resolve()); }
     if (jobs.length) {
       try { await Promise.all(jobs); toast('ok', '已刷新', '当前页数据已重新读取'); }
       catch (e) { toast('err', '刷新失败', e.message); }
