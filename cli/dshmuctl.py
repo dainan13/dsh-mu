@@ -154,6 +154,18 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
     ("INSTANCE_KEEP_CAPS", "instance_keep_caps", "optstr", "",
      "实例保留的 capability（逗号分隔，空=全部丢弃）。DSH 的命令工具用 bwrap 沙箱，"
      "在 jail 里需要 sys_admin（建命名空间/挂载）+ setuid/setgid（uid 映射）"),
+    ("LOG_MAX_MB", "log_max_mb", "int", 20,
+     "单个日志文件的轮转阈值（MB）。超过就 copytruncate 成 .1 —— 服务持有文件描述符，"
+     "只能截断不能改名，否则 supervise-daemon 会继续往旧 inode 写"),
+    ("LOG_KEEP", "log_keep", "int", 1,
+     "每个日志保留几个历史文件（.1 / .2 …）"),
+    ("STARTUP_REPORTS_KEEP", "startup_reports_keep", "int", 10,
+     "每个实例保留几份 DSH 启动诊断（<home>/.dsh/logs/startup-*.log）"),
+    ("PROBE", "probe", "bool", True,
+     "崩溃探针：在实例里预加载 dsh-mu-probe.js，记录 uncaught 堆栈、"
+     "退出码/信号、心跳（rss/句柄/事件循环延迟）。关掉后实例日志会退回\"只有几行\""),
+    ("PROBE_HEARTBEAT_S", "probe_heartbeat_s", "int", 120,
+     "探针心跳间隔（秒），0=只记录启动/退出/异常。客户机建议 120，实验室可设 30"),
     ("TLS_ENABLED", "tls_enabled", "bool", False,
      "启用 HTTPS：网关同时监听 443（证书在 /etc/dsh-mu/tls/）"),
     ("TLS_KEEP_HTTP", "tls_keep_http", "bool", True,
@@ -993,6 +1005,9 @@ def render_instance_conf(st: dict, name: str):
         # read-only, same-path binds for protected plugins (kernel-enforced EROFS)
         f"RO_PATHS=\"{','.join(protected_paths(name))}\"",
         f"BUNDLED_PLUGINS_HOST=\"{BUNDLED_PLUGINS_DIR}\"",
+        # 崩溃探针（写进 conf 让运维一眼知道有没有开 ✓ 关：PROBE=0）
+        f"PROBE=\"{0 if str(inst.get('probe', st['config'].get('probe', True))) in ('0', 'false', 'False') else 1}\"",
+        f"PROBE_HEARTBEAT_S=\"{int(inst.get('probe_heartbeat_s', st['config'].get('probe_heartbeat_s', 120)) or 0)}\"",
 
         "",
     ]
@@ -1818,6 +1833,7 @@ def sync_all(st: dict):
         probe = run(["/sbin/rc-service", "dsh-mud", "status"], check=False, capture=True)
         if "started" not in ((probe.stdout or "") + (probe.stderr or "")):
             info("admin backend: not running → starting it")
+            ensure_port_free(admin_port(), keep=service_child_pids("dsh-mud"))
             run(["/sbin/rc-service", "dsh-mud", "start"], check=False)
             time.sleep(1.0)
     with contextlib.suppress(Exception):
@@ -1827,6 +1843,10 @@ def sync_all(st: dict):
             mark_admin_restarted()
         else:
             restart_admin_if_stale()
+    with contextlib.suppress(Exception):
+        cfg_logs = st.get("config", {})
+        rotate_logs(max_mb=int(cfg_logs.get("log_max_mb", DEFAULT_LOG_MAX_MB) or DEFAULT_LOG_MAX_MB),
+                    keep=int(cfg_logs.get("log_keep", DEFAULT_LOG_KEEP) or DEFAULT_LOG_KEEP))
     ensure_instance_autostart(st)
     with contextlib.suppress(Exception):
         render_watchdog_service()
@@ -2654,9 +2674,18 @@ def service_action(name: str, action: str, check: bool = True):
         time.sleep(1.0)
         if not unit_is_supervised(unit_name):
             warn(f"{svc}: not supervised after {action}; re-registering it")
-            run(["/sbin/rc-service", svc, "stop"], check=False)
-            time.sleep(0.6)
-            run(["/sbin/rc-service", svc, "start"], check=False)
+            # 关键：**不要** zap+stop+start 来自愈 ✗
+            # openrc 偶尔把"其实有 supervisor"报成 unsupervised ✗
+            # 这时再 stop+start 会造出第二个 supervisor → 两者互相重拉 ✗
+            # （今天实测：越修越多，最后 5 台实例变 000）
+            existing = stale_supervisors(f"dsh-mu-{unit_name}")
+            if len(existing) > 1:
+                warn(f"{svc}: {len(existing)} supervisors — run: "
+                     f"dsh-muctl instance reap-supervisors {unit_name}")
+            else:
+                run(["/sbin/rc-service", svc, "stop"], check=False)
+                time.sleep(0.6)
+                run(["/sbin/rc-service", svc, "start"], check=False)
             time.sleep(1.0)
             if not unit_is_supervised(unit_name):
                 warn(f"{svc}: still unsupervised — instances keep running but will not "
@@ -2941,6 +2970,242 @@ def kill_cgroup(name: str):
             pass
 
 
+def logs_usage(st: dict | None = None) -> dict:
+    """统计日志占用（doctor 与 CLI 共用）。"""
+    st = st or load_state()
+    rows = []
+    total = 0
+    for base in (LOGS, "/var/lib/dsh-mu/gateway/logs"):
+        with contextlib.suppress(OSError):
+            for name in sorted(os.listdir(base)):
+                if not name.endswith(".log"):
+                    continue
+                path = os.path.join(base, name)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                total += size
+                rows.append({"file": path, "mb": round(size / 1048576, 1)})
+    reports = 0
+    reports_mb = 0.0
+    for name in (st.get("instances") or {}):
+        logs_dir = f"{instance_home(name)}/.dsh/logs"
+        with contextlib.suppress(OSError):
+            for entry in os.listdir(logs_dir):
+                if entry.startswith("startup-"):
+                    reports += 1
+                    with contextlib.suppress(OSError):
+                        reports_mb += os.path.getsize(os.path.join(logs_dir, entry)) / 1048576
+    rows.sort(key=lambda row: row["mb"], reverse=True)
+    return {"total_mb": round(total / 1048576, 1), "files": rows[:20],
+            "startup_reports": reports, "startup_reports_mb": round(reports_mb, 1)}
+
+
+EVENTS_KEEP = 200
+
+
+def record_event(st: dict, kind: str, name: str = "", detail: str = "") -> None:
+    """在 state 里维护一条滚动事件流（最近 200 条 ✓）。
+
+    以前"谁在什么时候重启了这台、为什么"只能翻日志 ✗
+    事件流是给页面用的结构化历史（和 append_lifecycle 的文本日志互补）。
+    """
+    events = st.setdefault("events", [])
+    events.append({"at": int(time.time()), "kind": kind, "instance": name, "detail": detail[:400]})
+    if len(events) > EVENTS_KEEP:
+        del events[:-EVENTS_KEEP]
+    with contextlib.suppress(Exception):
+        save_state(st)
+
+
+def admin_port() -> int:
+    """admin 监听端口（从配置里取，别写死 8787 ✗）。"""
+    try:
+        cfg = load_config()
+        return int(str(cfg.get("admin_listen") or "127.0.0.1:8787").rsplit(":", 1)[-1])
+    except Exception:  # noqa: BLE001
+        return 8787
+
+
+def newest_mtime(paths: list[str]) -> float:
+    """一组路径里最新的 mtime（不存在就当 0 ✓）。目录会递归（内置插件就是目录）"""
+    newest = 0.0
+    for path in paths:
+        try:
+            if os.path.isdir(path):
+                for root, _dirs, files in os.walk(path):
+                    for name in files:
+                        try:
+                            newest = max(newest, os.path.getmtime(os.path.join(root, name)))
+                        except OSError:
+                            continue
+            else:
+                newest = max(newest, os.path.getmtime(path))
+        except OSError:
+            continue
+    return newest
+
+
+def instance_started_epoch(name: str) -> float:
+    """实例主进程的启动时间（/proc/<pid> 的 mtime 就是进程启动 ✓ 不用 pidfile）。"""
+    pid = None
+    for line in tail_file(f"/sys/fs/cgroup/dsh-mu/{name}/cgroup.procs", 4):
+        if line.strip().isdigit():
+            pid = line.strip()
+            break
+    if not pid:
+        return 0.0
+    try:
+        return os.stat(f"/proc/{pid}").st_mtime
+    except OSError:
+        return 0.0
+
+
+def instance_drift(st: dict, name: str) -> dict:
+    """实例侧的四类"文件已新、进程仍旧"漂移 ✓
+
+    平台自身的"旧代码还在跑"是另一类问题（端口归属 + health.version ✓ 已单独检查）。
+    实例的代码来自只读镜像 ✗ 升级不会改它 ✓ 但下面这些是 rw/挂载自 apk 的：
+      · launch patch / cordis patch   （sync 会重渲染）
+      · /opt/dsh-mu-plugins 内置插件  （apk 覆盖 → 实例立刻看到新文件）
+      · /opt/dsh-mu-probe 崩溃探针    （同上）
+      · 运行中的运行时 id ≠ 期望 id   （切了运行时但没重启）
+    """
+    started = instance_started_epoch(name)
+    home = instance_home(name)
+    profile = instance_profile(name)
+    prof_dir = f"{home}/.dsh/profiles/{profile}"
+    out = {"instance": name, "started": started, "items": {}, "needs_restart": False}
+    if not started:
+        out["items"]["running"] = "not running (nothing to compare)"
+        return out
+
+    patch_mtime = newest_mtime([f"{prof_dir}/cordis.patch.yml", f"{home}/.dsh-mu-provider.yml",
+                                f"{prof_dir}/package.json"])
+    out["items"]["patch"] = patch_mtime > started
+    out["items"]["plugins"] = newest_mtime([BUNDLED_PLUGINS_DIR]) > started
+    out["items"]["probe"] = newest_mtime([f"{LIB}/probe"]) > started
+    running_id = instance_running_runtime(name) or ""
+    want_id = instance_conf_runtime(name) or resolve_instance_runtime(name) or ""
+    out["items"]["runtime"] = bool(want_id) and bool(running_id) and running_id != want_id
+    out["items"]["running_id"] = running_id
+    out["items"]["want_id"] = want_id
+    out["needs_restart"] = any(bool(out["items"][k]) for k in ("patch", "plugins", "probe", "runtime"))
+    return out
+
+
+def listening_pids(port: int) -> list[int]:
+    """谁在监听这个端口（纯 /proc 解析，不依赖 ss/lsof ✓）。"""
+    inodes = set()
+    try:
+        with open("/proc/net/tcp", encoding="utf-8") as fh:
+            next(fh)
+            for line in fh:
+                fields = line.split()
+                if len(fields) < 10 or fields[3] != "0A":      # 0A = LISTEN
+                    continue
+                local = fields[1]
+                if int(local.split(":")[1], 16) == int(port):
+                    inodes.add(fields[9])
+    except OSError:
+        return []
+    if not inodes:
+        return []
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        fd_dir = f"/proc/{entry}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    target = os.readlink(f"{fd_dir}/{fd}")
+                except OSError:
+                    continue
+                if target.startswith("socket:[") and target[8:-1] in inodes:
+                    pids.append(int(entry))
+                    break
+        except OSError:
+            continue
+    return sorted(set(pids))
+
+
+def ensure_port_free(port: int, keep: set[int] | None = None, quiet: bool = False) -> list[int]:
+    """端口被"上一代"进程占着就杀掉它 ✓
+
+    客户机现场：重启 admin 之后，15 小时前的旧 python 仍占着 8787 ✗
+    → 新 supervisor 抢不到端口 → 页面继续跑旧代码 ✗（"改了没生效"就是这么来的）
+    这里只杀 **不是当前 supervisor 子进程** 的持有者，避免误杀刚起好的服务。
+    """
+    keep = keep or set()
+    killed = []
+    for pid in listening_pids(port):
+        if pid in keep or pid in (0, 1):
+            continue
+        if not quiet:
+            info(f"port {port} is held by stale pid {pid} — killing it")
+        with contextlib.suppress(OSError):
+            os.kill(pid, 15)
+        time.sleep(0.6)
+        if os.path.exists(f"/proc/{pid}"):
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+        killed.append(pid)
+    return killed
+
+
+def stale_supervisors(unit: str) -> list[int]:
+    """列出该单元所有 supervise-daemon 进程（可能不止一个 ✗ 客户机上见过两个）"""
+    out = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "supervise-daemon" in cmd and unit in cmd:
+            out.append(int(entry))
+    return sorted(out)
+
+
+def service_child_pids(unit: str) -> set[int]:
+    """当前 supervise-daemon 的直接子进程（重启时用来"保护"新进程 ✓）。"""
+    pids: set[int] = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "supervise-daemon" in cmd and unit in cmd:
+            try:
+                with open(f"/proc/{entry}/task/{entry}/children", encoding="utf-8") as fh:
+                    pids |= {int(x) for x in fh.read().split()}
+            except OSError:
+                pass
+    return pids
+
+
+def append_lifecycle(name: str, message: str) -> None:
+    """平台侧的生命周期事件写进 /var/log/dsh-mu/<name>.log ✓
+
+    以前这个文件基本是空的（DSH 的 stdout 很少），排查时只能靠 jail 的两行 stderr ✗
+    现在把"谁在什么时候让它做了什么"记下来，日志视图按时间就能还原因果 ✓
+    """
+    line = f"[dsh-mu] {time.strftime('%Y-%m-%dT%H:%M:%S%z')} {message}\n"
+    try:
+        os.makedirs(LOGS, exist_ok=True)
+        with open(f"{LOGS}/{name}.log", "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
 def start_instance(st: dict, name: str, timeout: float = 900.0):
     inst = st["instances"][name]
     ensure_owner(st, name)
@@ -2957,18 +3222,45 @@ def start_instance(st: dict, name: str, timeout: float = 900.0):
     with contextlib.suppress(Exception):
         for change in prune_stale_bundles(st, name):
             info(f"{name}: {change}")
+    runtime_id = instance_conf_runtime(name) or runtime_default_id() or "(legacy)"
+    append_lifecycle(name, f"start requested runtime={runtime_id} port={inst.get('port')}")
+    record_event(st, "instance.start", name, f"runtime={runtime_id} port={inst.get('port')}")
+    started = time.time()
     service_action(name, "start")
     inst["state"] = "running"
     inst["started_at"] = int(time.time())
     save_state(st)
     render_gateway(st)
     if timeout > 0:
-        refresh_cookie(st, name, timeout=timeout)
+        # 以前这里盲等 refresh_cookie（最长 900 秒 ✗）——客户机上表现为"点了重启，
+        # 几分钟没有结论"✗。现在先有界等端口（默认 120 秒，config.start_wait_s 可调），
+        # 等不到就立刻归因 + 记录，而不是继续等。
+        wait_s = float(st.get("config", {}).get("start_wait_s", 120) or 120)
+        wait_s = min(wait_s, float(timeout))
+        if wait_listening(name, timeout=wait_s):
+            append_lifecycle(name, f"port bound after {time.time() - started:.1f}s")
+            refresh_cookie(st, name, timeout=timeout)
+        else:
+            diag = diagnose_instance(name)
+            record_failure(st, name, diag)
+            append_lifecycle(name, f"NOT listening after {wait_s:.0f}s: "
+                                    f"{diag['class']} — {diag['detail']}")
+            die(f"{name}: still not listening after {wait_s:.0f}s "
+                f"({diag['class']}: {diag['detail']}); see {LOGS}/{name}.err.log")
+    return
 
 
 def stop_instance(st: dict, name: str, mark: bool = True):
+    append_lifecycle(name, "stop requested")
+    record_event(st, "instance.stop", name, "requested")
     service_action(name, "stop", check=False)
     kill_cgroup(name)
+    # 反复 zap/start 会留下"多个 supervise-daemon" ✗ 它们会互相重拉、抢端口 ✓
+    # （演练时实测：doctor 报 duplicate，restart 也清不掉 → 就在这里一次性收干净 ✓）
+    # 注意：**不要**在 stop 路径里 reap supervisor ✗
+    # 1.9.136 试过：杀 supervisor + zap 会让 openrc 记账与真实进程错位 ✗
+    # → 与 watchdog 的 self-heal 互相踩，实例开始抖动（实测 5 台变 000）
+    # 重复 supervisor 的清理改成独立命令 `instance reap-supervisors` ✓ 不进热路径 ✓
     # supervise-daemon can time out ("Failed to stop") while leaving openrc's own state at
     # "started". Every later start then answers "has already been started" and does
     # nothing, which is how an instance ends up with no process, state=running and a
@@ -4834,6 +5126,191 @@ def create_instance(st: dict, name: str, user: str, cpu, mem, pids, port,
     return inst
 
 
+def tail_file(path: str, lines: int = 200) -> list[str]:
+    """读文件最后 N 行（不存在就返回空 ✓）。"""
+    try:
+        with open(path, errors="replace") as fh:
+            return [line.rstrip("\n") for line in fh.readlines()[-max(1, lines):]]
+    except OSError:
+        return []
+
+
+def instance_conf_get(name: str, key: str) -> str:
+    """从实例 conf 里取一个值（不解析整份 shell，只按 KEY= 取值 ✓）。"""
+    for line in tail_file(f"{INST_CONF_DIR}/{name}.conf", 400):
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip().strip('"')
+    return ""
+
+
+def wait_listening(name: str, timeout: float = 120.0) -> bool:
+    """轮询实例端口，直到可连或超时（判定"起来了"的唯一真实依据 ✓）。"""
+    port = int(instance_conf_get(name, "PORT") or 0)
+    if not port:
+        return False
+    deadline = time.time() + max(1.0, timeout)
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2.0):
+                return True
+        except OSError:
+            time.sleep(1.0)
+    return False
+
+
+def record_restart_reason(st: dict, name: str, reason: str) -> None:
+    inst = (st.get("instances") or {}).get(name)
+    if inst is None:
+        return
+    inst["last_restart_reason"] = reason[:300]
+    inst["last_restart_at"] = int(time.time())
+    with contextlib.suppress(Exception):
+        save_state(st)
+
+
+def record_failure(st: dict, name: str, diag: dict) -> None:
+    """把"最近一次失败原因"写进 state，页面上直接能看到 ✓"""
+    inst = (st.get("instances") or {}).get(name)
+    if inst is None:
+        return
+    inst["last_failure"] = {
+        "class": diag.get("class"),
+        "detail": (diag.get("detail") or "")[:400],
+        "at": int(diag.get("at") or time.time()),
+        "startup_report": diag.get("startup_report") or "",
+    }
+    inst["last_failure_count"] = int(inst.get("last_failure_count") or 0) + 1
+    record_event(st, "instance.failure", name, f"{diag.get('class')}: {diag.get('detail')}")
+    with contextlib.suppress(Exception):
+        save_state(st)
+
+
+def cgroup_counters(name: str) -> dict:
+    """读实例 cgroup 的"死因"计数（不需要 pidfile ✓）。"""
+    base = f"/sys/fs/cgroup/dsh-mu/{name}"
+    out = {"populated": None, "oom_kill": 0, "pids_max_hits": 0}
+    try:
+        for line in (read_text(f"{base}/cgroup.events") or "").splitlines():
+            if line.startswith("populated"):
+                out["populated"] = int(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    for key, filename, field in (("oom_kill", "memory.events", "oom_kill"),
+                                 ("pids_max_hits", "pids.events", "max")):
+        try:
+            for line in (read_text(f"{base}/{filename}") or "").splitlines():
+                if line.startswith(field):
+                    out[key] = int(line.split()[1])
+        except (OSError, ValueError):
+            pass
+    return out
+
+
+def diagnose_instance(name: str) -> dict:
+    """给一次"起不来"归因：把证据和分类一次性说清楚 ✓
+
+    以前只能人肉 grep 日志猜 ✗ 现在把所有可比对的证据放在一个结构里，
+    既能写进 state（页面上显示"上次失败原因"），也能 `dsh-muctl instance diagnose` 直接看。
+    """
+    info_path = f"{LOGS}/{name}.err.log"
+    out_path = f"{LOGS}/{name}.log"
+    err = tail_file(info_path, 400)
+    out = tail_file(out_path, 200)
+    # 心率行是噪音（每 120 秒一条 ✗ 会把真正的原因挤出窗口）→ 归因时先剔掉 ✓
+    err_signal = [line for line in err if "[probe:heartbeat]" not in line]
+    out_signal = [line for line in out if "[probe:heartbeat]" not in line]
+    body = "\n".join(out_signal + err_signal)
+    home = instance_home(name)
+    startup_reports = []
+    logs_dir = f"{home}/.dsh/logs"
+    try:
+        startup_reports = sorted(
+            (os.path.join(logs_dir, f) for f in os.listdir(logs_dir) if f.startswith("startup-")),
+            key=os.path.getmtime, reverse=True)[:1]
+    except OSError:
+        pass
+    report_text = tail_file(startup_reports[0], 200) if startup_reports else []
+
+    counters = cgroup_counters(name)
+    evidence: list[str] = []
+    klass = "unknown"
+    detail = ""
+
+    # 先看"现在到底在不在服务"——这是唯一不会骗人的事实 ✓
+    port = int(instance_conf_get(name, "PORT") or 0)
+    if port and port_in_use(port):
+        return {"instance": name, "class": "ok", "detail": f"在监听 127.0.0.1:{port}",
+                "at": int(time.time()), "counters": counters, "evidence": [],
+                "startup_report": ""}
+
+    def has(needle: str) -> bool:
+        return needle.lower() in body.lower()
+
+    if counters.get("oom_kill"):
+        klass = "oom"
+        detail = f"cgroup memory.events oom_kill={counters['oom_kill']}"
+        evidence.append(detail)
+    elif counters.get("pids_max_hits"):
+        klass = "pids_limit"
+        detail = f"pids.max 触顶 {counters['pids_max_hits']} 次"
+        evidence.append(detail)
+    elif has("cannot resolve profile bundle") or has("skipping profile bundle"):
+        klass = "bundle_missing"
+        for line in (out + err):
+            if "bundle" in line.lower():
+                detail = line.strip()[:300]
+                evidence.append(detail)
+    elif has("eaddr in use") or has("eaddrinuse") or has("address already in use"):
+        klass = "port_in_use"
+        detail = f"端口 {instance_conf_get(name, 'PORT')} 已被占用"
+        evidence.append(detail)
+    elif has("eacces") or has("permission denied"):
+        klass = "permission"
+        for line in (out + err):
+            if "permission denied" in line.lower() or "eacces" in line.lower():
+                detail = line.strip()[:300]
+                evidence.append(detail)
+    elif has("enoent") or has("no such file or directory"):
+        klass = "missing_file"
+        for line in (out + err):
+            if "no such file" in line.lower() or "enoent" in line.lower():
+                detail = line.strip()[:300]
+                evidence.append(detail)
+    elif has("uncaughtexception") or has("unhandledrejection"):
+        klass = "crash"
+        for line in (out + err):
+            if "uncaught" in line.lower() or "unhandled" in line.lower():
+                detail = line.strip()[:300]
+                evidence.append(detail)
+    elif "signal sigterm" in body.lower() or "signal SIGTERM" in body:
+        klass = "stopped"
+        detail = "收到 SIGTERM（被 stop/restart/watchdog 停止）"
+        evidence.append(detail)
+    elif "signal SIGKILL" in body or has("killed"):
+        klass = "killed"
+        detail = "被 SIGKILL（cgroup.kill 或 OOM 杀手）"
+        evidence.append(detail)
+    elif not body.strip():
+        klass = "no_output"
+        detail = "实例没有任何输出（连 jail 的启动行都没有）"
+    elif "port bound" not in body.lower() and "dsh web:" not in body.lower():
+        klass = "never_bound"
+        detail = "进程起来了但没有监听端口（启动阶段卡住）"
+        evidence.append("没有 port bound / dsh web 行")
+
+    for line in (err_signal[-12:] if err_signal else []):
+        evidence.append(line.strip()[:300])
+    if report_text:
+        evidence.append(f"DSH 启动报告：{os.path.basename(startup_reports[0])}")
+        for line in report_text[-6:]:
+            evidence.append(line.strip()[:300])
+
+    return {"instance": name, "class": klass, "detail": detail or klass,
+            "at": int(time.time()), "counters": counters,
+            "evidence": evidence[-20:],
+            "startup_report": startup_reports[0] if startup_reports else ""}
+
+
 def prune_stale_bundles(st: dict, name: str) -> list[str]:
     """把 profile 里"声明了但文件不在"的 bundle 删掉 ✓
 
@@ -5297,6 +5774,136 @@ def cmd_instance_del(args):
     save_state(st)
     sync_all(st)
     info(f"instance {args.name} deleted" + ("" if args.purge else "; data kept under " + f"{INSTANCES_DIR}/{args.name}"))
+
+
+def cmd_instance_restart_stale(args):
+    """把"文件已新、进程仍旧"的实例重启一遍（升级后的收尾动作 ✓）。"""
+    st = load_state()
+    targets = []
+    for name in sorted(st.get("instances") or {}):
+        if args.instance and name != args.instance:
+            continue
+        inst = st["instances"][name] or {}
+        if str(inst.get("state")) != "running":
+            continue
+        row = instance_drift(st, name)
+        if row.get("needs_restart"):
+            hot = [k for k, v in (row["items"] or {}).items() if v is True]
+            targets.append((name, ",".join(hot)))
+    if not targets:
+        info("no drifted instances — nothing to restart")
+        return 0
+    for name, why in targets:
+        print(f"  {'would restart' if args.dry_run else 'restarting'} {name} ({why})")
+    if args.dry_run:
+        return 0
+
+    import concurrent.futures
+    results = {}
+
+    def one(name: str) -> tuple[bool, str]:
+        try:
+            cur = load_state()
+            stop_instance(cur, name)
+            start_instance(cur, name, timeout=float(args.timeout))
+            return True, ""
+        except SystemExit as exc:            # die() 走的是 SystemExit ✓
+            return False, str(exc.code or "start failed")[:200]
+        except Exception as exc:             # noqa: BLE001
+            return False, str(exc)[:200]
+
+    # 默认**串行**：状态文件是 read-modify-write ✗ 并发会互相覆盖（实测：5 台变 000）
+    # 想要并发必须等状态层加锁合并（P0-1 之后再做），现在默认 1 ✓
+    workers = max(1, min(int(args.concurrency or 1), len(targets)))
+    info(f"restarting {len(targets)} instance(s) with concurrency {workers}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(one, name): name for name, _why in targets}
+        for fut in concurrent.futures.as_completed(futures):
+            name = futures[fut]
+            try:
+                ok, err = fut.result()
+            except Exception as exc:         # noqa: BLE001
+                ok, err = False, str(exc)[:200]
+            results[name] = (ok, err)
+            info(f"  {name}: {'ok' if ok else 'FAILED ' + err}")
+    failed = [n for n, (ok, _e) in results.items() if not ok]
+    if failed:
+        warn(f"{len(failed)} instance(s) failed to restart: {', '.join(sorted(failed))}")
+        return 1
+    info(f"all {len(results)} instance(s) restarted")
+    return 0
+
+
+def cmd_instance_reap_supervisors(args):
+    """清掉多余的 supervise-daemon（保留最新那个 ✓）。
+
+    为什么单独做：openrc 的记账与真实进程偶尔错位，会留下两个 supervisor ✗
+    它们会互相重拉同一个单元。把清理放进 stop/start 热路径会引发抖动 ✗
+    （实测过）→ 做成显式命令，由人决定什么时候收 ✓
+    """
+    st = load_state()
+    names = [args.instance] if args.instance else sorted(st.get("instances") or {})
+    fixed = []
+    for name in names:
+        if name not in st.get("instances"):
+            continue
+        unit = f"dsh-mu-{name}"
+        supervisors = stale_supervisors(unit)
+        if len(supervisors) <= 1:
+            continue
+        # ❗ 不能按 pid 大小猜"谁是最新的" ✗ 实测会杀掉正在服务的那一个 ✗
+        # 正确判据：谁的孩子还活着并且在这个实例的 cgroup 里 ✓
+        port = int((st.get("instances", {}).get(name) or {}).get("port") or 0)
+        live_pid = None
+        cgroup_pids = set()
+        with contextlib.suppress(OSError, ValueError):
+            cgroup_pids = {int(x) for x in
+                           (read_text(f"/sys/fs/cgroup/dsh-mu/{name}/cgroup.procs") or "").split()}
+        for sup in supervisors:
+            try:
+                with open(f"/proc/{sup}/task/{sup}/children", encoding="utf-8") as fh:
+                    kids = {int(x) for x in fh.read().split()}
+            except OSError:
+                kids = set()
+            if kids & cgroup_pids:
+                live_pid = sup
+                break
+        if live_pid is None:
+            warn(f"{name}: cannot tell which supervisor is serving — leaving duplicates alone "
+                 f"(supervisors={supervisors}); restart the instance instead")
+            continue
+        for pid in supervisors:
+            if pid == live_pid:
+                continue
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+            info(f"{name}: killed idle supervisor pid {pid} (kept {live_pid})")
+            fixed.append(name)
+    if not fixed:
+        info("no duplicate supervisors")
+    return 0
+
+
+def cmd_instance_diagnose(args):
+    """给一次失败的启动归因（也可以在正常实例上跑，用来确认"它到底怎么了"）。"""
+    st = load_state()
+    if args.name not in st["instances"]:
+        die(f"no such instance: {args.name}")
+    diag = diagnose_instance(args.name)
+    if getattr(args, "json", False):
+        print(json.dumps(diag, indent=2, ensure_ascii=False))
+        return 0
+    print(f"instance   {args.name}")
+    print(f"class      {diag['class']}")
+    print(f"detail     {diag['detail']}")
+    print(f"counters   {diag['counters']}")
+    if diag.get("startup_report"):
+        print(f"report     {diag['startup_report']}")
+    if diag.get("evidence"):
+        print("evidence")
+        for line in diag["evidence"]:
+            print(f"  {line}")
+    return 0
 
 
 def cmd_instance_logs(args):
@@ -9871,6 +10478,9 @@ def restart_admin_if_stale(quiet: bool = False) -> bool:
         return False
     if not quiet:
         info("admin backend is running the previous build; restarting it")
+    # 先确保端口上没有"上一代"的 python（客户机上它占了 15 小时 ✗
+    # → 新 supervisor 抢不到端口，页面一直跑旧代码 ✗）
+    ensure_port_free(admin_port(), keep=service_child_pids("dsh-mud"))
     run(["/sbin/rc-service", "dsh-mud", "restart"], check=False)
     mark_admin_restarted()
     return True
@@ -9941,6 +10551,13 @@ def watchdog_scan(heal: bool = True) -> dict:
     """
     st = load_state()
     bad, fixed, failed = [], [], []
+    # 日志轮转也放在这里：每 60 秒一次、纯 stat，开销可忽略 ✓
+    with contextlib.suppress(Exception):
+        cfg_logs = st.get("config", {})
+        for item in rotate_logs(
+                max_mb=int(cfg_logs.get("log_max_mb", DEFAULT_LOG_MAX_MB) or DEFAULT_LOG_MAX_MB),
+                keep=int(cfg_logs.get("log_keep", DEFAULT_LOG_KEEP) or DEFAULT_LOG_KEEP)):
+            info(f"watchdog: rotated {item['file']}")
     # 平台自身：admin 后端 / 网关 停了就拉起来 ✓
     # （客户机上踩到：装完 apk 后 dsh-mud 处于 stopped ✗ 整个 admin 打不开 ✗）
     for svc in ("dsh-mud", "dsh-mu-gateway"):
@@ -9975,7 +10592,10 @@ def watchdog_scan(heal: bool = True) -> dict:
         # （我第一版在这里按 supervision 判，结果 watchdog 每 60 秒给它发一次 SIGTERM ✗
         #   扩展被反复重启 ✗ 依赖它的实例又跟着卡住 ✗ —— 正是这次踩的坑）
         status = ext_status(name)
-        if status in ("running", "unsupervised"):
+        # "unsupervised" 但 supervisor 还在 = 其实是好的 ✗ 别去动它
+        if status in ("running", "unsupervised") and stale_supervisors(f"dsh-mu-ext-{name}"):
+            continue
+        if status == "running":
             continue
         if not heal:
             bad.append(f"ext-{name}")
@@ -10032,6 +10652,10 @@ def watchdog_scan(heal: bool = True) -> dict:
         if not heal:
             continue
         info(f"watchdog: {name} (port {port}) is not listening — restarting it")
+        with contextlib.suppress(Exception):
+            diag = diagnose_instance(name)
+            record_failure(st, name, diag)
+            record_restart_reason(st, name, f"{diag['class']}: {diag['detail']}")
         try:
             st2 = load_state()
             stop_instance(st2, name, mark=False)
@@ -10123,9 +10747,14 @@ def platform_log_files() -> list[str]:
 
 def rotate_logs(max_mb: int = DEFAULT_LOG_MAX_MB, keep: int = DEFAULT_LOG_KEEP,
                 force: bool = False) -> list[dict]:
-    """Size-based copytruncate rotation; returns what was rotated."""
-    rotated = []
-    threshold = max_mb * 1024 * 1024
+    """按大小轮转日志（copytruncate ✓），并清理过期启动报告。
+
+    为什么必须 copytruncate：supervise-daemon 一直持有文件描述符 ✗
+    改名（logrotate 默认做法）之后它继续写旧 inode → 新文件永远是空的 ✗
+    所以先复制成 .1，再把原文件截断，写者完全不受影响 ✓
+    """
+    rotated: list[dict] = []
+    threshold = max(0, int(max_mb)) * 1024 * 1024
     for path in platform_log_files():
         try:
             size = os.path.getsize(path)
@@ -10135,21 +10764,38 @@ def rotate_logs(max_mb: int = DEFAULT_LOG_MAX_MB, keep: int = DEFAULT_LOG_KEEP,
             continue
         if size == 0:
             continue
-        # shift .N-1 -> .N, dropping the oldest
-        with contextlib.suppress(OSError):
-            os.unlink(f"{path}.{keep}")
-        for index in range(keep - 1, 0, -1):
-            src, dst = f"{path}.{index}", f"{path}.{index + 1}"
-            if os.path.exists(src):
-                with contextlib.suppress(OSError):
-                    os.replace(src, dst)
-        with contextlib.suppress(OSError):
-            shutil.copy2(path, f"{path}.1")
+        if keep > 0:
+            with contextlib.suppress(OSError):
+                os.unlink(f"{path}.{keep}")
+            for index in range(keep - 1, 0, -1):
+                src, dst = f"{path}.{index}", f"{path}.{index + 1}"
+                if os.path.exists(src):
+                    with contextlib.suppress(OSError):
+                        os.replace(src, dst)
+            with contextlib.suppress(OSError):
+                shutil.copy2(path, f"{path}.1")
         with open(path, "w"):
             pass  # truncate in place, keeping the writer's descriptor valid
         with contextlib.suppress(OSError):
             os.chmod(path, 0o640)
         rotated.append({"file": path, "bytes": size})
+
+    # DSH 自己的启动诊断也会越攒越多 ✗ 只留最近 N 份 ✓
+    with contextlib.suppress(Exception):
+        st_now = load_state()
+        keep_reports = max(1, int((st_now.get("config") or {}).get("startup_reports_keep", 10) or 10))
+        for inst_name in (st_now.get("instances") or {}):
+            logs_dir = f"{instance_home(inst_name)}/.dsh/logs"
+            try:
+                reports = sorted((os.path.join(logs_dir, f) for f in os.listdir(logs_dir)
+                                  if f.startswith("startup-")),
+                                 key=os.path.getmtime, reverse=True)
+            except OSError:
+                continue
+            for stale in reports[keep_reports:]:
+                with contextlib.suppress(OSError):
+                    os.unlink(stale)
+                    rotated.append({"file": stale, "bytes": 0, "pruned": True})
     return rotated
 
 
@@ -10160,8 +10806,6 @@ BACKUP_MANIFEST = "MANIFEST.json"
 
 
 BACKUP_SKIP: set[str] = set()
-
-
 def backup_groups() -> dict[str, list[str]]:
     """Backup members grouped by what an operator may want to leave out.
 
@@ -10489,6 +11133,272 @@ def cmd_restore(args):
     info(f"restored {result['restored']}; previous state saved to {result['safety_backup']}")
     info("gateway views re-rendered; run `dsh-muctl doctor` and restart instances if needed")
     return 0
+
+
+UPGRADE_JOB = "/run/dsh-mu/upgrade-job.json"
+
+
+def upgrade_job_write(job: dict) -> None:
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(UPGRADE_JOB), exist_ok=True)
+        atomic_write(UPGRADE_JOB, json.dumps(job, indent=2, ensure_ascii=False) + "\n", mode=0o644)
+
+
+def apk_expected_version(path: str) -> str:
+    """apk 文件里的版本（apk v3 是 ADB 容器 ✗ tarfile 打不开，用 `apk adbdump` ✓）。
+
+    返回 VERSION 文件那种形态（1.9.126），去掉 -rN ✓ 直接和 _platform_version() 比 ✓
+    """
+    name = os.path.basename(path)
+    verdict = ""
+    with contextlib.suppress(Exception):
+        res = run(["/sbin/apk", "adbdump", path], check=False, capture=True)
+        body = ((res.stdout or "") + (res.stderr or ""))
+        hit = re.search(r"(?m)^\s*version:\s*(\S+)\s*$", body)
+        if hit:
+            verdict = hit.group(1)
+    if not verdict:
+        hit = re.search(r"dsh-mu-(\d[\w.]*?)(?:-r\d+)?\.apk$", name)
+        if hit:
+            verdict = hit.group(1)
+    return re.sub(r"-r\d+$", "", verdict)
+
+
+def latest_other_apk(path: str) -> str:
+    """回滚用：同目录里除它之外最新的 dsh-mu-*.apk ✓"""
+    folder = os.path.dirname(os.path.abspath(path)) or "."
+    best, best_mtime = "", 0.0
+    with contextlib.suppress(OSError):
+        for name in os.listdir(folder):
+            if not name.endswith(".apk") or not name.startswith("dsh-mu-"):
+                continue
+            cand = os.path.join(folder, name)
+            if os.path.abspath(cand) == os.path.abspath(path):
+                continue
+            try:
+                mtime = os.path.getmtime(cand)
+            except OSError:
+                continue
+            if mtime > best_mtime:
+                best, best_mtime = cand, mtime
+    return best
+
+
+def upgrade_job_step(job: dict, phase: str, detail: str = "") -> None:
+    job["phase"] = phase
+    job.setdefault("steps", []).append({"at": int(time.time()), "phase": phase, "detail": detail[:400]})
+    upgrade_job_write(job)
+    if not job.get("quiet"):
+        info(f"[{phase}] {detail}" if detail else f"[{phase}]")
+
+
+def cmd_upgrade(args):
+    """升级 = 预检 → 快照 → 安装 → 验证 →（失败自动回滚）
+
+    以前升级靠人手：装完才发现 admin 打不开、实例起不来 ✗
+    这个命令把"装完要验证什么、失败怎么退"写成代码 ✓
+    """
+    ensure_root()
+    path = os.path.abspath(args.apk)
+    if not os.path.isfile(path):
+        die(f"no such apk: {path}")
+    expected = apk_expected_version(path)
+    if not expected:
+        die(f"cannot read the version out of {path} (is it an apk?)")
+    current = _platform_version()
+    prev_apk = args.previous or latest_other_apk(path)
+    job = {"id": int(time.time()), "apk": path, "expected": expected, "from": current,
+           "previous_apk": prev_apk, "started": int(time.time()), "ok": None,
+           "quiet": bool(getattr(args, "json", False))}
+
+    upgrade_job_step(job, "preflight", f"{current} -> {expected}")
+    problems = []
+    try:
+        st_w = os.statvfs("/")
+        free_gb = st_w.f_bavail * st_w.f_frsize / (1024 ** 3)
+    except OSError:
+        free_gb = -1.0
+    if free_gb >= 0 and free_gb < args.min_free_gb:
+        problems.append(f"磁盘余量 {free_gb:.1f}GB < {args.min_free_gb}GB")
+    if not os.access("/sys/fs/cgroup/dsh-mu", os.W_OK):
+        problems.append("cgroup 委托不可写")
+    if current == expected and not args.force:
+        problems.append(f"已经是 {expected}（用 --force 重装）")
+    if not args.skip_doctor:
+        failing = [row for row in doctor_checks(load_state()) if row.get("status") == DOCTOR_FAIL]
+        if failing:
+            problems.append(f"doctor 有 {len(failing)} 条 FAIL："
+                            + ", ".join((r.get("check") or r.get("name") or "?")
+                                        for r in failing[:4]))
+    if problems:
+        upgrade_job_step(job, "preflight-failed", "; ".join(problems))
+        job.update({"ok": False, "error": "preflight: " + "; ".join(problems),
+                    "finished": int(time.time())})
+        upgrade_job_write(job)
+        die("预检失败：" + "; ".join(problems))
+    upgrade_job_step(job, "preflight-ok", f"free {free_gb:.1f}GB, doctor clean")
+
+    snap = args.snapshot or f"/var/backups/dsh-mu-upgrade-{time.strftime('%Y%m%d-%H%M%S')}.tgz"
+    try:
+        os.makedirs(os.path.dirname(snap), exist_ok=True)
+        create_backup(snap, with_instances=False, skip_groups=set())
+        upgrade_job_step(job, "snapshot", snap)
+    except Exception as exc:  # noqa: BLE001
+        upgrade_job_step(job, "snapshot-failed", str(exc))
+        job.update({"ok": False, "error": f"snapshot failed: {exc}", "finished": int(time.time())})
+        upgrade_job_write(job)
+        die(f"快照失败，未安装：{exc}")
+
+    upgrade_job_step(job, "install", path)
+    res = run(["/sbin/apk", "add", "--allow-untrusted", "--force-overwrite", path],
+              check=False, capture=True)
+    output = ((res.stdout or "") + (res.stderr or "")).strip()
+    if res.returncode != 0:
+        upgrade_job_step(job, "install-failed", output[-300:])
+        job.update({"ok": False, "error": "apk add failed", "output": output[-2000:],
+                    "finished": int(time.time())})
+        upgrade_job_write(job)
+        die(f"apk add 失败：{output[-400:]}")
+    upgrade_job_step(job, "installed", expected)
+    # apk 装完，旧进程可能还占着 admin 端口（客户机上出现过 15 小时的孤儿 ✗）
+    # → 这里做一次"确定性接手"：zap 掉 supervisor、清掉端口、重新 start ✓
+    with contextlib.suppress(Exception):
+        port_now = admin_port()
+        run(["/sbin/rc-service", "dsh-mud", "zap"], check=False, capture=True)
+        killed = ensure_port_free(port_now)
+        if killed:
+            upgrade_job_step(job, "port-reclaimed", f"killed stale {killed} on {port_now}")
+        run(["/sbin/rc-service", "dsh-mud", "start"], check=False)
+        time.sleep(2.0)
+
+    def verify() -> list[str]:
+        bad = []
+        deadline = time.time() + args.verify_timeout
+        seen = ""
+        while time.time() < deadline:
+            seen = _platform_version()
+            if seen == expected:
+                break
+            time.sleep(2.0)
+        if seen != expected:
+            bad.append(f"VERSION 是 {seen}，期望 {expected}")
+        port = admin_port()
+        alive = False
+        deadline = time.time() + args.verify_timeout
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=2.0):
+                    alive = True
+                    break
+            except OSError:
+                time.sleep(2.0)
+        if not alive:
+            bad.append(f"admin {port} 没在监听")
+        # ★ 权威判据：admin 的 /api/health 会报它**自己加载的**版本 ✓
+        # （只测端口通不够 ✗ 回滚演练里就抓到：旧 supervisor 还在服务旧代码 ✓ 端口当然通 ✗）
+        serving = ""
+        health_deadline = time.time() + args.verify_timeout
+        while time.time() < health_deadline:
+            try:
+                token = (read_text(ADMIN_TOKEN_PATH) or "").strip()
+                req = urllib.request.Request(f"http://127.0.0.1:{port}/api/health",
+                                             headers={"X-DSH-MU-Admin": token})
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    serving = str(json.loads(resp.read().decode("utf-8")).get("version") or "")
+                break
+            except Exception:  # noqa: BLE001
+                time.sleep(2.0)
+        if serving != expected:
+            bad.append(f"admin 自报版本是 {serving or '未知'}，期望 {expected}（旧进程仍在服务）")
+        off = []
+        st_now = load_state()
+        for name, inst in (st_now.get("instances") or {}).items():
+            if str(inst.get("state")) != "running":
+                continue
+            inst_port = int(inst.get("port") or 0)
+            if not inst_port:
+                continue
+            ok_inst = False
+            deadline = time.time() + min(60.0, args.verify_timeout)
+            while time.time() < deadline:
+                try:
+                    with socket.create_connection(("127.0.0.1", inst_port), timeout=2.0):
+                        ok_inst = True
+                        break
+                except OSError:
+                    time.sleep(2.0)
+            if not ok_inst:
+                off.append(name)
+        if off:
+            bad.append("实例端口不通：" + ", ".join(sorted(off)[:8]))
+        return bad
+
+    upgrade_job_step(job, "verify", f"timeout {args.verify_timeout}s")
+    problems = verify()
+    if not problems:
+        st_done = load_state()
+        drift = [name for name in sorted(st_done.get("instances") or {})
+                 if instance_drift(st_done, name).get("needs_restart")]
+        upgrade_job_step(job, "verify-ok", expected)
+        job.update({"ok": True, "finished": int(time.time()), "drift": drift})
+        upgrade_job_write(job)
+        info(f"升级成功：{current} -> {expected}")
+        if drift:
+            info(f"有 {len(drift)} 台实例需要重启才能加载新文件：dsh-muctl instance restart-stale")
+        return 0
+
+    upgrade_job_step(job, "verify-failed", "; ".join(problems))
+    warn("验证失败，开始回滚：" + "; ".join(problems))
+    rolled = False
+    if prev_apk and os.path.isfile(prev_apk):
+        upgrade_job_step(job, "rollback", f"reinstall {os.path.basename(prev_apk)}")
+        # 这个 apk 没有 --force-downgrade 选项 ✗（回滚演练时实测）
+        # → 先 del 再 add（版本回退唯一可靠的办法 ✓ 代价是钩子多跑一遍 ✓）
+        run(["/sbin/apk", "del", "dsh-mu"], check=False, capture=True)
+        res = run(["/sbin/apk", "add", "--allow-untrusted", "--force-overwrite", prev_apk],
+                  check=False, capture=True)
+        out = ((res.stdout or "") + (res.stderr or "")).strip()
+        if res.returncode == 0:
+            rolled = True
+            upgrade_job_step(job, "rollback-installed", _platform_version())
+        else:
+            upgrade_job_step(job, "rollback-failed", out[-300:])
+    else:
+        upgrade_job_step(job, "rollback-skipped", "no previous apk found")
+    if rolled and not args.no_restore_state:
+        try:
+            apply_restore(snap, restore_plan(snap), skip_groups=set())
+            upgrade_job_step(job, "state-restored", snap)
+        except Exception as exc:  # noqa: BLE001
+            upgrade_job_step(job, "state-restore-failed", str(exc))
+    with contextlib.suppress(Exception):
+        # 回滚是"恢复"场景：旧的 supervisor/python 一律清掉再起 ✓
+        for unit in ("dsh-mud", "dsh-mu-gateway"):
+            run(["/sbin/rc-service", unit, "zap"], check=False, capture=True)
+        for pid in stale_supervisors("dsh-mud"):
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+        ensure_port_free(admin_port())
+        started = False
+        for attempt in range(2):
+            run(["/sbin/rc-service", "dsh-mud", "start"], check=False)
+            time.sleep(3.0)
+            probe = run(["/sbin/rc-service", "dsh-mud", "status"], check=False, capture=True)
+            if "started" in ((probe.stdout or "") + (probe.stderr or "")):
+                started = True
+                break
+            run(["/sbin/rc-service", "dsh-mud", "zap"], check=False, capture=True)
+            ensure_port_free(admin_port())
+        run(["/sbin/rc-service", "dsh-mu-gateway", "restart"], check=False)
+        if not started:
+            upgrade_job_step(job, "rollback-service-failed",
+                             "admin did not come back; run: dsh-muctl sync")
+    job.update({"ok": False, "error": "; ".join(problems), "rolled_back": rolled,
+                "finished": int(time.time())})
+    upgrade_job_write(job)
+    if rolled:
+        die(f"升级失败已回滚到 {_platform_version()}：{'；'.join(problems)}")
+    die(f"升级失败且回滚未成功（快照 {snap}）：{'；'.join(problems)}")
 
 
 def cmd_logs_size(args):
@@ -15496,10 +16406,45 @@ def doctor_checks(st: dict) -> list[dict]:
         else:
             add("nginx temp dirs", DOCTOR_PASS, f"{NGINX_TEMP_ROOT} inside the gateway jail")
 
-    total_mb = sum(os.path.getsize(p) for p in platform_log_files() if os.path.exists(p)) // (1024 * 1024)
-    add("log volume", DOCTOR_PASS if total_mb < 512 else DOCTOR_WARN,
-        f"{total_mb} MB across {len(platform_log_files())} files",
-        "" if total_mb < 512 else "dsh-muctl logs rotate --force")
+    drift_rows = []
+    for inst_name in sorted(st.get("instances") or {}):
+        if str((st["instances"][inst_name] or {}).get("state")) != "running":
+            continue
+        info_row = instance_drift(st, inst_name)
+        if info_row.get("needs_restart"):
+            hot = [k for k, v in (info_row["items"] or {}).items() if v is True]
+            drift_rows.append(f"{inst_name}({','.join(hot)})")
+    add("instance drift", DOCTOR_PASS if not drift_rows else DOCTOR_WARN,
+        "所有在跑的实例都与磁盘一致" if not drift_rows else
+        "以下实例有「文件已新、进程仍旧」的漂移：" + ", ".join(drift_rows),
+        "" if not drift_rows else "dsh-muctl instance restart-stale")
+    owners = listening_pids(admin_port())
+    children = service_child_pids("dsh-mud")
+    if not owners:
+        add("admin port owner", DOCTOR_FAIL, f"nobody is listening on {admin_port()}",
+            "dsh-muctl sync")
+    elif owners and not set(owners) <= children:
+        add("admin port owner", DOCTOR_FAIL,
+            f"port {admin_port()} is held by pid {owners} which is not a child of the current "
+            f"supervise-daemon (children={sorted(children) or '-'}) — the page may be running "
+            f"an old build", "dsh-muctl sync")
+    else:
+        add("admin port owner", DOCTOR_PASS, f"pid {owners[0]} is supervised by dsh-mud")
+    usage = logs_usage(st)
+    max_mb = int((st.get("config") or {}).get("log_max_mb", DEFAULT_LOG_MAX_MB) or DEFAULT_LOG_MAX_MB)
+    biggest = usage["files"][0] if usage["files"] else {"file": "-", "mb": 0}
+    volume_status, volume_fix = DOCTOR_PASS, ""
+    if biggest["mb"] > max_mb * 2:
+        volume_status = DOCTOR_FAIL
+        volume_fix = "dsh-muctl logs rotate（超过阈值 2 倍，说明轮转没生效）"
+    elif usage["total_mb"] > 200:
+        volume_status = DOCTOR_WARN
+        volume_fix = "dsh-muctl logs rotate"
+    add("log usage", volume_status,
+        f"{usage['total_mb']}MB / {len(usage['files'])} 文件；最大 "
+        f"{os.path.basename(biggest['file'])} {biggest['mb']}MB；启动报告 "
+        f"{usage['startup_reports']} 份 {usage['startup_reports_mb']}MB（阈值 {max_mb}MB/文件）",
+        volume_fix)
     return checks
 
 
@@ -15688,6 +16633,22 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("-n", "--lines", type=int, default=100)
     a.add_argument("-f", "--follow", action="store_true")
     a.set_defaults(func=cmd_instance_logs)
+    a = isub.add_parser("restart-stale",
+                        help="restart instances whose files changed on disk (after an upgrade)")
+    a.add_argument("instance", nargs="?", default="", help="only this instance")
+    a.add_argument("--dry-run", action="store_true")
+    a.add_argument("--concurrency", type=int, default=1,
+                   help="1 = serial (safe); >1 can lose state updates until the state layer merges")
+    a.add_argument("--timeout", type=float, default=180.0)
+    a.set_defaults(func=cmd_instance_restart_stale)
+    a = isub.add_parser("reap-supervisors",
+                        help="kill duplicate supervise-daemon processes (keeps the newest)")
+    a.add_argument("instance", nargs="?", default="")
+    a.set_defaults(func=cmd_instance_reap_supervisors)
+    a = isub.add_parser("diagnose", help="explain why an instance is not listening")
+    a.add_argument("name")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(func=cmd_instance_diagnose)
     a = isub.add_parser("shell")
     a.add_argument("name")
     a.set_defaults(func=cmd_instance_shell)
@@ -15788,31 +16749,41 @@ def build_parser() -> argparse.ArgumentParser:
                     help="with `models --refresh`: probe each new model to learn its protocol")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_provider)
-    sp = sub.add_parser("upgrade", help="install an apk and sync everything (one step)")
-    sp.add_argument("apk", nargs="?", help="path to dsh-mu-*.apk (default: newest found)")
-    sp.add_argument("--safe", action="store_true",
-                    help="refuse to upgrade while an instance is in active use")
-    sp.add_argument("--no-restart", action="store_true", help="do not mention instance restarts")
-    sp.set_defaults(func=cmd_upgrade)
-    sp = sub.add_parser("runtime", help="DSH runtime helpers (shared rootfs)")
-    sp.add_argument("action",
-                    choices=["status", "fix-pty", "install", "use", "channels",
-                             "list", "prune", "ensure-mounted", "pack", "verify",
-                             "migrate-ids"],
-                    nargs="?",
-                    default="status")
-    sp.add_argument("version", nargs="?", help="with `install`: dsh version, e.g. 0.2.1-rc.5")
-    sp.add_argument("--dry-run", dest="dry_run", action="store_true",
-                    help="migrate-ids: 只打印计划（现在默认就是预演 ✓ 保留此参数兼容）")
-    sp.add_argument("--restart", dest="restart", action="store_true",
-                    help="use: 设为默认后**立刻逐个重启**跟随的实例（默认不动它们 ✓）")
-    sp.add_argument("--yes", dest="yes", action="store_true",
-                    help="migrate-ids: 真的执行（会停/重启受影响的实例 ✗ 危险）")
-    sp.add_argument("--from", dest="from_dir", default="",
-                    help="runtime pack: 源目录（默认当前运行时目录）")
-    sp.add_argument("--keep-dir", dest="keep_dir", action="store_true",
-                    help="runtime pack: 保留源目录（默认就保留，占位用于未来）")
-    sp.set_defaults(func=cmd_runtime)
+    sp = sub.add_parser("admin", help="admin backend (loopback JSON API behind the gateway)")
+    sp.add_argument("action", choices=["status", "install", "restart", "token"])
+    sp.add_argument("--rotate", action="store_true", help="with `token`: generate a new token")
+    sp.add_argument("--no-reload", dest="reload", action="store_false", default=True,
+                    help="with `install`: do not restart the service")
+    sp.set_defaults(func=cmd_admin)
+
+    sp = sub.add_parser("backup", help="write a platform backup (records, optionally instance files)")
+    sp.add_argument("--out", help="output file (default /var/backups/dsh-mu-<ts>.tgz)")
+    sp.add_argument("--with-instances", dest="with_instances", action="store_true",
+                    help="also archive each instance's home directory")
+    sp.add_argument("--except", dest="except_groups", default="",
+                    help="comma separated groups to leave out "
+                         "(state,config,secrets,gateway,providers,plans,tls)")
+    sp.add_argument("--only", dest="only_groups", default="",
+                    help="comma separated groups to keep; everything else is left out")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_backup)
+
+    sp = sub.add_parser("default", help="priority chain for the starting model (plan + model)")
+    sp.add_argument("action", choices=["list", "show", "add", "set", "rm", "delete",
+                                       "user-set", "user-clear"])
+    sp.add_argument("plan", nargs="?", help="plan id (or an index for rm)")
+    sp.add_argument("--model", help="model id to pin for that plan")
+    sp.set_defaults(func=cmd_default)
+
+    sp = sub.add_parser("egress", help="per-instance egress policy (nftables, cgroup-matched)")
+    sp.add_argument("action", choices=["show", "set", "allow", "allow-add", "allow-rm", "instance"])
+    sp.add_argument("policy", nargs="?", help="open | no-intranet | allowlist")
+    sp.add_argument("name", nargs="?", help="instance name (egress instance)")
+    sp.add_argument("--allow", help="allowlist entries, e.g. 10.1.2.3:443,192.168.5.0/24")
+    sp.add_argument("--reset", action="store_true", help="drop the per-instance override")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_egress)
+
     sp = sub.add_parser("ext", help="extensions: jailed appliances shipped by plugin packages")
     sp.add_argument("action", choices=["list", "reload", "status", "start", "stop", "restart",
                                        "logs", "doctor", "cli"], nargs="?", default="list")
@@ -15820,24 +16791,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("-n", "--lines", type=int, default=40)
     sp.add_argument("rest", nargs=argparse.REMAINDER, help="arguments for `ext cli`")
     sp.set_defaults(func=cmd_ext)
-    sp = sub.add_parser("plugin", help="plugin packages + policy: protected / preinstall / push")
-    sp.add_argument("action", choices=["list", "policy", "add", "remove", "rm",
-                                       "protect", "unprotect", "preinstall", "unpreinstall",
-                                       "push", "unpush", "fetch", "cached", "forget",
-                                       "check"])
-    sp.add_argument("--delete-asset", action="store_true",
-                    help="also delete the downloaded package (plugin remove)")
-    sp.add_argument("--policy-action", dest="policy_action", default="",
-                    help="internal")
-    sp.add_argument("pkg", nargs="?", help="npm package name, e.g. @scope/dsh-plugin-x")
-    sp.add_argument("--version", help="pin a version (default: latest)")
-    sp.add_argument("--name", help="instance used to run pnpm when filling the store")
-    sp.add_argument("--store", action="store_true",
-                    help="also fill the pnpm store (for plugin_store_offline=true)")
-    sp.add_argument("--proxy", help="proxy for this download, e.g. http://127.0.0.1:7890")
-    sp.add_argument("--note", help="one line shown in the panel")
+
+    sp = sub.add_parser("instance-patch", help="show the resolved provider patch for an instance")
+    sp.add_argument("name")
     sp.add_argument("--json", action="store_true")
-    sp.set_defaults(func=cmd_plugin)
+    sp.set_defaults(func=cmd_instance_patch)
+
+    sp = sub.add_parser("mount", help="bind host directories into an instance jail")
+    sp.add_argument("action", choices=["list", "add", "rm", "delete", "set"])
+    sp.add_argument("host", nargs="?", help="host directory")
+    sp.add_argument("jail", nargs="?", help="path inside the jail (default: same as host)")
+    sp.add_argument("--instance", help="instance name")
+    sp.add_argument("--all", action="store_true", help="apply to every instance")
+    sp.add_argument("--rw", action="store_true", help="read-write (default: read-only)")
+    sp.set_defaults(func=cmd_mount)
+
     sp = sub.add_parser("plan", help="model plans: provider + credential + display name")
     sp.add_argument("action", choices=["list", "add", "rm", "delete", "enable", "disable",
                                        "default", "show", "sync", "key", "hide", "show",
@@ -15860,35 +16828,6 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--default", action="store_true", help="make this team plan the default")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_plan)
-    sp = sub.add_parser("egress", help="per-instance egress policy (nftables, cgroup-matched)")
-    sp.add_argument("action", choices=["show", "set", "allow", "allow-add", "allow-rm", "instance"])
-    sp.add_argument("policy", nargs="?", help="open | no-intranet | allowlist")
-    sp.add_argument("name", nargs="?", help="instance name (egress instance)")
-    sp.add_argument("--allow", help="allowlist entries, e.g. 10.1.2.3:443,192.168.5.0/24")
-    sp.add_argument("--reset", action="store_true", help="drop the per-instance override")
-    sp.add_argument("--json", action="store_true")
-    sp.set_defaults(func=cmd_egress)
-    sp = sub.add_parser("default", help="priority chain for the starting model (plan + model)")
-    sp.add_argument("action", choices=["list", "show", "add", "set", "rm", "delete",
-                                       "user-set", "user-clear"])
-    sp.add_argument("plan", nargs="?", help="plan id (or an index for rm)")
-    sp.add_argument("--model", help="model id to pin for that plan")
-    sp.set_defaults(func=cmd_default)
-    sp = sub.add_parser("template", help="import provider templates from the project repo")
-    sp.add_argument("action", choices=["list", "import", "source"])
-    sp.add_argument("name", nargs="?", help="template name (without .json)")
-    sp.add_argument("--force", action="store_true", help="replace an existing package")
-    sp.add_argument("--url", help="change the template source (base URL, https:// or file://)")
-    sp.set_defaults(func=cmd_template)
-
-    sp = sub.add_parser("mount", help="bind host directories into an instance jail")
-    sp.add_argument("action", choices=["list", "add", "rm", "delete", "set"])
-    sp.add_argument("host", nargs="?", help="host directory")
-    sp.add_argument("jail", nargs="?", help="path inside the jail (default: same as host)")
-    sp.add_argument("--instance", help="instance name")
-    sp.add_argument("--all", action="store_true", help="apply to every instance")
-    sp.add_argument("--rw", action="store_true", help="read-write (default: read-only)")
-    sp.set_defaults(func=cmd_mount)
 
     sp = sub.add_parser("provider-test", help="probe a provider endpoint (real request, tiny completion)")
     sp.add_argument("--instance", help="use this instance's provider and credential")
@@ -15897,27 +16836,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model", help="override the model")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_provider_test)
-    sp = sub.add_parser("instance-patch", help="show the resolved provider patch for an instance")
-    sp.add_argument("name")
-    sp.add_argument("--json", action="store_true")
-    sp.set_defaults(func=cmd_instance_patch)
-    sp = sub.add_parser("admin", help="admin backend (loopback JSON API behind the gateway)")
-    sp.add_argument("action", choices=["status", "install", "restart", "token"])
-    sp.add_argument("--rotate", action="store_true", help="with `token`: generate a new token")
-    sp.add_argument("--no-reload", dest="reload", action="store_false", default=True,
-                    help="with `install`: do not restart the service")
-    sp.set_defaults(func=cmd_admin)
-    sp = sub.add_parser("backup", help="write a platform backup (records, optionally instance files)")
-    sp.add_argument("--out", help="output file (default /var/backups/dsh-mu-<ts>.tgz)")
-    sp.add_argument("--with-instances", dest="with_instances", action="store_true",
-                    help="also archive each instance's home directory")
-    sp.add_argument("--except", dest="except_groups", default="",
-                    help="comma separated groups to leave out "
-                         "(state,config,secrets,gateway,providers,plans,tls)")
-    sp.add_argument("--only", dest="only_groups", default="",
-                    help="comma separated groups to keep; everything else is left out")
-    sp.add_argument("--json", action="store_true")
-    sp.set_defaults(func=cmd_backup)
+
     sp = sub.add_parser("restore", help="restore a platform backup")
     sp.add_argument("file")
     sp.add_argument("--dry-run", dest="dry_run", action="store_true", help="show the plan only")
@@ -15929,6 +16848,26 @@ def build_parser() -> argparse.ArgumentParser:
                     help="comma separated groups to restore; everything else is skipped")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_restore)
+
+    sp = sub.add_parser("template", help="import provider templates from the project repo")
+    sp.add_argument("action", choices=["list", "import", "source"])
+    sp.add_argument("name", nargs="?", help="template name (without .json)")
+    sp.add_argument("--force", action="store_true", help="replace an existing package")
+    sp.add_argument("--url", help="change the template source (base URL, https:// or file://)")
+    sp.set_defaults(func=cmd_template)
+
+    sp = sub.add_parser("upgrade",
+                        help="install an apk: preflight → snapshot → install → verify → rollback")
+    sp.add_argument("apk")
+    sp.add_argument("--previous", default="", help="apk to roll back to (default: newest sibling)")
+    sp.add_argument("--snapshot", default="", help="where to write the state snapshot")
+    sp.add_argument("--min-free-gb", type=float, default=2.0)
+    sp.add_argument("--verify-timeout", type=float, default=120.0)
+    sp.add_argument("--force", action="store_true", help="reinstall the same version")
+    sp.add_argument("--skip-doctor", action="store_true", help="ignore doctor FAILs in preflight")
+    sp.add_argument("--no-restore-state", action="store_true")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_upgrade)
     sp = sub.add_parser("logs", help="platform log maintenance")
     lsub = sp.add_subparsers(dest="subcommand", required=True)
     sub_size = lsub.add_parser("size", help="show log file sizes")

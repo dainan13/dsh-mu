@@ -475,6 +475,11 @@ def instance_view(st: dict, name: str) -> dict:
         "log_bytes": (os.path.getsize(f"{mu.LOGS}/{name}.log")
                       if os.path.exists(f"{mu.LOGS}/{name}.log") else 0),
         "restarts": int(inst.get("restarts", 0)),
+        # 「上次为什么起不来 / 为什么被重启」——以前只能翻日志猜 ✗
+        "last_failure": inst.get("last_failure") or {},
+        "last_failure_count": int(inst.get("last_failure_count") or 0),
+        "last_restart_reason": str(inst.get("last_restart_reason") or ""),
+        "last_restart_at": int(inst.get("last_restart_at") or 0),
         "started_at": int(inst.get("started_at", 0) or 0),
         "port_range": [int(x) for x in (st["config"].get("port_range") or [])],
     }
@@ -699,6 +704,7 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("GET", re.compile(r"^/api/users$"), "users"),
     ("GET", re.compile(r"^/api/instances$"), "instances"),
     ("GET", re.compile(r"^/api/instances/([\w-]+)/logs$"), "instance_logs"),
+    ("GET", re.compile(r"^/api/events$"), "events"),
     ("GET", re.compile(r"^/api/instances/([\w-]+)/patch$"), "instance_patch"),
     ("GET", re.compile(r"^/api/instances/([\w-]+)$"), "instance"),
     ("GET", re.compile(r"^/api/doctor$"), "doctor"),
@@ -2399,6 +2405,17 @@ class Handler(BaseHTTPRequestHandler):
             if groups[0] not in st["instances"]:
                 return 404, {"error": "no such instance", "instance": groups[0]}
             return 200, {"instance": instance_view(st, groups[0])}
+        if name == "events":
+            want = int((query.get("limit") or ["100"])[0] or 100)
+            kind = str((query.get("kind") or [""])[0])
+            inst = str((query.get("instance") or [""])[0])
+            rows = list(reversed(st.get("events") or []))
+            if kind:
+                rows = [row for row in rows if str(row.get("kind", "")).startswith(kind)]
+            if inst:
+                rows = [row for row in rows if row.get("instance") == inst]
+            return 200, {"events": rows[:max(1, min(want, 200))],
+                         "total": len(st.get("events") or [])}
         if name == "instance_logs":
             if groups[0] not in st["instances"]:
                 return 404, {"error": "no such instance", "instance": groups[0]}
@@ -2413,25 +2430,56 @@ class Handler(BaseHTTPRequestHandler):
             # everything that explains a failure (node stack traces, jail errors) goes to
             # `.err.log`. Serving only the first hid every real error behind a page of
             # "dsh web: http://..." lines.
-            stream = str((query.get("stream") or ["both"])[0]).lower()
-            if stream not in ("stdout", "stderr", "both"):
-                stream = "both"
+            stream = str((query.get("stream") or ["all"])[0]).lower()
+            if stream not in ("stdout", "stderr", "both", "all", "dsh"):
+                stream = "all"
             parts = []
-            if stream in ("stdout", "both"):
+            if stream in ("stdout", "both", "all"):
                 payload = tail_log(f"{mu.LOGS}/{groups[0]}.log", want_lines)
-                parts.append(("stdout", payload))
-            if stream in ("stderr", "both"):
+                parts.append(("platform", payload))
+            if stream in ("stderr", "both", "all"):
                 err = tail_log(f"{mu.LOGS}/{groups[0]}.err.log", want_lines)
-                parts.append(("stderr", err))
+                parts.append(("jail", err))
+            if stream in ("dsh", "all"):
+                # ★ DSH 自己的启动诊断：<home>/.dsh/logs/startup-*.log
+                # （启动失败时 DSH 只往 stderr 打一行结论，详细报告写在这里 ✗ 以前没采集）
+                logs_dir = f"{mu.instance_home(groups[0])}/.dsh/logs"
+                if os.path.isdir(logs_dir):
+                    files = sorted(
+                        (os.path.join(logs_dir, f) for f in os.listdir(logs_dir)
+                         if f.endswith(".log")),
+                        key=lambda path: os.path.getmtime(path), reverse=True)[:3]
+                    chunks = []
+                    for path in reversed(files):
+                        got = tail_log(path, max(40, want_lines // 2))
+                        for line in (got.get("lines") or []):
+                            chunks.append(f"[{os.path.basename(path)}] {line}")
+                    parts.append(("dsh", {"file": logs_dir, "lines": chunks,
+                                          "source": "dsh-home-logs",
+                                          "size": sum(os.path.getsize(f) for f in files)}))
             if not parts:
                 return 400, {"error": "stream must be stdout, stderr or both"}
             payload = parts[-1][1]
             payload["stream"] = stream
             merged = []
+            stamp = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
             for label, part in parts:
                 for line in (part.get("lines") or []):
-                    merged.append(line if stream != "both" else f"[{label}] {line}")
+                    hit = stamp.search(line)
+                    merged.append((hit.group(1) if hit else "", f"[{label}] {line}"))
+            merged.sort(key=lambda pair: pair[0])
+            merged = [line for _ts, line in merged]
+            raw = str((query.get("raw") or ["0"])[0]).lower() in ("1", "true", "yes")
+            if raw:
+                # 下载"原始文件"：只取单一来源，且不加 [source] 前缀 ✓
+                src_label = {"stdout": "platform", "stderr": "jail",
+                             "platform": "platform", "jail": "jail", "dsh": "dsh"}.get(stream)
+                if src_label:
+                    merged = [line for line in merged if line.startswith(f"[{src_label}] ")]
+                merged = [line.split("] ", 1)[1] if line.startswith("[") and "] " in line else line
+                          for line in merged]
             payload["lines"] = merged[-want_lines:] if want_lines else merged
+            payload["stream"] = stream
             payload["sources"] = {label: {"file": part.get("file"), "source": part.get("source"),
                                           "mtime": part.get("mtime"), "size": part.get("size")}
                                   for label, part in parts}

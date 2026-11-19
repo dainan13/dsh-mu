@@ -64,11 +64,17 @@ fi
 : "${EXTRA_MOUNTS:=}"
 : "${RO_PATHS:=}"
 : "${BUNDLED_PLUGINS_HOST:=}"
+: "${PROBE_HOST:=/usr/local/lib/dsh-mu/probe}"
+: "${PROBE_JAIL:=/opt/dsh-mu-probe}"
+: "${PROBE:=1}"
+: "${PROBE_HEARTBEAT_S:=30}"
 BUNDLED_PLUGINS_JAIL=/opt/dsh-mu-plugins
+PROBE_HOST="${PROBE_HOST:-/usr/local/lib/dsh-mu/probe}"
+PROBE_JAIL=/opt/dsh-mu-probe
 
 [ -d "$ROOTFS" ] || { echo "dsh-mu-jail: rootfs missing: $ROOTFS" >&2; exit 1; }
 
-log() { echo "[dsh-mu-jail:$NAME] $*" >&2; }
+log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [dsh-mu-jail:$NAME] $*" >&2; }
 
 # ------------------------------------------------------------------ cgroup v2
 setup_cgroup() {
@@ -249,6 +255,15 @@ if [ -n "${BUNDLED_PLUGINS_HOST:-}" ] && [ -d "$BUNDLED_PLUGINS_HOST" ]; then
 	fi
 fi
 
+# 崩溃探针目录：只读挂到 /opt/dsh-mu-probe ✓（升级 apk 即更新，不用动实例 rootfs）
+if [ -d "$PROBE_HOST" ]; then
+	mkdir -p "$ROOTFS$PROBE_JAIL" 2>/dev/null || true
+	if mount --rbind "$PROBE_HOST" "$ROOTFS$PROBE_JAIL" 2>/dev/null \
+		&& mount -o remount,ro,bind "$ROOTFS$PROBE_JAIL" 2>/dev/null; then
+		echo "[jail] crash probe (ro): $PROBE_HOST -> $PROBE_JAIL" >&2
+	fi
+fi
+
 # Plugins the platform protects: mount each package directory read-only onto itself
 # inside this mount namespace, so the instance can neither delete nor replace it.
 # Enforced by the kernel (EROFS), and CAP_SYS_ADMIN is dropped, so it cannot umount.
@@ -284,10 +299,23 @@ case "$DSHMU_MODE" in
 		# Launch the entry script directly: the host has no global `dsh` binary any
 		# more (the runtime lives in the gateway template and only its package
 		# directory is bind-mounted), while `node` exists inside every instance.
+		# 崩溃探针：uncaught / exit code / 心跳 —— 解决"进程突然消失、日志空白" ✗
+		# 默认开启；conf 里 PROBE=0 可关，PROBE_HEARTBEAT_S=0 关心跳 ✓
+		# 注意：这段在 chroot **之前**执行 ✗ 所以要用宿主路径 $ROOTFS$PROBE_JAIL 判存在
+		# （第一版写成 $PROBE_JAIL/… 永远为假 → 探针静默不生效 ✗）
+		if [ "${PROBE:-1}" != "0" ] && [ -f "$ROOTFS$PROBE_JAIL/dsh-mu-probe.js" ]; then
+			export NODE_OPTIONS="${NODE_OPTIONS:-} --require $PROBE_JAIL/dsh-mu-probe.js"
+			export DSH_MU_PROBE_HEARTBEAT_S="${PROBE_HEARTBEAT_S:-30}"
+		fi
 		RUN_CMD="exec node $DSH_RUNTIME_IN_JAIL/lib/bin.js $DSH_LAUNCH_ARGS --profile web --host $DSH_HOST --port $PORT --no-open $DSH_EXTRA_ARGS"
 		JAIL_BIN=/bin/sh
 		;;
 	shell)
+		# shell 里手工跑 node 时也带探针（排查很有用 ✓）
+		if [ "${PROBE:-1}" != "0" ] && [ -f "$ROOTFS$PROBE_JAIL/dsh-mu-probe.js" ]; then
+			export NODE_OPTIONS="${NODE_OPTIONS:-} --require $PROBE_JAIL/dsh-mu-probe.js"
+			export DSH_MU_PROBE_HEARTBEAT_S="${PROBE_HEARTBEAT_S:-120}"
+		fi
 		RUN_CMD="exec /bin/sh -l"
 		;;
 	exec)
@@ -348,7 +376,7 @@ setup_cgroup
 export DSHMU_NAME="$NAME" DSHMU_MODE="$MODE" DSHMU_CMD="$CMD" \
 	ROOTFS INSTANCE_HOME INSTANCE_WORK PORT INST_UID INST_GID \
 	CGROUP_PATH DSH_HOST DSH_EXTRA_ARGS DSH_WORK_IN_JAIL EXTRA_MOUNTS RO_PATHS \
-	BUNDLED_PLUGINS_HOST BUNDLED_PLUGINS_JAIL \
+	BUNDLED_PLUGINS_HOST BUNDLED_PLUGINS_JAIL PROBE_HOST PROBE_JAIL PROBE PROBE_HEARTBEAT_S \
 	DSH_RUNTIME_DIR DSH_RUNTIME_IN_JAIL DSH_HOME_IN_JAIL DSH_PERMISSION_MODE DSH_LAUNCH_ARGS KEEP_CAPS
 export HOME=/home/dsh
 export DSH_HOME="$DSH_HOME_IN_JAIL"
@@ -361,10 +389,14 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 export TERM="${TERM:-xterm}"
 export LANG="${LANG:-C.UTF-8}"
 
-log "starting mode=$MODE uid=$INST_UID port=$PORT rootfs=$ROOTFS cgroup=$CGROUP_PATH"
+DSH_VER=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+	"$DSH_RUNTIME_DIR/package.json" 2>/dev/null | head -1)
+log "start mode=$MODE uid=$INST_UID port=$PORT dsh=${DSH_VER:-?} runtime=$DSH_RUNTIME_DIR cgroup=$CGROUP_PATH"
+log "binds: rootfs=$ROOTFS runtime_ro=$DSH_RUNTIME_DIR/node_modules plugins_ro=$BUNDLED_PLUGINS_HOST"
 # No --fork: with it, `unshare` becomes a wrapper process, the service manager signals
 # only that wrapper, and the real workload (dsh / an appliance) survives `stop` -- it
 # keeps the port and the next start fails with "Address in use" (measured; --kill-child
 # did not help because the child was already re-parented). Exec'ing straight through
 # makes the workload *be* the supervised process, so SIGTERM reaches it directly.
+log "enter namespace pid=$$ mode=$MODE (下一步 chroot 进 rootfs 并 exec 负载)"
 exec unshare --mount --uts --propagation private /bin/sh "$INNER"

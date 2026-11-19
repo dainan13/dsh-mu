@@ -804,10 +804,13 @@ html.wiring .side-stack .flags { visibility: hidden; }
               <div class="row" style="gap:6px">
                 <span class="faint" style="font-size:11.5px">来源</span>
                 <div class="seg" id="logStream">
-                  <button aria-pressed="true">stdout + stderr</button>
-                  <button aria-pressed="false">stdout</button>
-                  <button aria-pressed="false">stderr</button>
+                  <button aria-pressed="true" data-v="all">全部</button>
+                  <button aria-pressed="false" data-v="platform">平台</button>
+                  <button aria-pressed="false" data-v="stderr">jail</button>
+                  <button aria-pressed="false" data-v="dsh">DSH 报告</button>
                 </div>
+                <label class="switch"><input type="checkbox" id="logErrOnly"><span>只看错误</span></label>
+                <label class="switch"><input type="checkbox" id="logHeartbeat"><span>显示心跳</span></label>
               </div>
               <label class="switch"><input type="checkbox" id="logLive"><span>实时刷新（2 秒）</span></label>
               <span class="spacer"></span>
@@ -1510,6 +1513,20 @@ html.wiring .side-stack .flags { visibility: hidden; }
           </div>
           <div class="page-tools">
             <button class="btn secondary" onclick="toast('info','已导出','audit.jsonl · 42 条')"><svg class="i i-sm"><use href="#i-download"/></svg>导出 JSONL</button>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:14px">
+          <div class="panel-head">
+            <h2>实例事件</h2><span class="sub" id="eventSub">最近 100 条</span>
+            <span class="spacer"></span>
+            <button class="btn sm ghost" onclick="loadEvents()"><svg class="i i-sm"><use href="#i-refresh"/></svg>刷新</button>
+          </div>
+          <div class="panel-scroll" style="max-height:260px">
+            <table class="data compact">
+              <thead><tr><th>时间</th><th>类型</th><th>实例</th><th>说明</th></tr></thead>
+              <tbody id="eventBody"><tr><td colspan="4" class="muted">读取中…</td></tr></tbody>
+            </table>
           </div>
         </div>
 
@@ -4259,6 +4276,45 @@ function wireDoctorBadge(summary) {
     }
   };
 
+  // 行内徽标：上次失败原因 / 上次重启原因（不用点开日志就能看见 ✓）
+  function failureBadge(r) {
+    const f = r.last_failure || {};
+    if (!f.class || r.state !== 'running' || r.live) return '';
+    const label = `上次失败：${f.class}`;
+    const title = `${f.detail || ''}${f.startup_report ? `\n启动报告：${f.startup_report}` : ''}`;
+    return `<span class="badge err sm" title="${esc(title)}">${esc(label)}</span>`;
+  }
+  function restartNote(r) {
+    if (!r.last_restart_reason) return '';
+    const when = r.last_restart_at ? new Date(r.last_restart_at * 1000).toLocaleString() : '';
+    return `<span class="s faint" title="${esc(r.last_restart_reason)}">最近自动重启：${esc(when)}</span>`;
+  }
+
+  // 实例事件：平台侧的结构化历史（start/stop/failure），和文本日志互补 ✓
+  window.loadEvents = async function () {
+    const body = document.getElementById('eventBody');
+    if (!body) return;
+    try {
+      const d = await api('events?limit=100');
+      const rows = d.events || [];
+      const sub = document.getElementById('eventSub');
+      if (sub) sub.textContent = `最近 ${rows.length} 条 / 共 ${d.total || 0} 条`;
+      const tone = (kind) => String(kind).includes('failure') ? 'err'
+        : String(kind).includes('stop') ? 'warn' : 'ok';
+      body.innerHTML = rows.length ? rows.map(row => {
+        const when = new Date((row.at || 0) * 1000).toLocaleString();
+        return `<tr>
+          <td class="mono faint nowrap">${esc(when)}</td>
+          <td><span class="badge ${tone(row.kind)} sm">${esc(row.kind || '')}</span></td>
+          <td class="mono">${esc(row.instance || '—')}</td>
+          <td class="faint">${esc(row.detail || '')}</td>
+        </tr>`;
+      }).join('') : '<tr><td colspan="4" class="muted">还没有事件（实例启动/停止/失败时会记录）</td></tr>';
+    } catch (e) {
+      body.innerHTML = `<tr><td colspan="4" class="muted">读取失败：${esc(e.message)}</td></tr>`;
+    }
+  };
+
   async function wireInstances() {
     if (!window.__muRuntimeIds) { try { await loadRuntimeIds(); } catch (e) { window.__muRuntimeIds = []; } }
     const [ins, cfg] = await Promise.all([api('instances'), api('config')]);
@@ -4275,8 +4331,8 @@ function wireDoctorBadge(summary) {
       const busy = !!((r.activity || {}).session_open);
       const live = !!r.live;
       return `<tr data-inst="${esc(r.name)}">
-        <td><div class="cell-main"><span class="strong">${esc(r.name)}</span>${r.orphan ? '<span class="badge err sm">未绑定用户</span>' : ''}${busy ? '<span class="badge warn sm">正在使用</span>' : ''}</div>
-            <div class="cell-stack"><span class="s">${esc(r.user)}</span></div></td>
+        <td><div class="cell-main"><span class="strong">${esc(r.name)}</span>${r.orphan ? '<span class="badge err sm">未绑定用户</span>' : ''}${busy ? '<span class="badge warn sm">正在使用</span>' : ''}${failureBadge(r)}</div>
+            <div class="cell-stack"><span class="s">${esc(r.user)}</span>${restartNote(r)}</div></td>
         <td class="rt-col"><span class="row" style="gap:6px;align-items:center;flex-wrap:nowrap">
             <span class="mono" style="font-size:12px" title="实例配置里的运行时；改动在重启后生效">${esc(r.runtime_next || r.runtime_effective || '—')}</span>
             <span class="faint" style="font-size:11px;flex:0 0 auto">${r.runtime ? '指定' : '默认'}</span>
@@ -4570,7 +4626,7 @@ function wireDoctorBadge(summary) {
     if (on('v-ext')) add(window.syncExt);
     if (on('v-platform')) add(window.wirePlatform);
     if (on('v-doctor')) add(window.wireDoctor);
-    if (on('v-audit')) add(window.wireAudit);
+    if (on('v-audit')) { add(window.wireAudit); add(window.loadEvents ? window.loadEvents() : Promise.resolve()); }
     if (jobs.length) {
       try { await Promise.all(jobs); toast('ok', '已刷新', '当前页数据已重新读取'); }
       catch (e) { toast('err', '刷新失败', e.message); }
@@ -5148,10 +5204,13 @@ function wireDoctorBadge(summary) {
     return on ? on.textContent.trim() : fallback;
   };
   const streamOf = () => {
-    const v = segValue('logStream', 'both');
-    if (v.indexOf('stderr') === 0) return 'stderr';
-    if (v.indexOf('stdout') === 0 && v.indexOf('+') < 0) return 'stdout';
-    return 'both';
+    // 优先读按钮上的 data-v（新的四档：全部/平台/jail/DSH 报告 ✓）
+    const box = document.getElementById('logStream');
+    const on = box && [...box.querySelectorAll('button')]
+      .find(b => b.getAttribute('aria-pressed') === 'true');
+    const v = (on && on.getAttribute('data-v')) || segValue('logStream', 'all');
+    if (v === 'platform' || v === 'dsh' || v === 'stderr' || v === 'stdout') return v;
+    return 'all';
   };
   const limitOf = () => parseInt(segValue('logLines', '300'), 10) || 300;
 
@@ -5194,14 +5253,21 @@ function wireDoctorBadge(summary) {
       syncLogButtons();
       return;
     }
-    body.innerHTML = state.lines.length ? state.lines.map((line, i) => {
-      const m = /^\[(stdout|stderr)\]\s?([\s\S]*)$/.exec(line);
-      const tag = m ? m[1] : 'stdout';
+    const errOnly = !!((document.getElementById('logErrOnly') || {}).checked);
+    const showHeartbeat = !!((document.getElementById('logHeartbeat') || {}).checked);
+    const rows = (state.lines || []).map((line) => {
+      const m = /^\[(platform|jail|dsh)\]\s?([\s\S]*)$/.exec(line);
+      const tag = m ? m[1] : 'platform';
       const msg = m ? m[2] : line;
-      const isErr = tag === 'stderr' || /\b(ERROR|Error|error)\b/.test(msg);
-      return `<div class="log-line${isErr ? ' is-err' : ''}"><span class="ln">${i + 1}</span>`
-        + `<span class="tag ${tag === 'stderr' ? 'err' : 'out'}">[${tag}]</span>`
-        + `<span class="msg">${esc(msg)}</span></div>`;
+      const isErr = tag === 'jail' || /\b(ERROR|Error|error|WARNING|Warn|cannot|failed|Error:)\b/.test(msg);
+      return { tag, msg, isErr };
+    }).filter((row) => !errOnly || row.isErr)
+      .filter((row) => showHeartbeat || row.msg.indexOf('[probe:heartbeat]') < 0);
+    body.innerHTML = rows.length ? rows.map((row, i) => {
+      const cls = row.tag === 'jail' ? 'err' : (row.tag === 'dsh' ? 'out' : 'out');
+      return `<div class="log-line${row.isErr ? ' is-err' : ''}"><span class="ln">${i + 1}</span>`
+        + `<span class="tag ${cls}">[${row.tag}]</span>`
+        + `<span class="msg">${esc(row.msg)}</span></div>`;
     }).join('') : '<div class="log-line"><span class="msg muted">（没有内容）</span></div>';
 
     const path = document.getElementById('logPath');
@@ -5229,8 +5295,11 @@ function wireDoctorBadge(summary) {
     state.lines = [];
     state.emptyInfo = null;
     try {
-      const d = await api(`instances/${encodeURIComponent(inst)}/logs?stream=${state.stream}&limit=${state.limit}`);
+      const qs = `instances/${encodeURIComponent(inst)}/logs?stream=${state.stream}&limit=${state.limit}`
+        + (state.stream && state.stream !== 'all' ? '&raw=1' : '');
+      const d = await api(qs);
       state.lines = d.lines || [];
+      state.rawLines = (state.stream && state.stream !== 'all') ? (d.lines || []) : [];
       state.sources = d.sources || {};
       state.emptyInfo = state.lines.length ? null : {
         note: d.note || '没有输出',
@@ -5266,6 +5335,11 @@ function wireDoctorBadge(summary) {
       state.inst = sel.value;
       state.pending = null;
     } catch (e) { /* 保持原样 */ }
+  }
+
+  for (const id of ['logErrOnly', 'logHeartbeat']) {
+    const box = document.getElementById(id);
+    if (box) box.addEventListener('change', () => paint());
   }
 
   window.wireLogs = async function () {
@@ -5312,7 +5386,11 @@ function wireDoctorBadge(summary) {
       }
     }
     if (ev.target.closest('#logDownload')) {
-      const lines = visibleLines();
+      // 选了具体来源 → 下载**原始文件内容**（不带 [platform]/[jail]/[dsh] 前缀 ✓）
+      // 选"全部" → 下载合并视图（带前缀，便于对照时间线 ✓）
+      const stream = streamOf();
+      const raw = stream !== 'all';
+      const lines = raw ? (state.rawLines || []) : visibleLines();
       const text = lines.join('\n');
       if (!text) { toast('info', '没有内容', '当前实例没有日志行'); return; }
       const blob = new Blob([text + '\n'], { type: 'text/plain;charset=utf-8' });

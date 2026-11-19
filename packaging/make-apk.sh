@@ -102,6 +102,7 @@ build_unsigned() {
 
 	install_file 0755 "$SRC/cli/dsh-muctl"           /usr/local/sbin/dsh-muctl
 	install_file 0755 "$SRC/jail/dsh-mu-jail"        /usr/local/sbin/dsh-mu-jail
+	install_file 0644 "$SRC/jail/dsh-mu-probe.js"    /usr/local/lib/dsh-mu/probe/dsh-mu-probe.js
 	install_file 0755 "$SRC/jail/dsh-mu-cgroup-init" /usr/local/sbin/dsh-mu-cgroup-init
 	install_file 0755 "$SRC/admin/dsh-mud"           /usr/local/sbin/dsh-mud
 	install_file 0644 "$SRC/cli/dshmuctl.py"         /usr/local/lib/dsh-mu/python/dshmuctl.py
