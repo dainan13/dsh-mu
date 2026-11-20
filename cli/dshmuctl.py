@@ -2003,6 +2003,8 @@ def sync_all(st: dict):
         # 「started」可能是假的 ✗：端口被上一代 python 占着（客户机上占了 15 小时）
         # → 只有"端口持有者 == 当前 supervisor 的子进程"才算真的在跑 ✓
         port_now = admin_port()
+        with contextlib.suppress(Exception):
+            reap_service_supervisors("dsh-mud", port_now)
         owners = listening_pids(port_now)
         children = service_child_pids("dsh-mud")
         stale_owner = bool(owners) and not set(owners) <= children
@@ -3278,6 +3280,33 @@ def installed_at() -> float:
     with contextlib.suppress(OSError):
         return os.path.getmtime(f"{LIB}/.installed_at")
     return 0.0
+
+
+def drift_needs_restart(file_mtime: float, proc_started: float,
+                        installed: float = 0.0,
+                        tolerance: float = 0.0) -> bool:
+    """纯判定：文件比进程新（含容差）或"装包晚于进程启动" → 需要重启 ✓
+
+    单独抽出来是为了能自测：这是最容易算错又最影响"要不要重启"的地方 ✗
+      · tolerance 吸收"同一秒写文件 + 重启"的抖动（DRIFT_TOLERANCE_S）
+      · installed > proc_started 说明装完包还没重启过 → 一定漂移
+    """
+    tol = DRIFT_TOLERANCE_S if not tolerance else tolerance
+    if installed and proc_started and proc_started + tol < installed:
+        return True
+    return bool(file_mtime) and file_mtime > proc_started + tol
+
+
+def plan_key_state(provider: str, has_key: bool, keyless: set | None = None) -> str:
+    """纯判定：套餐的 key 状态 → not_required / set / missing
+
+    not_required 表示这个 provider 本来就不需要 key（如 kilo 免费额度），
+    页面要显示「无需」而不是「缺」✗（这两者意思完全不同）
+    """
+    keyless = keyless if keyless is not None else set()
+    if str(provider or "").lower() in keyless:
+        return "not_required"
+    return "set" if has_key else "missing"
 
 
 def instance_drift(st: dict, name: str) -> dict:
@@ -6297,6 +6326,48 @@ def cell_restart_instance(name: str, timeout: float = 180.0) -> bool:
         warn(f"{name}: cgroup still has {info['populated']} process(es) after stop")
     cell_start_instance(name)
     return wait_listening(name, timeout=timeout)
+
+
+def _ppid_of(pid: int) -> int:
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            return int(fh.read().rsplit(")", 1)[1].split()[1])
+    return 0
+
+
+def reap_service_supervisors(unit: str, port: int | None = None) -> list[int]:
+    """清掉平台服务多余的 supervisor（保留正在服务的那棵树 ✓）
+
+    判据：端口持有者的祖先链里出现过的 supervisor 才是"在服务"的那个；
+    其余一律视为残留（客户机上出现过 gateway 同时 2 个 supervisor ✗）
+    """
+    sups = stale_supervisors(unit)
+    if len(sups) <= 1:
+        return []
+    keep = 0
+    for owner in (listening_pids(int(port)) if port else []):
+        pid = owner
+        for _ in range(8):
+            pid = _ppid_of(pid)
+            if pid <= 1:
+                break
+            if pid in sups:
+                keep = pid
+                break
+        if keep:
+            break
+    if not keep:
+        keep = max(sups, key=proc_start_epoch)      # 兜底：留最新的那个
+    killed = []
+    for pid in sups:
+        if pid == keep:
+            continue
+        with contextlib.suppress(OSError):
+            os.kill(pid, 15)
+            killed.append(pid)
+    if killed:
+        info(f"{unit}: killed {len(killed)} stale supervisor(s) {killed}, kept {keep}")
+    return killed
 
 
 def service_cell(unit: str, port: int | None = None) -> dict:
@@ -11104,6 +11175,8 @@ def watchdog_scan(heal: bool = True) -> dict:
     for svc in ("dsh-mud", "dsh-mu-gateway"):
         if not os.path.exists(f"/etc/init.d/{svc}"):
             continue
+        with contextlib.suppress(Exception):
+            reap_service_supervisors(svc, svc_ports.get(svc))
         st_now = run(["/sbin/rc-service", svc, "status"], check=False, capture=True)
         text = (st_now.stdout or "") + (st_now.stderr or "")
         cell = service_cell(svc, svc_ports.get(svc))
@@ -15704,6 +15777,28 @@ def cmd_selftest_unit(args):
     row = cell_state(fake, "__nope__")
     check("stopped 的实例判为 stopped", row["state"] == "stopped")
     check("不存在的 cgroup 不报 populated", row["populated"] == 0)
+
+    print("── drift 与 key 判定（纯函数）")
+    now = time.time()
+    check("文件比进程新 → 需要重启",
+          drift_needs_restart(now, now - 60, tolerance=2.0))
+    check("文件只新 1 秒（容差内）→ 不重启",
+          not drift_needs_restart(now, now - 1, tolerance=2.0))
+    check("未来时间戳（构建机时钟领先）→ 需要重启",
+          drift_needs_restart(now + 3600, now - 60, tolerance=2.0))
+    check("装包晚于进程启动 → 需要重启",
+          drift_needs_restart(0, now - 600, installed=now - 300, tolerance=2.0))
+    check("文件旧于进程 → 不重启", not drift_needs_restart(now - 600, now - 60, tolerance=2.0))
+    check("kilo 这类无需 key 的 provider → not_required",
+          plan_key_state("kilo", False, {"kilo"}) == "not_required")
+    check("有 key 的 provider → set", plan_key_state("mu-deepseek", True, {"kilo"}) == "set")
+    check("没 key 且非免费 → missing", plan_key_state("mu-deepseek", False, {"kilo"}) == "missing")
+
+    print("── 平台服务判活")
+    dead = service_cell("dsh-mu-nosuch-unit", 1)
+    check("不存在的服务判为 dead", dead["state"] == "dead")
+    running = service_cell("dsh-mud", admin_port())
+    check("service_cell 返回 listening 字段", "listening" in running and "state" in running)
 
     print("── job 文件读写")
     with contextlib.suppress(OSError):
