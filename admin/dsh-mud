@@ -706,6 +706,7 @@ ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("GET", re.compile(r"^/api/instances/([\w-]+)/logs$"), "instance_logs"),
     ("GET", re.compile(r"^/api/events$"), "events"),
     ("GET", re.compile(r"^/api/upgrade-job$"), "upgrade_job"),
+    ("GET", re.compile(r"^/api/config-schema$"), "config_schema"),
     ("GET", re.compile(r"^/api/upgrades$"), "upgrade_candidates"),
     ("POST", re.compile(r"^/api/upgrade/start$"), "upgrade_start"),
     ("POST", re.compile(r"^/api/upgrade/cancel$"), "upgrade_cancel"),
@@ -816,6 +817,14 @@ MUTATING = {"auth_verify", "instance_ensure", "provider_save", "provider_delete"
             "instance_create", "instance_action", "instance_limits",
             "instance_delete", "config_set"}
 
+
+
+def keyless_providers() -> set:
+    """本来就不需要 key 的 provider（配置 keyless_providers，默认 kilo）"""
+    with contextlib.suppress(Exception):
+        raw = str((mu.load_config(None) or {}).get("keyless_providers") or "")
+        return {item.strip().lower() for item in raw.split(",") if item.strip()}
+    return {"kilo"}
 
 
 def apply_plan_change(mu, st, plan=None):
@@ -1456,6 +1465,7 @@ class Handler(BaseHTTPRequestHandler):
             if actor_user not in users:
                 return 403, {"error": "not a platform account", "user": actor_user}
             plans = mu.list_plans()
+            keyless = keyless_providers()
             rows = []
             for pid, plan in sorted(plans.items(), key=lambda kv: mu.plan_order_key(kv[1])):
                 owner = plan.get("owner") or "*"
@@ -1470,6 +1480,7 @@ class Handler(BaseHTTPRequestHandler):
                              "models": plan.get("models") or [],
                              "effective_models": mu.plan_effective_models(plan),
                              "has_key": bool(plan.get("has_key")),
+                             "key_required": str(plan.get("provider") or "") not in keyless,
                              "default_model": plan.get("default_model") or ""})
             provs = []
             for pid, pkg in sorted((mu.list_provider_packages() or {}).items()):
@@ -2279,6 +2290,8 @@ class Handler(BaseHTTPRequestHandler):
                              "last_probe": plan.get("last_probe") or {},
                              "effective_models": mu.plan_effective_models(plan),
                              "has_key": bool(plan.get("has_key")),
+                             # 该 provider 本来就不需要 key（如 kilo 免费额度）→ 页面显示「无需」
+                             "key_required": str(plan.get("provider") or "") not in keyless_providers(),
                              # 探测（自动检测可用模型）需要 provider 包声明 discover
                              "discover": bool((mu.plan_package(plan) or {}).get("discover")),
                              "default_model": plan.get("default_model") or ""})
@@ -2409,6 +2422,8 @@ class Handler(BaseHTTPRequestHandler):
             if groups[0] not in st["instances"]:
                 return 404, {"error": "no such instance", "instance": groups[0]}
             return 200, {"instance": instance_view(st, groups[0])}
+        if name == "config_schema":
+            return 200, {"rows": mu.config_schema_rows()}
         if name == "upgrade_candidates":
             rows = []
             for folder in ("/root", "/var/lib/dsh-mu/upgrades", "/tmp"):

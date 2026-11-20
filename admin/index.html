@@ -1425,7 +1425,7 @@ html.wiring .side-stack .flags { visibility: hidden; }
           <div class="panel">
             <div class="panel-head"><h2>配置项</h2><span class="sub" id="cfgSub">…</span></div>
             <table class="data compact">
-              <thead><tr><th>键</th><th>值</th><th class="num">操作</th></tr></thead>
+              <thead><tr><th style="width:210px">配置项</th><th style="width:190px">当前值</th><th>说明</th><th style="width:170px">改完何时生效</th><th class="num">操作</th></tr></thead>
               <tbody id="cfgBody">
                 <tr><td class="mono">gateway_host</td><td class="mono faint">dsh-mu</td><td class="num"><button class="btn sm ghost" onclick="openEditConfig('gateway_host')">编辑</button></td></tr>
                 <tr><td class="mono">gateway_listen</td><td class="mono faint">80</td><td class="num"><button class="btn sm ghost" onclick="openEditConfig('gateway_listen')">编辑</button></td></tr>
@@ -2914,12 +2914,18 @@ function openPolicyAdd() {
 
 function openEditConfig(key, current) {
   const val = (current !== undefined && current !== null) ? String(current) : '';
+  const meta = (window.__cfgMeta || {})[key] || {};
+  const title = meta.title || key;
+  const doc = meta.doc || '';
+  const effect = meta.effect || '';
   openModal({
-    title: '编辑 · ' + key,
-    sub: '写入 /etc/dsh-mu/dsh-mu.conf；按项的说明决定要不要 sync / 重启。',
+    title: '编辑 · ' + title,
+    sub: key + ' → 写入 /etc/dsh-mu/dsh-mu.conf',
     size: 'sm',
     body: `
+      ${doc ? `<div class="notice info" style="margin-bottom:10px"><svg class="i"><use href="#i-info"/></svg><div class="body"><b>这一项是做什么的</b><span>${escHtml(doc)}</span></div></div>` : ''}
       <label class="field"><span class="label">值</span><input class="input mono" id="cfgValue" value="${val.replace(/"/g, '&quot;')}"></label>
+      ${effect ? `<div class="faint" style="font-size:12px;margin-top:6px">改完生效方式：<b>${escHtml(effect)}</b></div>` : ''}
       <div class="notice info"><svg class="i"><use href="#i-info"/></svg><div class="body"><b>密钥类字段不在这里改</b><span>请用 <span class="mono">dsh-muctl instance provider</span> 或 <span class="mono">instance api-key</span> 注入实例凭据。</span></div></div>`,
     foot: `<button class="btn ghost" onclick="closeModal()">取消</button>
            <button class="btn primary" onclick="submitEditConfig('${key}')">保存</button>`,
@@ -4974,7 +4980,10 @@ function wireDoctorBadge(summary) {
             ? `<span class="badge">个人</span><span class="faint" style="font-size:11px"> ${esc(r.owner)}</span>`
             : '<span class="badge ok">团队</span><span class="faint" style="font-size:11px"> 所有用户</span>'}</td>
           <td><span class="faint" style="font-size:11.5px">${(r.owner && r.owner !== '*') ? '用户自建' : '管理员'}</span></td>
-          <td>${r.has_key ? '<span class="badge ok sm">有</span>' : '<span class="badge warn sm">缺</span>'}</td>
+          <td>${r.key_required === false
+            ? '<span class="badge outline sm" title="该 provider 本来就不需要 key（如免费额度）">无需</span>'
+            : (r.has_key ? '<span class="badge ok sm">有</span>'
+                         : '<span class="badge warn sm" title="还没填 key，这个套餐目前不可用">未设置</span>')}</td>
           <td>${(r.models || []).length
             ? `<span class="strong">${(r.models || []).length} 个</span>`
             : '<span class="strong">全部</span><span class="faint" style="font-size:11px">，未筛选</span>'}</td>
@@ -5174,9 +5183,16 @@ function wireDoctorBadge(summary) {
     act('users', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(Object.assign({ name, instance, role }, pw ? { password: pw } : {})) })
       .then((r) => {
-        setModalBusy(false); closeModal();
+        setModalBusy(false);
         const shown = r.generated_password || pw;
-        toast('ok', '用户已创建', shown ? `${name} · 初始口令 ${shown}（只显示一次）` : name);
+        const created = (r.instance || (instance === 'auto' ? name : ''));
+        // 口令只在这里出现一次 → 用带"复制"按钮的凭据弹窗，而不是一闪而过的 toast ✗
+        showCredential({
+          title: '用户已创建', name,
+          password: shown,
+          generated: !!r.generated_password,
+          instance: instance === 'none' ? '' : created,
+        });
         refresh();
       })
       .catch(e => { setModalBusy(false); showModalError(e.message); });
@@ -5577,21 +5593,37 @@ function wireDoctorBadge(summary) {
     if (!body) return;
     // 人话 + 分组：必须处理 → 建议处理 → 提示（默认折叠 ✓）
     // 文案来自后端（title / advice），页面不再自己造词
-    const groups = [['blocking', '必须处理'], ['suggestion', '建议处理'], ['info', '提示（可忽略）']];
-    const mark = { FAIL: ['err', '✗ 需要处理'], WARN: ['warn', '! 建议'], PASS: ['ok', '✓ 通过'], SKIP: ['outline', '- 跳过'] };
+    const groups = [['blocking', '必须处理'], ['suggestion', '建议处理'],
+                    ['info', '提示（可忽略）'], ['pass', '已通过']];
+    const markByGroup = {
+      blocking: ['err', '✗ 需要处理'], suggestion: ['warn', '! 建议'],
+      info: ['outline', 'i 提示'], pass: ['ok', '✓ 通过'],
+    };
+    const markOf = (c) => {
+      if (c.status === 'PASS') return markByGroup.pass;
+      if (c.status === 'SKIP') return ['outline', '- 跳过'];
+      return markByGroup[c.group || 'suggestion'] || ['outline', c.status];
+    };
     let html = '';
     for (const [key, label] of groups) {
       const rows = state.checks.filter(c => (c.group || 'suggestion') === key
         && (!state.onlyProblems || c.status !== 'PASS'));
       if (!rows.length) continue;
+      // 「只看问题」时跳过整组"已通过"；「全部」时列出（默认仍折叠提示组 ✓）
+      if (key === 'pass' && state.onlyProblems) continue;
       if (key === 'info' && !window.__muShowInfo) {
         html += `<tr><td colspan="4" class="faint">${label}：${rows.length} 条已折叠（正常现象，可忽略）
           <button class="btn sm ghost" onclick="window.__muShowInfo=true;window.dshmuDoctorPaint&&window.dshmuDoctorPaint()">展开</button></td></tr>`;
         continue;
       }
       html += `<tr><td colspan="4" class="strong" style="background:var(--bg-2)">${label}（${rows.length}）</td></tr>`;
+      if (key === 'pass') {
+        html += `<tr><td colspan="4" class="faint" style="white-space:normal;line-height:20px">`
+          + rows.map(c => esc(c.title || c.check)).join(' · ') + '</td></tr>';
+        continue;
+      }
       for (const c of rows) {
-        const [kind, label2] = mark[c.status] || ['outline', c.status];
+        const [kind, label2] = markOf(c);
         const advice = c.status === 'PASS' ? '' : (c.advice || c.fix || '');
         html += `<tr class="row-${kind === 'ok' ? 'ok' : kind}" data-issue="${c.status === 'PASS' ? 0 : 1}">
           <td><span class="badge ${kind}">${esc(label2)}</span></td>
@@ -5973,21 +6005,66 @@ function wireDoctorBadge(summary) {
     const body = document.getElementById('cfgBody');
     if (!body) return;
     try {
-      const d = await api('config');
+      const [d, schema] = await Promise.all([
+        api('config'),
+        api('config-schema').catch(() => ({ rows: [] })),
+      ]);
       const cfg = d.config || {};
-      const keys = Object.keys(cfg).sort();
-      body.innerHTML = keys.length ? keys.map(k => `<tr>
-        <td class="mono">${esc(k)}</td>
+      const meta = {};
+      (schema.rows || []).forEach(r => { meta[r.key] = r; });
+      window.__cfgMeta = meta;
+      // 按业务分组展示（字母序看不出"这些项是一类事"）
+      const GROUPS = [
+        ['对外访问与网关', ['gateway_host', 'gateway_listen', 'gateway_mode', 'admin_listen',
+                            'tls_enabled', 'tls_keep_http', 'tls_redirect']],
+        ['实例网络与端口', ['instance_egress', 'instance_egress_allow', 'port_range', 'uid_base']],
+        ['实例资源与权限', ['default_cpu_max', 'default_mem_max', 'default_mem_high',
+                            'default_pids_max', 'instance_permission_mode', 'instance_keep_caps',
+                            'instance_run_uid']],
+        ['日志、探针与诊断', ['log_max_mb', 'log_keep', 'startup_reports_keep', 'probe',
+                              'probe_heartbeat_s']],
+        ['模型、插件与转发', ['default_provider', 'hide_builtin_deepseek', 'models_native',
+                              'models_lock', 'market_enabled', 'download_proxy',
+                              'plugin_store_offline', 'relay_enabled', 'relay_source',
+                              'relay_listen', 'default_model_chain', 'model_api_key']],
+        ['会话与安全', ['session_days', 'session_idle_minutes', 'password_algo', 'admin_system_users']],
+        ['系统、镜像与运行时', ['alpine_mirror', 'alpine_version', 'alpine_image_index',
+                                'alpine_image_base', 'dsh_version', 'dsh_extra_args',
+                                'npm_registry', 'runtime_channel_base', 'dsh_runtime_dir',
+                                'dsh_runtime_default', 'runtime_mirrors', 'runtime_proxy_list',
+                                'template_packages', 'alpine_template_image', 'nginx_http_d_dir',
+                                'nginx_conf_d_dir', 'provider_template_base', 'web_search_plan',
+                                'start_wait_s']],
+      ];
+      const seen = new Set();
+      const order = [];
+      GROUPS.forEach(([label, ks]) => {
+        const hit = ks.filter(k => k in cfg);
+        if (hit.length) { order.push([label, hit]); hit.forEach(k => seen.add(k)); }
+      });
+      const rest = Object.keys(cfg).filter(k => !seen.has(k)).sort();
+      if (rest.length) order.push(['其他', rest]);
+      const rowOf = (k) => {
+        const m = meta[k] || { title: k, doc: '', effect: '' };
+        return `<tr>
+        <td><div class="strong">${esc(m.title)}</div><div class="mono faint" style="font-size:11px">${esc(k)}</div></td>
         <td>${showVal(k, cfg[k])}</td>
+        <td class="muted" style="white-space:normal;font-size:12px">${esc(m.doc || '')}</td>
+        <td class="faint" style="white-space:normal;font-size:11.5px">${esc(m.effect || '')}</td>
         <td class="num"><button class="btn sm ghost" onclick="openEditConfig('${esc(k)}', ${JSON.stringify(cfg[k] === null || cfg[k] === undefined ? '' : cfg[k]).replace(/"/g, '&quot;')})">编辑</button></td>
-      </tr>`).join('') : '<tr><td colspan="3" class="muted">没有配置。</td></tr>';
+      </tr>`;
+      };
+      body.innerHTML = order.length ? order.map(([label, ks]) =>
+        `<tr><td colspan="5" class="strong" style="background:var(--bg-2)">${esc(label)}（${ks.length}）</td></tr>`
+        + ks.map(rowOf).join('')).join('')
+        : '<tr><td colspan="5" class="muted">没有配置。</td></tr>';
       const sub = document.getElementById('cfgSub');
       if (sub) {
         const secrets = (d.secret_keys || []).length;
-        sub.textContent = `${keys.length} 个键${secrets ? ` · ${secrets} 个 secret` : ''} · ${esc(d.config_file || '')}`;
+        sub.textContent = `${Object.keys(cfg).length} 个键${secrets ? ` · ${secrets} 个 secret` : ''} · ${esc(d.config_file || '')}`;
       }
     } catch (e) {
-      body.innerHTML = `<tr><td colspan="3" class="muted">读取失败：${esc(e.message)}</td></tr>`;
+      body.innerHTML = `<tr><td colspan="5" class="muted">读取失败：${esc(e.message)}</td></tr>`;
     }
   }
   window.wirePlatform = load;

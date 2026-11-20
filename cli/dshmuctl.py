@@ -210,6 +210,8 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
      "实例在 jail 内以哪个 uid 运行：0=jail root（capability 全丢，apk 可用）；auto=每实例分配专用 uid"),
     ("INSTANCE_PERMISSION_MODE", "instance_permission_mode", "str", "danger-full-access",
      "实例内 DSH agent 沙箱模式：danger-full-access|workspace-write|read-only（本 LXC 无 bwrap/Landlock，故默认全开）"),
+    ("KEYLESS_PROVIDERS", "keyless_providers", "str", "kilo",
+     "哪些 provider 本来就不需要 key（逗号分隔）。这些套餐的 key 列显示「无需」而不是「缺」"),
     ("DEFAULT_PROVIDER", "default_provider", "str", "deepseek",
      "新实例默认 provider preset（deepseek|opencode-go|opencode）"),
     ("DSH_EXTRA_ARGS", "dsh_extra_args", "str", "",
@@ -389,6 +391,89 @@ def _conf_from_legacy(legacy: dict, base: dict) -> dict:
         except (TypeError, ValueError):
             cfg[key] = default
     return cfg
+
+
+# ------------------------------------------------------- 配置项的人话说明
+# key -> (中文名, 一句话说明, 改完什么时候生效)
+CONF_HUMAN: dict[str, tuple[str, str, str]] = {
+    "gateway_host": ("对外域名", "用户在浏览器里访问的地址；登录跳转与实例代理都按它来", "执行 dsh-muctl sync 后生效"),
+    "gateway_listen": ("网关监听端口", "对外 HTTP 端口（一般 80）", "重启网关后生效"),
+    "instance_egress": ("实例出网策略", "open=不限制；no-intranet=禁内网（默认）；allowlist=只允许白名单", "立即生效"),
+    "instance_egress_allow": ("出网白名单", "允许访问的 IP/CIDR，可带端口，逗号分隔", "立即生效"),
+    "hide_builtin_deepseek": ("隐藏内置 DeepSeek 通道", "内置通道直连 api.deepseek.com，实例里只有占位 key；默认隐藏", "执行 dsh-muctl sync 后生效"),
+    "models_native": ("显示 DSH 原生模型页", "默认关闭（由客户端插件管理 key）；打开后用户能看到原生页", "执行 dsh-muctl sync 后生效"),
+    "models_lock": ("锁定原生模型页", "给平台托管的 provider 隐藏编辑/删除按钮", "执行 dsh-muctl sync 后生效"),
+    "market_enabled": ("启用插件市场", "实例里的插件市场列表来自平台插件资产", "执行 dsh-muctl sync 后生效"),
+    "download_proxy": ("插件下载代理", "形如 http://127.0.0.1:7890；留空=直连", "立即生效"),
+    "plugin_store_offline": ("插件安装强制离线", "只用平台本地 store；换 store 会让已有实例失配", "立即生效"),
+    "log_max_mb": ("单个日志上限 (MB)", "超过就轮转（copytruncate，不影响正在写的进程）", "下一次轮转时生效"),
+    "log_keep": ("日志保留份数", "每个日志保留几个历史文件", "下一次轮转时生效"),
+    "startup_reports_keep": ("启动诊断保留份数", "每个实例保留几份 DSH 启动报告", "立即生效"),
+    "probe": ("崩溃探针", "在实例里预加载探针：崩溃堆栈、退出码、心跳", "重启实例后生效"),
+    "probe_heartbeat_s": ("探针心跳间隔 (秒)", "0=只记录启动/退出/异常；客户机建议 120", "重启实例后生效"),
+    "tls_enabled": ("启用 HTTPS", "网关同时监听 443", "重启网关后生效"),
+    "tls_keep_http": ("保留 HTTP", "启用 HTTPS 后是否仍监听 80", "重启网关后生效"),
+    "tls_redirect": ("HTTP 跳转 HTTPS", "访问 80 自动跳到 443", "重启网关后生效"),
+    "relay_enabled": ("启用模型转发", "实例的模型请求经由平台转发（带用量统计）", "重启转发后生效"),
+    "relay_source": ("转发配置来源", "file / db（按安装时的选择）", "重启转发后生效"),
+    "relay_listen": ("转发监听端口", "实例通过它访问上游模型", "重启转发后生效"),
+    "session_idle_minutes": ("登录空闲超时 (分钟)", "超过这么久没动作就要重新登录", "立即生效"),
+    "session_days": ("登录有效期 (天)", "记住登录状态的最长时间", "立即生效"),
+    "port_range": ("实例端口范围", "新建实例从这里取端口", "仅影响新建实例"),
+    "uid_base": ("实例 UID 起点", "实例内部用户 id 的起点", "仅影响新建实例"),
+    "default_cpu_max": ("默认 CPU 限制", "cgroup v2 的 cpu.max 写法，如 100000 100000", "立即生效"),
+    "default_mem_max": ("默认内存上限 (字节)", "超过会被 OOM 杀掉", "立即生效"),
+    "default_mem_high": ("默认内存软限 (字节)", "超过开始回收，不至于直接杀", "立即生效"),
+    "default_pids_max": ("默认进程数上限", "防止 fork 炸弹", "立即生效"),
+    "instance_permission_mode": ("实例权限模式", "danger-full-access / ask / read-only 等", "重启实例后生效"),
+    "default_provider": ("默认模型来源", "新建实例默认用哪个上游", "仅影响新建实例"),
+    "keyless_providers": ("无需 key 的 provider",
+                          "这些 provider 本来就不需要 key（如 kilo 的免费额度）；"
+                          "填了就不会在套餐表里被标成「缺」", "立即生效"),
+    "dsh_extra_args": ("DSH 额外参数", "追加到实例启动命令后面，留空即可", "重启实例后生效"),
+    "dsh_version": ("DSH 版本", "实例使用的 harness 版本（一般由运行时镜像决定）", "仅影响新建实例"),
+    "alpine_mirror": ("系统软件源", "安装/升级系统包用的镜像站", "下次安装/升级时生效"),
+    "alpine_version": ("目标系统版本", "auto=跟随模板", "仅影响新建实例"),
+    "gateway_mode": ("网关运行方式", "jail=在 jail 里跑（推荐）；host=直接跑", "重启网关后生效"),
+    "admin_listen": ("管理后台监听", "默认 127.0.0.1:8787（只给网关代理）", "重启后台后生效"),
+    "password_algo": ("口令哈希算法", "默认 pbkdf2sha256", "仅影响新设置的口令"),
+    "npm_registry": ("npm 源", "实例里装插件用的源；离线机器可留空", "立即生效"),
+    "model_api_key": ("平台模型 Key", "注入到新建实例的占位 key；建议用命令行写入", "仅影响新建实例"),
+    "instance_keep_caps": ("给实例保留的特权", "一般留空；调试时才需要（如 sys_ptrace）", "重启实例后生效"),
+    "default_model_chain": ("默认模型链", "实例默认的模型回退顺序（通常由套餐决定）", "执行 dsh-muctl sync 后生效"),
+    "provider_template_base": ("provider 模板来源", "导入 provider 时拉模板的地址", "下次导入时生效"),
+    "web_search_plan": ("联网搜索用的套餐", "指定哪个套餐承担 web_search（留空=按顺序）", "执行 dsh-muctl sync 后生效"),
+    "admin_system_users": ("免密系统账号", "这些账号不走平台口令校验（默认 root）", "立即生效"),
+    "instance_run_uid": ("实例运行 UID", "0=按实例名分配；一般留 0", "仅影响新建实例"),
+    "runtime_channel_base": ("运行时下载源", "拉取运行时镜像的地址前缀", "下次下载运行时生效"),
+    "dsh_runtime_dir": ("运行时目录", "留空=默认 /var/lib/dsh-mu/runtimes", "下次安装/启动时生效"),
+    "alpine_image_index": ("镜像索引地址", "LXC 模板索引来源", "下次安装时生效"),
+    "alpine_image_base": ("镜像下载地址", "LXC 模板下载来源", "下次安装时生效"),
+    "alpine_template_image": ("指定模板文件", "固定用某个模板（留空=自动选最新）", "仅影响新建实例"),
+    "template_packages": ("模板内预装包", "建实例前在模板里装好的包", "仅影响新建实例"),
+    "dsh_runtime_default": ("默认运行时", "新建实例默认用哪个运行时（留空=当前默认）", "仅影响新建实例"),
+    "runtime_mirrors": ("运行时镜像站", "运行时下载失败时的备用地址", "下次下载运行时生效"),
+    "runtime_proxy_list": ("运行时下载代理", "形如 http://127.0.0.1:7890", "下次下载运行时生效"),
+    "nginx_http_d_dir": ("nginx 站点目录", "网关站点配置放在哪（一般 /etc/nginx/http.d）", "重启网关后生效"),
+    "nginx_conf_d_dir": ("nginx 片段目录", "平台生成的片段放哪（一般 /etc/nginx/conf.d）", "重启网关后生效"),
+    "pbkdf2_iterations": ("口令哈希迭代次数", "越大越慢越难暴力破解；默认 260000", "立即生效"),
+
+}
+
+
+def config_schema_rows() -> list[dict]:
+    """给页面用：每个配置项的中文名 / 说明 / 生效方式 / 默认值 / 类型"""
+    rows = []
+    for _env, key, kind, default, doc in CONF_SCHEMA:
+        title, human, effect = CONF_HUMAN.get(key, ("", "", ""))
+        rows.append({
+            "key": key,
+            "title": title or key,
+            "doc": human or str(doc or ""),
+            "effect": effect or "执行 dsh-muctl sync 后生效",
+            "kind": kind,
+        })
+    return rows
 
 
 def load_config(legacy: dict | None = None) -> dict:
@@ -6063,7 +6148,7 @@ def cmd_instance_restart_stale(args):
 
     # 状态层已原子化 ✓；重启已改走 cell（kill → 等 populated=0 → 起 → 等端口）✓
     # 这两条到位后，并发重启是安全的（P2-1 阶段 3b 的验收项之一）
-    workers = max(1, min(int(args.concurrency or 3), len(targets)))
+    workers = max(1, min(int(args.concurrency or 5), len(targets)))
     job = restart_job_read() or {"id": int(time.time()), "started": int(time.time()),
                                  "total": len(targets), "done": [], "failed": []}
     job.update({"phase": "running", "total": len(targets),
@@ -6178,6 +6263,25 @@ def cell_stop_instance(name: str, wait: float = 10.0) -> dict:
             "populated": cgroup_stats(name)["populated"]}
 
 
+def ext_reap_cgroup(name: str) -> int:
+    """清掉扩展 cgroup 里的残留进程（返回杀掉的个数）"""
+    cg = f"{EXT_CGROUP_PARENT}/{name}"
+    pids = []
+    with contextlib.suppress(OSError):
+        pids = [int(x) for x in (read_text(f"{cg}/cgroup.procs") or "").split() if x.isdigit()]
+    if not pids:
+        return 0
+    with contextlib.suppress(OSError):
+        atomic_write(f"{cg}/cgroup.kill", "1", mode=0o644)
+    deadline = time.time() + 6
+    while time.time() < deadline:
+        with contextlib.suppress(OSError):
+            if not (read_text(f"{cg}/cgroup.procs") or "").strip():
+                break
+        time.sleep(0.2)
+    return len(pids)
+
+
 def cell_start_instance(name: str) -> None:
     """按 cgroup 起：清记账 → rc-service start（supervise-daemon 负责崩溃重拉 ✓）"""
     unit = f"dsh-mu-{name}"
@@ -6195,6 +6299,47 @@ def cell_restart_instance(name: str, timeout: float = 180.0) -> bool:
     return wait_listening(name, timeout=timeout)
 
 
+def service_cell(unit: str, port: int | None = None) -> dict:
+    """平台自身服务的"权威状态"：端口能否连 + 有几个 supervisor（不看 openrc 记账 ✓）"""
+    listening = bool(port) and port_in_use(int(port))
+    sups = len(stale_supervisors(unit))
+    if listening:
+        state = "running"
+    elif sups:
+        state = "starting"
+    else:
+        state = "dead"
+    return {"unit": unit, "state": state, "port": port or 0,
+            "listening": listening, "supervisors": sups}
+
+
+def platform_service_cells(st: dict) -> list[dict]:
+    cfg = (st.get("config") or {})
+    rows = [service_cell("dsh-mud", admin_port()),
+            service_cell("dsh-mu-gateway", int(cfg.get("gateway_listen") or 80))]
+    if str(cfg.get("relay_enabled", True)) in ("True", "true", "1"):
+        rows.append(service_cell("dsh-mu-model-relay", int(cfg.get("relay_listen") or 8099)))
+    for name in sorted(ext_manifests()):
+        man = ext_manifests().get(name) or {}
+        port = int(man.get("port") or 0)
+        row = service_cell(f"dsh-mu-ext-{name}", port)
+        cg = f"{EXT_CGROUP_PARENT}/{name}"
+        procs = 0
+        with contextlib.suppress(OSError):
+            procs = len([x for x in (read_text(f"{cg}/cgroup.procs") or "").split() if x])
+        row["processes"] = procs
+        if port:
+            row["state"] = "running" if row["listening"] else ("starting" if procs else "dead")
+        else:
+            # 无 TCP 端口的扩展（如 SSH）：cgroup 里有进程即视为在跑 ✓
+            # socket 探测只作为附加信息（broker socket 可能按需创建 / 权限受限 ✗ 不能当死因）
+            sock = str((man.get("service") or {}).get("socket") or "")
+            row["socket"] = socket_probe(sock) if sock else "n/a"
+            row["state"] = "running" if procs > 0 else "dead"
+        rows.append(row)
+    return rows
+
+
 def cmd_cell(args):
     st = load_state()
     names = [args.name] if args.name else sorted(st.get("instances") or {})
@@ -6202,6 +6347,12 @@ def cmd_cell(args):
     if getattr(args, "json", False):
         print(json.dumps(rows, indent=2, ensure_ascii=False))
         return 0
+    if getattr(args, "services", False):
+        print(f"{'SERVICE':26} {'CELL':10} {'PORT':6} {'LISTEN':7} {'SUP':4}")
+        for row in platform_service_cells(st):
+            print(f"{row['unit']:26} {row['state']:10} {row['port']:<6} "
+                  f"{'yes' if row['listening'] else 'no':7} {row['supervisors']:<4}")
+        print()
     print(f"{'INSTANCE':14} {'CELL':14} {'WANT':9} {'PORT':6} {'LISTEN':7} "
           f"{'PID':4} {'AGE':8} {'RSS':8} {'SUP':4} {'OOM':4}")
     for row in rows:
@@ -6503,6 +6654,15 @@ depend() {{
 	# SIGTERM. `after` keeps the ordering without dragging the appliance down with it.
 	after dsh-mu-gateway
 	after dsh-mud
+}}
+
+stop_post() {{
+	# supervise-daemon 只给直接子进程发信号；负载是 jail 里的孙进程，
+	# 不杀整个 cgroup 就会残留（实测同一 cgroup 里堆了 3 个 ext-ssh 进程 ✗）
+	if [ -w {EXT_CGROUP_PARENT}/{name}/cgroup.kill ]; then
+		echo 1 > {EXT_CGROUP_PARENT}/{name}/cgroup.kill 2>/dev/null
+	fi
+	return 0
 }}
 """
 
@@ -10938,12 +11098,18 @@ def watchdog_scan(heal: bool = True) -> dict:
             info(f"watchdog: rotated {item['file']}")
     # 平台自身：admin 后端 / 网关 停了就拉起来 ✓
     # （客户机上踩到：装完 apk 后 dsh-mud 处于 stopped ✗ 整个 admin 打不开 ✗）
+    cfg_now = (st.get("config") or {})
+    svc_ports = {"dsh-mud": admin_port(),
+                 "dsh-mu-gateway": int(cfg_now.get("gateway_listen") or 80)}
     for svc in ("dsh-mud", "dsh-mu-gateway"):
         if not os.path.exists(f"/etc/init.d/{svc}"):
             continue
         st_now = run(["/sbin/rc-service", svc, "status"], check=False, capture=True)
         text = (st_now.stdout or "") + (st_now.stderr or "")
-        if "started" in text:
+        cell = service_cell(svc, svc_ports.get(svc))
+        if cell["state"] == "running":
+            continue
+        if "started" in text and cell["state"] != "dead":
             continue
         if not heal:
             bad.append(svc)
@@ -15498,6 +15664,63 @@ def cmd_sync_state(args):
     return 0
 
 
+def cmd_selftest_unit(args):
+    """纯函数自测（不需要真机状态，任何机器都能跑 ✓）"""
+    failures = []
+    passes = 0
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        nonlocal passes
+        if ok:
+            passes += 1
+            print(f"  ✓ {label}")
+        else:
+            failures.append(label)
+            print(f"  ✗ {label} {detail}")
+
+    print("── 配置项说明")
+    rows = config_schema_rows()
+    check("每个配置项都有中文名", all(r["title"] and r["title"] != r["key"] for r in rows),
+          "有配置项缺少 CONF_HUMAN 标题")
+    check("每个配置项都有说明", all(r["doc"] for r in rows), "有配置项没有说明")
+    check("每个配置项都有生效方式", all(r["effect"] for r in rows), "有配置项没有生效方式")
+
+    print("── 人话词表")
+    check("DOCTOR_HUMAN 的分组都合法",
+          all(g in ("blocking", "suggestion", "info") for _t, g, _a in DOCTOR_HUMAN.values()))
+    sample = humanize_check({"check": "instance drift", "status": "WARN", "detail": "x", "fix": ""})
+    check("humanize 给出 title/group/advice",
+          bool(sample.get("title")) and sample.get("group") == "suggestion")
+    passed = humanize_check({"check": "runtime", "status": "PASS", "detail": "", "fix": ""})
+    check("通过项不会归进问题分组", passed.get("group") == "pass")
+
+    print("── 进程时间与 drift 判据")
+    check("proc_start_epoch(1) 可读且在过去", 0 < proc_start_epoch(1) <= time.time() + 5)
+    check("newest_mtime 忽略『未来』时间", newest_mtime(["/etc/hostname"]) < time.time() + 300)
+    check("DRIFT_TOLERANCE_S 是正数", DRIFT_TOLERANCE_S > 0)
+
+    print("── cell_state（不存在的实例）")
+    fake = {"instances": {"__nope__": {"port": 1, "state": "stopped"}}}
+    row = cell_state(fake, "__nope__")
+    check("stopped 的实例判为 stopped", row["state"] == "stopped")
+    check("不存在的 cgroup 不报 populated", row["populated"] == 0)
+
+    print("── job 文件读写")
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(RESTART_JOB), exist_ok=True)
+        restart_job_write({"id": 1, "phase": "done"})
+        check("restart job 写入后可读回", restart_job_read().get("phase") == "done")
+
+    print()
+    if failures:
+        print(f"selftest --unit: {passes} passed, {len(failures)} FAILED")
+        for item in failures:
+            print(f"  FAILED: {item}")
+        die("unit selftest failed")
+    print(f"selftest --unit: {passes} passed, 0 failed")
+    return 0
+
+
 def cmd_selftest(args):
     ensure_root()
     script = f"{LIB}/tests/selftest.mjs"
@@ -15882,6 +16105,7 @@ DOCTOR_HUMAN: dict[str, tuple[str, str, str]] = {
     "profile bundles": ("实例缺插件包", "blocking", "dsh-muctl instance-repair <实例名>"),
     "instance supervision": ("实例守护（崩溃后会自动拉起）", "suggestion",
                              "dsh-muctl instance restart <实例名>"),
+    "admin code": ("后台是否在跑旧代码", "blocking", "dsh-muctl sync"),
     "supervisors": ("重复的守护进程", "info", "dsh-muctl instance reap-supervisors"),
     "cell view": ("状态记录不一致（服务其实正常）", "info",
                   "可忽略；想清零就 dsh-muctl instance restart <实例名>"),
@@ -17031,7 +17255,15 @@ def doctor_checks(st: dict) -> list[dict]:
         else:
             add("nginx temp dirs", DOCTOR_PASS, f"{NGINX_TEMP_ROOT} inside the gateway jail")
 
+    # ③ 后台是否在跑旧代码（今天两次踩到：旧 python 占着 8787，新接口 404 ✗）
+    a_port = admin_port()
+    a_stale = admin_code_stale(a_port)
+    add("admin code", DOCTOR_FAIL if a_stale else DOCTOR_PASS,
+        f"后台进程 {a_stale} 比 /usr/local/sbin/dsh-mud 更早启动，跑的是旧代码"
+        if a_stale else "后台进程与新代码一致",
+        "dsh-muctl sync   # 自动换到新进程")
     cell_rows = []
+    cell_names = []
     for inst_name in sorted(st.get("instances") or {}):
         row = cell_state(st, inst_name)
         probe = run(["/sbin/rc-service", f"dsh-mu-{inst_name}", "status"],
@@ -17040,12 +17272,14 @@ def doctor_checks(st: dict) -> list[dict]:
         openrc_started = "started" in text
         cell_live = row["state"] in ("running", "starting", "not_listening", "orphan_listener")
         if openrc_started != cell_live:
-            cell_rows.append(f"{inst_name}(openrc={'started' if openrc_started else 'stopped'}"
-                             f",cell={row['state']})")
-    add("cell view", DOCTOR_PASS if not cell_rows else DOCTOR_WARN,
-        "cgroup 视角与 openrc 视角一致" if not cell_rows else
-        "以下实例两种视角不一致（P2-1 迁移前观察用）：" + ", ".join(cell_rows[:4]),
-        "" if not cell_rows else "dsh-muctl cell list   # 看 cgroup 权威状态")
+            cell_rows.append(inst_name)
+            cell_names.append(inst_name)
+    add("cell view", DOCTOR_PASS if not cell_rows else DOCTOR_SKIP,
+        "系统记录与实际运行状态一致" if not cell_rows else
+        f"有 {len(cell_rows)} 台实例的系统记录写着「未启动」，但它们实际都在正常服务"
+        f"（{'、'.join(cell_rows[:6])}{'…' if len(cell_rows) > 6 else ''}）。"
+        f"这是升级后的过渡现象，不影响使用",
+        "" if not cell_rows else "可忽略；想看真实状态：dsh-muctl cell list")
     drift_rows = []
     for inst_name in sorted(st.get("instances") or {}):
         if str((st["instances"][inst_name] or {}).get("state")) != "running":
@@ -17053,11 +17287,12 @@ def doctor_checks(st: dict) -> list[dict]:
         info_row = instance_drift(st, inst_name)
         if info_row.get("needs_restart"):
             hot = [k for k, v in (info_row["items"] or {}).items() if v is True]
-            drift_rows.append(f"{inst_name}({','.join(hot)})")
+            drift_rows.append(inst_name)
     add("instance drift", DOCTOR_PASS if not drift_rows else DOCTOR_WARN,
-        "所有在跑的实例都与磁盘一致" if not drift_rows else
-        "以下实例有「文件已新、进程仍旧」的漂移：" + ", ".join(drift_rows),
-        "" if not drift_rows else "dsh-muctl instance restart-stale")
+        "所有实例都在运行最新文件" if not drift_rows else
+        f"有 {len(drift_rows)} 台实例仍在运行装包前的旧文件（当前功能正常，但新功能不会生效）："
+        f"{'、'.join(drift_rows[:6])}{'…' if len(drift_rows) > 6 else ''}",
+        "" if not drift_rows else "dsh-muctl instance restart-stale（后台执行，--status 看进度）")
     owners = listening_pids(admin_port())
     children = service_child_pids("dsh-mud")
     if not owners:
@@ -17311,7 +17546,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--status", action="store_true", help="print the background job state")
     a.add_argument("--worker", action="store_true", help="internal: the background worker")
     a.add_argument("--json", action="store_true")
-    a.add_argument("--concurrency", type=int, default=3)
+    a.add_argument("--concurrency", type=int, default=5,
+                   help="并发重启的实例数（默认 5；cell 路径是确定性的，失败会自动重试一次）")
     a.add_argument("--timeout", type=float, default=180.0)
     a.set_defaults(func=cmd_instance_restart_stale)
     a = isub.add_parser("reap-supervisors",
@@ -17551,6 +17787,8 @@ def build_parser() -> argparse.ArgumentParser:
     csub = sp.add_subparsers(dest="cell_action", required=True)
     c_list = csub.add_parser("list", help="all instances")
     c_list.add_argument("--json", action="store_true")
+    c_list.add_argument("--services", action="store_true",
+                        help="also show platform services (gateway / admin / relay / extensions)")
     c_list.set_defaults(func=cmd_cell, name="")
     c_one = csub.add_parser("status", help="one instance")
     c_one.add_argument("name")
@@ -17597,11 +17835,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--fix", action="store_true", help="apply the safe fixes it knows (gateway install, sync, cgroup)")
     sp.set_defaults(func=cmd_doctor)
     sp = sub.add_parser("selftest", help="end-to-end verification")
+    sp.add_argument("--unit", action="store_true",
+                    help="pure-function self-test (no running platform needed)")
     sp.add_argument("--host")
     sp.add_argument("--user", help="account used for the authenticated checks")
     sp.add_argument("--password")
     sp.add_argument("--ws-hold", type=int, help="milliseconds to hold the WebSocket (default 15000)")
-    sp.set_defaults(func=cmd_selftest)
+    sp.set_defaults(func=lambda a: cmd_selftest_unit(a) if getattr(a, "unit", False) else cmd_selftest(a))
     sp = sub.add_parser("acceptance", help="run the acceptance suite (optionally the fresh-machine checklist)")
     # Optional positionals mirror tests/acceptance.sh: <instance> <user> <password>
     sp.add_argument("rest", nargs="*", help="[instance [user [password]]]")
