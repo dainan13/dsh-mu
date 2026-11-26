@@ -184,6 +184,8 @@ CONF_SCHEMA: list[tuple[str, str, str, object, str]] = [
      "web_search 工具用哪个套餐（留空=自动挑一个 deepseek 系套餐）"),
     ("RELAY_SOURCE", "relay_source", "str", "file",
      "where the relay reads credentials: file (relay.json, default) or db (ask dsh-mud)"),
+    ("PACK_PROCESSORS", "pack_processors", "int", 2,
+     "打包运行时（mksquashfs）用几个线程；容器里可见的是宿主核数，设太大容易把内存打爆"),
     ("RELAY_LISTEN", "relay_listen", "int", 8099,
      "代理监听的 loopback 端口（只给本机 jail 用，不对外）"),
     # 24h by default: an unattended browser tab should not stay signed in for a week.
@@ -416,6 +418,7 @@ CONF_HUMAN: dict[str, tuple[str, str, str]] = {
     "tls_redirect": ("HTTP 跳转 HTTPS", "访问 80 自动跳到 443", "重启网关后生效"),
     "relay_enabled": ("启用模型转发", "实例的模型请求经由平台转发（带用量统计）", "重启转发后生效"),
     "relay_source": ("转发配置来源", "file / db（按安装时的选择）", "重启转发后生效"),
+    "pack_processors": ("运行时打包并发", "整数（默认 2）", "下次 runtime pack 生效"),
     "relay_listen": ("转发监听端口", "实例通过它访问上游模型", "重启转发后生效"),
     "session_idle_minutes": ("登录空闲超时 (分钟)", "超过这么久没动作就要重新登录", "立即生效"),
     "session_days": ("登录有效期 (天)", "记住登录状态的最长时间", "立即生效"),
@@ -562,7 +565,16 @@ def ensure_root():
 def run(cmd, check=True, capture=False, **kw):
     if isinstance(cmd, str):
         cmd = ["/bin/sh", "-c", cmd]
-    res = subprocess.run(cmd, capture_output=capture, text=True, **kw)
+    try:
+        res = subprocess.run(cmd, capture_output=capture, text=True, **kw)
+    except FileNotFoundError:
+        class _Missing:
+            returncode = 127
+            stdout = ""
+            stderr = f"command not found: {cmd[0] if isinstance(cmd, list) else cmd}"
+        if check:
+            die(_Missing.stderr)
+        return _Missing()
     if check and res.returncode != 0:
         out = (res.stderr or res.stdout or "").strip() if capture else ""
         die(f"command failed ({res.returncode}): {' '.join(cmd)} {out}")
@@ -720,7 +732,8 @@ def state_transaction():
             finally:
                 save_state(st)
     except SystemExit:
-        warn("state lock busy for 20s; continuing without it (best-effort)")
+        holder = state_lock_holder() or "未知（可能刚释放）"
+        warn(f"state lock busy for 20s; continuing without it (best-effort) — 持有者: {holder}")
         st = load_state()
         try:
             yield st
@@ -779,6 +792,26 @@ def state_lock_holder() -> str:
     return "; ".join(holders)
 
 
+LOCK_STATS = "/run/dsh-mu/state-lock.json"
+
+
+def _lock_stats_record(wait_s: float, hold_s: float) -> None:
+    """把最近一次锁等待/持有时间落盘（>2s 才记），供 doctor / 排查用 ✓"""
+    if wait_s < 2.0 and hold_s < 2.0:
+        return
+    with contextlib.suppress(OSError):
+        os.makedirs(os.path.dirname(LOCK_STATS), exist_ok=True)
+        atomic_write(LOCK_STATS, json.dumps({
+            "at": int(time.time()), "at_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "wait_s": round(wait_s, 2), "hold_s": round(hold_s, 2),
+            "pid": os.getpid(),
+            # 等待 >5s 时把当时的持锁者也记下来（下次复现就知道是谁 ✗）
+            "holder": (state_lock_holder() or "") if wait_s >= 5.0 else "",
+            "cmd": " ".join(os.path.basename(a) if i == 0 else a
+                            for i, a in enumerate([sys.argv[0].split("/")[-1]] + sys.argv[1:3]))
+        }, ensure_ascii=False) + "\n", mode=0o644)
+
+
 @contextlib.contextmanager
 def state_lock(exclusive: bool = True, timeout: float = 120.0):
     """Serialize state mutations across processes (CLI and the admin backend).
@@ -801,7 +834,8 @@ def state_lock(exclusive: bool = True, timeout: float = 120.0):
     os.makedirs(ETC, exist_ok=True)
     fh = open(STATE_LOCK_PATH, "a+")
     flag = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-    deadline = time.time() + timeout
+    _t_wait = time.time()
+    deadline = _t_wait + timeout
     while True:
         try:
             fcntl.flock(fh, flag | fcntl.LOCK_NB)
@@ -816,9 +850,11 @@ def state_lock(exclusive: bool = True, timeout: float = 120.0):
                       " (usually a long instance start inside the lock)")
             time.sleep(0.1)
     _LOCK_STATE.update(depth=1, fh=fh)
+    _t_hold = time.time()
     try:
         yield
     finally:
+        _lock_stats_record(_t_hold - _t_wait, time.time() - _t_hold)
         _LOCK_STATE.update(depth=0, fh=None)
         try:
             fcntl.flock(fh, fcntl.LOCK_UN)
@@ -948,15 +984,12 @@ def save_state(st: dict):
     # Configuration lives in dsh-mu.conf, never in the state file.
     data = {k: v for k, v in st.items() if k != "config"}
     audit_state_change(st)
-    try:
-        with state_lock(timeout=20.0):
-            atomic_write(STATE_PATH, json.dumps(data, indent=2, sort_keys=True) + "\n", mode=0o600)
-    except SystemExit:
-        # 锁被别人长期占着（客户机上出现过 ✗）→ 无锁原子写 + 明确告警
-        # 好处：运维动作不会因为一把锁永久失败 ✗
-        # 代价：极端并发下可能丢一次更新（可接受，因为有事件流与 doctor 校验 ✓）
-        warn(f"state lock busy for 20s; writing {STATE_PATH} without the lock")
-        atomic_write(STATE_PATH, json.dumps(data, indent=2, sort_keys=True) + "\n", mode=0o600)
+    # 这里**不再**取排它锁：
+    #   · 写盘是 atomic_write + rename，任何时刻读到的都是完整文件 ✓
+    #   · 只有"读-改-写"才需要串行（见 state_transaction）✓
+    #   · 之前 save_state 也抢锁，批量操作（10 台实例的 sync）互相排队 → 出现
+    #     "state lock busy for 20s" 并降级写，日志噪音大且掩盖真正的问题 ✗
+    atomic_write(STATE_PATH, json.dumps(data, indent=2, sort_keys=True) + "\n", mode=0o600)
 
 
 def secret_key() -> bytes:
@@ -1036,6 +1069,19 @@ def render_gateway(st: dict):
     if str(st["config"].get("relay_source") or "file") != "db":
         with contextlib.suppress(OSError):
             write_relay_document(st)
+    # 迁移：老版本的网关单元直接 exec nginx，崩溃重试时会卡在残留 socket 上；
+    # 新版经 gateway-run.sh 先清理再 exec（1.9.236 起）。这里把单元补上。
+    with contextlib.suppress(Exception):
+        if os.path.exists(GATEWAY_SERVICE):
+            body = read_text(GATEWAY_SERVICE) or ""
+            if "gateway-run.sh" not in body:
+                render_gateway_service()
+                info("已把网关单元迁移到 gateway-run.sh（崩溃重试会先清残留 socket）")
+    for _unit in ("dsh-mu-gateway", "dsh-mu-watchdog", "dsh-mud"):
+        with contextlib.suppress(Exception):
+            _n = reap_duplicate_supervisors(_unit)
+            if _n:
+                warn(f"{_unit}: 清理了 {_n} 个重复的监督进程")
     if str(st["config"].get("gateway_mode") or "jail") == "jail":
         # The gateway jail reads its own copy of these files; refresh it on every
         # state change, otherwise the jail keeps serving a stale cookie/state.
@@ -1043,10 +1089,19 @@ def render_gateway(st: dict):
             sync_gateway_etc()
         # Its runner config (bind list, port) and nginx fragments live on the host
         # too, and a `config` change (TLS on/off, port) must reach them.
+        jail_changed = False
         with contextlib.suppress(OSError):
-            write_gateway_jail_conf(st["config"])
+            jail_changed = str(write_gateway_jail_conf(st["config"])).endswith(":changed")
         with contextlib.suppress(OSError):
             render_gateway_jail_conf_files(st["config"])
+        if jail_changed:
+            # 挂载/端口这类改动 SIGHUP 带不进来 → 必须真的重启（且要按 cgroup 杀干净）
+            info("gateway jail 配置变化（挂载/端口），正在安全重启网关")
+            run(["/sbin/rc-service", "dsh-mu-gateway", "stop"], check=False)
+            cgroup_kill("/sys/fs/cgroup/dsh-mu/gateway")
+            time.sleep(1)
+            gateway_prepare_start()
+            run(["/sbin/rc-service", "dsh-mu-gateway", "start"], check=False)
         # nginx wants its temp dirs to be owned by root inside the jail; with only
         # CAP_NET_BIND_SERVICE the startup chown would fail if they were not, so we
         # normalise the ownership here.
@@ -1934,6 +1989,23 @@ def heal_instance_plugin_specs(st: dict) -> list[str]:
 
 def sync_all(st: dict):
     os.makedirs(INST_CONF_DIR, exist_ok=True)
+    with contextlib.suppress(Exception):
+        migrate_provider_packages()
+    with contextlib.suppress(Exception):
+        report = site_sync(st, quiet=True)
+        if report["added"] or report["removed"]:
+            info(f"站点：新增 {report['added'] or '-'}，移除 {report['removed'] or '-'}")
+    with contextlib.suppress(Exception):
+        if (not os.path.exists(PROVIDER_CATALOG_ACTIVE)
+                and os.path.exists(PROVIDER_CATALOG_PLATFORM)):
+            shutil.copyfile(PROVIDER_CATALOG_PLATFORM, PROVIDER_CATALOG_ACTIVE)
+            info("provider 目录：已从平台快照初始化 /var/lib/dsh-mu/catalog.json")
+    with contextlib.suppress(Exception):
+        for _pid in migrate_provider_declared():
+            info(f"provider {_pid}: 记录可编辑的高级字段")
+    with contextlib.suppress(Exception):
+        for _pid in migrate_provider_limits():
+            info(f"provider {_pid}: 修正模型限额（maxTokens 不能再等于 contextWindow）")
     # 实例的「终端」依赖 dsh 运行时里的 node-pty 原生模块；缺了就在每次 sync 时补回 ✓
     with contextlib.suppress(Exception):
         ensure_dsh_native_modules(quiet=True)
@@ -3842,6 +3914,52 @@ def sync_gateway_etc() -> str:
     return etc
 
 
+def reap_duplicate_supervisors(unit: str) -> int:
+    """同一个 unit 只保留一个 supervise-daemon（多余的直接 SIGTERM）
+
+    openrc 的 `start` 不检查是否已有 supervise-daemon（pidfile 记的是子进程），
+    反复 start 会留下多个监督进程，各自跑一个 watchdog → CPU 打满 ✗（实测 .61 三个）
+    """
+    with contextlib.suppress(Exception):
+        out = run(["ps", "-eo", "pid,args"], check=False, capture=True).stdout or ""
+        found = []
+        for line in out.splitlines():
+            if "supervise-daemon " + unit in line:
+                found.append(int(line.split()[0]))
+        if len(found) <= 1:
+            return 0
+        # 保留最新的（最大的 pid 通常是当前启动的那次）
+        found.sort()
+        for pid in found[:-1]:
+            run(["kill", "-TERM", str(pid)], check=False)
+        return len(found) - 1
+    return 0
+
+
+def gateway_master_pid() -> str:
+    """当前网关 nginx master 的 pid（没有就空串）"""
+    with contextlib.suppress(Exception):
+        out = run(["ps", "-eo", "pid,args"], check=False, capture=True).stdout or ""
+        for line in out.splitlines():
+            if "nginx: master process" in line:
+                return line.split()[0]
+    return ""
+
+
+def gateway_prepare_start() -> None:
+    """启动网关前的清理（两种真实事故都在这里收口）
+
+    ① 上一次异常退出留下的 unix socket 文件 → 新进程 bind 报 EADDRINUSE，
+       网关起不来（整站 502/000）✗
+    ② /var/tmp/nginx 的临时目录属主不对 → nginx chown 失败 EPERM（jail 里没有 CAP_CHOWN）✗
+    """
+    if not gateway_master_pid():
+        for path in glob.glob(f"{SITES_RUN}/*/*.sock"):
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+    prepare_gateway_tmp()
+
+
 def write_gateway_jail_conf(cfg: dict, port: int | None = None) -> str:
     """The runner config for the platform jail (same format as an instance conf)."""
     paths = gateway_paths()
@@ -3864,6 +3982,16 @@ def write_gateway_jail_conf(cfg: dict, port: int | None = None) -> str:
     # 的 127.0.0.1 ✗，所以把 /run/dsh-mu 里的这个 socket 直接挂进 jail ✓
     os.makedirs(RESP_SOCKET_DIR, exist_ok=True)
     mount_list.append(f"{RESP_SOCKET_DIR}:{RESP_SOCKET_DIR}:rw")
+    # 内置 DAV 站点（kind=dav）由网关进程直接读写实例目录（scope 由 site.lua 注入的租户决定）
+    st = load_state()
+    needs_instances = any(
+        (row.get("kind") or "") in ("dav", "nginx")
+        and any(str((m or {}).get("source") or "").startswith("instances")
+                for m in (row.get("mounts") or []))
+        for row in (st.get("sites") or {}).values())
+    if needs_instances:
+        # 平台内置 dav 与 nginx 型站点都要能读实例目录（mounts 声明了 instances）
+        mount_list.append(f"{VAR}/instances:{VAR}/instances:rw")
     if os.path.isdir(MARKET_DIR):
         # tarballs for the local npm registry; read-only, gateway only
         mount_list.append(f"{MARKET_DIR}:{MARKET_DIR}:ro")
@@ -3880,8 +4008,9 @@ EXTRA_MOUNTS={mounts}
 KEEP_CAPS=net_bind_service
 DSH_RUNTIME_DIR={paths['rootfs']}/nonexistent
 """
+    changed = (read_text(GATEWAY_CONF) or "") != body
     atomic_write(GATEWAY_CONF, body, mode=0o644)
-    return GATEWAY_CONF
+    return GATEWAY_CONF if not changed else GATEWAY_CONF + ":changed"
 
 
 def render_gateway_jail_conf_files(cfg: dict, port: int | None = None) -> dict:
@@ -3899,11 +4028,24 @@ def render_gateway_jail_conf_files(cfg: dict, port: int | None = None) -> dict:
             changed.append(os.path.basename(path))
         atomic_write(path, text, mode=0o644)
     if changed and str(cfg.get("gateway_mode") or "jail") == "jail":
-        # nginx only picks up *new locations* on a reload/restart; lua-only edits ride
-        # the reload_if_stale path, but structural changes (e.g. the market proxy) need
-        # the workers to re-read the configuration.
-        info("gateway configuration changed (" + ", ".join(changed[:4]) + "); restarting it")
-        run(["/sbin/rc-service", "dsh-mu-gateway", "restart"], check=False)
+        # 结构性改动（新增 location）需要让 master 重新读配置。**不要用 rc-service restart**：
+        # jail 里的 nginx 是 master 自己 fork 的，stop 只杀 supervise 的直接子进程 ✗
+        # → 新进程 bind 80/8099 失败，旧 master 继续用旧配置（实测：新站点一直 404 ✗）
+        # 正确做法：给 master 发 SIGHUP（零中断），没有 master 才走 start。
+        info("gateway configuration changed (" + ", ".join(changed[:4]) + "); reloading it")
+        master = ""
+        with contextlib.suppress(Exception):
+            out = run(["ps", "-eo", "pid,args"], check=False, capture=True).stdout or ""
+            for line in out.splitlines():
+                if "nginx: master process" in line:
+                    master = line.split()[0]
+                    break
+        if master:
+            prepare_gateway_tmp()
+            run(["kill", "-HUP", master], check=False)
+        else:
+            gateway_prepare_start()
+            run(["/sbin/rc-service", "dsh-mu-gateway", "start"], check=False)
     main = GATEWAY_NGINX_MAIN.replace("@CONF_DIR@", GATEWAY_CONF_IN_JAIL)
     atomic_write(f"{paths['conf']}/nginx.conf", main, mode=0o644)
 
@@ -4006,7 +4148,8 @@ def render_gateway_service() -> str:
             .replace("DeepSeek Harness instance '__gateway' (mount-ns + chroot + cgroup jail)",
                      "dsh-mu gateway: openresty inside a mount-ns + chroot + cgroup jail"))
     # The runner takes the conf through --conf, so pass it right after the jail.
-    cmd = f"nginx -c {GATEWAY_CONF_IN_JAIL}/nginx.conf"
+    # 经包装器启动：先清残留 socket/临时目录，再 exec nginx（见 jail/dsh-mu-gateway-run）
+    cmd = f"/usr/local/lib/dsh-mu/gateway-run.sh -c {GATEWAY_CONF_IN_JAIL}/nginx.conf"
     body = body.replace('command_args="__gateway"',
                         'command_args="--conf ' + GATEWAY_CONF + ' __gateway -- ' + cmd + '"')
     atomic_write(GATEWAY_SERVICE, body, mode=0o755)
@@ -4083,6 +4226,7 @@ def cmd_gateway_jail(args):
             sub_start = "start"
         else:
             sub_start = sub
+        gateway_prepare_start()
         run(["/sbin/rc-service", "dsh-mu-gateway", sub_start], check=False)
         time.sleep(2)
         health = gateway_health(port)
@@ -4693,6 +4837,399 @@ def ext_port_problems() -> list[str]:
     return problems
 
 
+# ---------------------------------------------------------------- sites (docs/27)
+SITES_RUN = "/run/dsh-mu/sites"
+SITE_DEFAULT_BASE = "/s/"
+SITE_RESERVED = ("/", "/admin", "/login", "/logout", "/me", "/mu-api/", "/mu-internal/",
+                 "/mu-static/", "/ext/", "/ext-api/", "/__search", "/dav/")
+SITE_METHOD_WRITE = ("PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK")
+
+
+def site_slug(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9-]+", "-", str(name or "").strip().lower()).strip("-")
+    return slug or "site"
+
+
+def site_reserved(path: str) -> bool:
+    p = "/" + path.strip("/") + "/" if path.strip("/") else "/"
+    for r in SITE_RESERVED:
+        if r == "/":
+            if p == "/":
+                return True
+            continue
+        rr = "/" + r.strip("/") + "/"
+        if p == rr or p.startswith(rr):
+            return True
+    return False
+
+
+def site_entry_valid(path: str) -> str:
+    """返回空串表示合法；否则返回中文原因（入口是平台分配的，必须可控）"""
+    if not path.startswith("/"):
+        return "入口必须以 / 开头"
+    if not path.endswith("/"):
+        return "入口必须以 / 结尾"
+    if "//" in path:
+        return "入口不能包含连续斜杠"
+    if re.search(r"[\s{}\\~^$*?'\"]", path):
+        return "入口包含非法字符（空白 / 花括号 / 反斜杠 / 正则符号）"
+    if ".." in path:
+        return "入口不能包含 .."
+    base = path.strip("/")
+    if not base:
+        return "入口不能是整个根路径"
+    if site_reserved(path):
+        return f"入口 {path} 属于平台保留命名空间"
+    return ""
+
+
+def site_entry_taken(st: dict, path: str, ignore: str = "") -> str:
+    for other, row in (st.get("sites") or {}).items():
+        if other == ignore:
+            continue
+        cur = str(((row.get("entry") or {}).get("path")) or "")
+        if not cur:
+            continue
+        a, b = cur.rstrip("/"), path.rstrip("/")
+        if a == b or a.startswith(b + "/") or b.startswith(a + "/"):
+            return other
+    return ""
+
+
+def site_manifests() -> dict:
+    """扩展包的 manifest 里声明的 site 段（只读来源）"""
+    out = {}
+    for name, manifest in ext_manifests().items():
+        site = manifest.get("site")
+        if isinstance(site, dict) and site:
+            out[name] = site
+    return out
+
+
+def site_allocate(st: dict, ext_name: str, site: dict) -> dict:
+    """给一个站点的入口做分配：扩展只能给偏好，平台说了算"""
+    name = site_slug(site.get("name") or ext_name)
+    base = str((st.get("config") or {}).get("sites_base_path") or SITE_DEFAULT_BASE)
+    if not base.endswith("/"):
+        base += "/"
+    prefer = str(site.get("prefer_path") or "").strip()
+    cand = prefer if (prefer and not site_entry_valid(prefer) and
+                      not site_entry_taken(st, prefer, ignore=name)) else f"{base}{name}/"
+    if site_entry_valid(cand) or site_entry_taken(st, cand, ignore=name):
+        cand = f"{base}{name}/"
+    n = 2
+    while site_entry_valid(cand) or site_entry_taken(st, cand, ignore=name):
+        cand = f"{base}{name}-{n}/"
+        n += 1
+    return {"path": cand, "host": site.get("prefer_host") or None,
+            "strip": bool(((site.get("socket") or {}).get("strip", True)))}
+
+
+def site_sync(st: dict, quiet: bool = True) -> dict:
+    """把 manifest 里的 site 段同步进注册表（入口只分配一次，之后由运维掌控）"""
+    sites = st.setdefault("sites", {})
+    declared = site_manifests()
+    by_site = {site_slug((s or {}).get("name") or ext): (ext, s)
+               for ext, s in declared.items()}
+    added, updated, removed = [], [], []
+    for name, (ext, site) in by_site.items():
+        row = sites.get(name)
+        if not row:
+            entry = site_allocate(st, ext, site)
+            row = {"extension": ext, "kind": site.get("kind") or "socket",
+                   "enabled": True, "entry": entry, "assigned_by": "platform",
+                   "nginx": site.get("nginx") or {},
+                   "approved": not bool((site.get("nginx") or {}).get("requires_approval")),
+                   "preference": site.get("prefer_path") or "",
+                   "auth": site.get("auth") or {"mode": "platform"},
+                   "scope": site.get("scope") or {"tenant": "instance"},
+                   "mounts": site.get("mounts") or [],
+                   "egress": site.get("egress") or [],
+                   "upstream": site.get("upstream") or "",
+                   "created_at": int(time.time())}
+            sites[name] = row
+            added.append(name)
+        else:
+            before = json.dumps(row, sort_keys=True)
+            row["extension"] = ext
+            row["kind"] = site.get("kind") or row.get("kind") or "socket"
+            row["preference"] = site.get("prefer_path") or row.get("preference") or ""
+            row["auth"] = site.get("auth") or row.get("auth") or {"mode": "platform"}
+            row["scope"] = site.get("scope") or row.get("scope") or {"tenant": "instance"}
+            if site.get("upstream"):
+                row["upstream"] = site.get("upstream")
+            row["mounts"] = site.get("mounts") or row.get("mounts") or []
+            row["egress"] = site.get("egress") or row.get("egress") or []
+            row["nginx"] = site.get("nginx") or row.get("nginx") or {}
+            if not (row.get("nginx") or {}).get("requires_approval"):
+                row["approved"] = True
+            if json.dumps(row, sort_keys=True) != before:
+                row["updated_at"] = int(time.time())
+                updated.append(name)
+    for name in list(sites):
+        if name not in by_site:
+            del sites[name]
+            removed.append(name)
+    for name in added + updated + removed:
+        os.makedirs(f"{SITES_RUN}/{name}", exist_ok=True)
+    if (added or updated or removed) and not quiet:
+        info(f"sites: +{len(added)} ~{len(updated)} -{len(removed)}")
+    return {"added": added, "updated": updated, "removed": removed}
+
+
+def site_socket_path(name: str) -> str:
+    return f"{SITES_RUN}/{name}/upstream.sock"
+
+
+def sync_site_nginx_files(st: dict, quiet: bool = False) -> list[str]:
+    """把 nginx 型站点的 site.conf / lua 落到网关 conf 目录，并编译成独立 server{}。
+
+    契约（docs/27 §2.2）：
+      · 扩展提供 site.conf，内容只有 location（listen/server_name 由平台注入）
+      · lua 目录整体复制到 <conf>/ext/<name>/lua/
+      · 落盘后跑 nginx -t；不通过就删掉该文件并保留上一版（last-good）
+    """
+    paths = gateway_paths()
+    ext_root = f"{paths['conf']}/ext"
+    os.makedirs(ext_root, exist_ok=True)
+    problems = []
+    for name, row in sorted((st.get("sites") or {}).items()):
+        if (row.get("kind") or "") != "nginx":
+            continue
+        target = f"{paths['conf']}/http.d/dsh-mu-site-{name}.conf"
+        if not row.get("enabled") or not row.get("approved"):
+            with contextlib.suppress(OSError):
+                os.unlink(target)
+            continue
+        manifest = ext_manifests().get(str(row.get("extension") or "")) or {}
+        src_dir = str(manifest.get("_dir") or "")
+        conf_rel = str(((manifest.get("site") or {}).get("nginx") or {}).get("file") or "")
+        if not src_dir or not conf_rel:
+            problems.append(f"{name}: 扩展里缺少 site.nginx.file")
+            continue
+        body = read_text(os.path.join(src_dir, conf_rel)) or ""
+        if not body.strip():
+            problems.append(f"{name}: site.conf 为空")
+            continue
+        # 复制 lua（如果有）。目录用**扩展名**（manifest.name），
+        # 与 site.conf 里 /etc/dsh-mu-gateway/ext/<扩展名>/lua/... 的引用保持一致
+        ext_name = str(row.get("extension") or name)
+        os.makedirs(f"{ext_root}/{ext_name}/lua", exist_ok=True)
+        for path in glob.glob(os.path.join(src_dir, "lua", "*.lua")):
+            shutil.copy2(path, f"{ext_root}/{ext_name}/lua/{os.path.basename(path)}")
+        sock = f"{SITES_RUN}/{name}/nginx.sock"
+        rendered = (f"# generated by dsh-muctl - nginx-kind site '{name}'\n"
+                    f"server {{\n"
+                    f"    listen unix:{sock};\n"
+                    f"    client_max_body_size 512m;\n"
+                    f"{body}\n"
+                    f"}}\n")
+        if (read_text(target) or "") == rendered:
+            continue
+        atomic_write(target, rendered, mode=0o644)
+        ok = run(["chroot", paths["rootfs"], "/usr/sbin/nginx", "-t"], check=False,
+                 capture=True)
+        if ok.returncode != 0:
+            with contextlib.suppress(OSError):
+                os.unlink(target)
+            problems.append(f"{name}: nginx 配置被拒绝（已回滚）："
+                            f"{((ok.stderr or ok.stdout) or '')[-200:].strip()}")
+        elif not quiet:
+            info(f"站点 {name}（nginx 型）已编译进网关")
+    return problems
+
+
+def render_site_locations(st: dict) -> str:
+    """Gateway blocks that expose socket-kind sites behind the admin session.
+
+    入口由平台分配（docs/27 §4）；身份现在先只注入会话用户，令牌在下一步接。
+    """
+    blocks = []
+    for name, row in sorted((st.get("sites") or {}).items()):
+        kind = row.get("kind") or "socket"
+        if kind not in ("socket", "dav", "nginx"):
+            continue
+        path = str(((row.get("entry") or {}).get("path")) or "")
+        if not path or site_entry_valid(path):
+            continue
+        if kind == "dav":
+            if not row.get("enabled"):
+                blocks.append(f"""    # ---------- dav '{name}' 已停用
+    location ^~ {path} {{
+        default_type text/html;
+        return 503 '<!doctype html><meta charset="utf-8"><title>站点已停用</title>';
+    }}
+""")
+                continue
+            prefix = path.rstrip("/")
+            blocks.append(f"""    # ---------- dav site '{name}' entry {path}（openresty 用 Lua 提供 WebDAV）
+    location = {prefix} {{
+        # 同上：Windows 不跟随 PROPFIND 的 301 ✗
+        rewrite ^ {path} last;
+    }}
+
+    location ^~ {path} {{
+        set                 $admin_token "";
+        set                 $admin_user  "";
+        set                 $admin_must_change "";
+        set                 $site_name    {name};
+        set                 $site_tenant  "";
+        set                 $site_scope   "rw";
+        set                 $site_subject "";
+        set                 $site_prefix  {path};
+        set                 $dav_root     /var/lib/dsh-mu/instances;
+        access_by_lua_file  /usr/local/lib/dsh-mu/lua/site.lua;
+        content_by_lua_file /usr/local/lib/dsh-mu/lua/dav.lua;
+        client_max_body_size 512m;
+        proxy_set_header    X-DSH-MU-Site        {name};
+        proxy_set_header    X-DSH-MU-Principal   $site_subject;
+        proxy_set_header    X-DSH-MU-Tenant      $site_tenant;
+        proxy_set_header    X-DSH-MU-Scopes      $site_scope;
+        proxy_set_header    X-DSH-MU-Verified-By platform;
+        proxy_set_header    X-DSH-MU-Request-Id  $request_id;
+        proxy_set_header    Cookie               "";
+    }}
+""")
+            continue
+        if kind == "nginx":
+            if not row.get("enabled"):
+                blocks.append(f"""    # ---------- nginx site '{name}' 已停用
+    location ^~ {path} {{
+        default_type text/html;
+        return 503 '<!doctype html><meta charset="utf-8"><title>站点已停用</title>';
+    }}
+""")
+                continue
+            if not row.get("approved"):
+                blocks.append(f"""    # ---------- nginx site '{name}' 等待批准
+    location ^~ {path} {{
+        default_type text/html;
+        return 503 '<!doctype html><meta charset="utf-8"><title>站点等待批准</title>
+<style>body{{font:14px/1.6 system-ui;margin:0;padding:24px;background:#0f1218;color:#e6e8eb}}
+code{{background:#1b212b;padding:1px 6px;border-radius:4px}}</style>
+<h3>站点 {name} 还没有被批准</h3>
+<p>这个站点由扩展提供配置与 Lua，会运行在网关进程里；需要管理员显式批准。</p>
+<pre>dsh-muctl site approve {name}</pre>';
+    }}
+""")
+                continue
+            sock = f"{SITES_RUN}/{name}/nginx.sock"
+            prefix = path.rstrip("/")
+            blocks.append(f"""    # ---------- nginx site '{name}' entry {path}（扩展 site.conf 在 openresty 里）
+    location = {prefix} {{
+        rewrite ^ {path} last;
+    }}
+
+    location ^~ {path} {{
+        set                 $admin_token "";
+        set                 $admin_user  "";
+        set                 $admin_must_change "";
+        set                 $site_name    {name};
+        set                 $site_tenant  "";
+        set                 $site_scope   "rw";
+        set                 $site_subject "";
+        set                 $site_prefix  {path};
+        set                 $dav_root     /var/lib/dsh-mu/instances;
+        access_by_lua_file  /usr/local/lib/dsh-mu/lua/site.lua;
+        proxy_pass          http://unix:{sock}:/;
+        proxy_http_version  1.1;
+        proxy_set_header    Host                 $host;
+        proxy_set_header    X-Forwarded-Proto    $scheme;
+        proxy_set_header    X-Forwarded-Host     $host;
+        proxy_set_header    X-Forwarded-Prefix   {path};
+        proxy_set_header    X-Original-URI       $request_uri;
+        proxy_set_header    X-DSH-MU-Site        {name};
+        proxy_set_header    X-DSH-MU-Principal   $site_subject;
+        proxy_set_header    X-DSH-MU-Tenant      $site_tenant;
+        proxy_set_header    X-DSH-MU-Scopes      $site_scope;
+        proxy_set_header    X-DSH-MU-Verified-By platform;
+        proxy_set_header    X-DSH-MU-Request-Id  $request_id;
+        proxy_set_header    Cookie               "";
+        client_max_body_size 512m;
+        proxy_read_timeout  300s;
+    }}
+""")
+            continue
+        if not row.get("enabled"):
+            # 停用：入口保留但立刻 503（不再建连上游）——docs/27 §9
+            blocks.append(f"""    # ---------- site '{name}' 已停用
+    location ^~ {path} {{
+        default_type text/html;
+        return 503 '<!doctype html><meta charset="utf-8"><title>站点已停用</title>
+<style>body{{font:14px/1.6 system-ui;margin:0;padding:24px;background:#0f1218;color:#e6e8eb}}
+code{{background:#1b212b;padding:1px 6px;border-radius:4px}}</style>
+<h3>站点 {name} 已停用</h3>
+<p>管理员停用了这个站点，入口暂时不可用（不再连接上游）。</p>
+<p>恢复：<code>dsh-muctl site enable {name}</code></p>';
+    }}
+""")
+            continue
+        paths = [path]
+        mig = (st.get("site_migrations") or {}).get(name) or {}
+        if mig.get("old") and int(mig.get("until") or 0) > int(time.time()):
+            if not site_entry_valid(str(mig["old"])):
+                paths.insert(0, str(mig["old"]))
+        sock = str(row.get("upstream") or "") or site_socket_path(name)
+        strip = bool(((row.get("entry") or {}).get("strip", True)))
+        for one in paths:
+            prefix = one.rstrip("/")
+            rewrite = (f"        rewrite ^%s/(.*)$ /$1 break;\n" % prefix) if strip else ""
+            blocks.append(f"""    # ---------- site '{name}' (socket) entry {one}
+    location = {prefix} {{
+        # Windows 的 WebDAV 客户端不跟随 PROPFIND 的 301（表现为"找不到"）✗
+        rewrite ^ {one} last;
+    }}
+
+    location ^~ {one} {{
+        set                 $admin_token "";
+        set                 $admin_user "";
+        set                 $admin_must_change "";
+        # 站点身份变量：site.lua 按"令牌/会话"填充，下面注入成 X-DSH-MU-*
+        set                 $site_name         {name};
+        set                 $site_tenant       "";
+        set                 $site_scope        "rw";
+        set                 $site_subject      "";
+        access_by_lua_file  /usr/local/lib/dsh-mu/lua/site.lua;
+{rewrite}        proxy_pass          http://unix:{sock}:/;
+        proxy_http_version  1.1;
+        proxy_set_header    Host                 $host;
+        proxy_set_header    X-Real-IP            $remote_addr;
+        proxy_set_header    X-Forwarded-For      $proxy_add_x_forwarded_for;
+        proxy_set_header    X-Forwarded-Proto    $scheme;
+        proxy_set_header    X-Forwarded-Host     $host;
+        proxy_set_header    X-Forwarded-Prefix   {one};
+        proxy_set_header    X-Original-URI       $request_uri;
+        # 身份：客户端同名头会被下面覆盖（nginx 同一头只发最后一次设置的值）
+        proxy_set_header    X-DSH-MU-Site        {name};
+        proxy_set_header    X-DSH-MU-Principal   $site_subject;
+        proxy_set_header    X-DSH-MU-Tenant      $site_tenant;
+        proxy_set_header    X-DSH-MU-Scopes      $site_scope;
+        proxy_set_header    X-DSH-MU-Verified-By platform;
+        proxy_set_header    X-DSH-MU-Request-Id  $request_id;
+        proxy_set_header    Cookie               "";
+        proxy_set_header    Accept-Encoding      "";
+        client_max_body_size 512m;
+        proxy_read_timeout  300s;
+        proxy_connect_timeout 10s;
+        error_page 502 503 504 = @gw_site_down_{name};
+    }}
+
+    location @gw_site_down_{name} {{
+        default_type text/html;
+        return 200 '<!doctype html><meta charset="utf-8"><title>站点不可用</title>
+<style>body{{font:14px/1.6 system-ui;margin:0;padding:24px;background:#0f1218;color:#e6e8eb}}
+code{{background:#1b212b;padding:1px 6px;border-radius:4px}}pre{{background:#1b212b;padding:12px;border-radius:8px}}
+.muted{{color:#8b949e;font-size:12px}}</style>
+<h3>站点 {name} 连不上</h3>
+<p class="muted">平台把 <code>{path}</code> 代理到 <code>{sock}</code>，但连接失败（502）。</p>
+<pre>dsh-muctl site status {name}
+ls -l {sock}
+dsh-muctl site logs {name} -n 50</pre>';
+    }}
+""")
+    return "\n".join(blocks)
+
+
 def render_ext_locations() -> str:
     """Gateway blocks that expose each extension's admin page to the browser.
 
@@ -4704,7 +5241,11 @@ def render_ext_locations() -> str:
     """
     blocks = []
     for name, manifest in sorted(ext_registered().items()):
-        sock = ext_socket_path(name, "admin")
+        # 系统级扩展（service.kind=system）自己监听一个 admin socket，
+        # 在 manifest 的 admin.socket 里声明；平台只为它渲染 /ext/<name>/ 代理。
+        declared = str(((manifest.get("admin") or {}).get("socket")) or "").strip()
+        # manifest 里写相对名（如 "admin.sock"）时由平台拼目录；写绝对路径（系统级扩展）时直接用
+        sock = declared if declared.startswith("/") else ext_socket_path(name, "admin")
         port = 0 if sock else ext_admin_port(manifest)
         if not sock and not port:
             continue
@@ -4712,6 +5253,9 @@ def render_ext_locations() -> str:
         target = f"http://unix:{sock}:/" if sock else f"http://127.0.0.1:{port}/"
         target_escaped = target.replace("'", "")
         socket_dir = ext_admin_socket_dir(name) if sock else f"(TCP 127.0.0.1:{port})"
+        # location 前缀吃掉 /api/，这里要补回去，否则上游收到 /status → 404 ✗
+        # 普通用户的接口走 /ext/<name>/u/…（site.lua，任意登录用户）；管理员页仍走 /ext/<name>/
+        api_target_u = (f"http://unix:{sock}:/u/" if sock else f"http://127.0.0.1:{port}/u/")
         blocks.append(f"""    # ---------- extension '{name}': admin page proxied (loopback is host-only)
     location = /ext/{name} {{
         return 302 /ext/{name}/;
@@ -4731,11 +5275,34 @@ def render_ext_locations() -> str:
         # compromised it could call the admin API on 127.0.0.1:8787. The extension gets
         # its own token instead, which it can compare against admin.token.
         proxy_set_header    X-DSH-MU-Ext-Token {ext_token};
+        proxy_set_header    X-DSH-MU-Principal $admin_user;
+        proxy_set_header    X-DSH-MU-Role      "admin";
         proxy_set_header    Cookie            "";
         proxy_set_header    Accept-Encoding   "";
         proxy_read_timeout  300s;
         proxy_connect_timeout 10s;
         error_page 502 503 504 = @gw_ext_down_{name};
+    }}
+
+    location ^~ /ext/{name}/u/ {{
+        set                 $admin_token "";
+        set                 $admin_user  "";
+        set                 $admin_must_change "";
+        set                 $site_name    {name};
+        set                 $site_tenant  "";
+        set                 $site_scope   "rw";
+        set                 $site_subject "";
+        set                 $site_prefix  "/ext/{name}/";
+        access_by_lua_file  /usr/local/lib/dsh-mu/lua/site.lua;
+        proxy_pass          {api_target_u};
+        proxy_http_version  1.1;
+        proxy_set_header    Host              $host;
+        proxy_set_header    X-Real-IP         $remote_addr;
+        proxy_set_header    X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header    X-DSH-MU-Principal $site_subject;
+        proxy_set_header    X-DSH-MU-Role      "user";
+        proxy_set_header    Cookie            "";
+        proxy_set_header    Accept-Encoding   "";
     }}
 
     location @gw_ext_down_{name} {{
@@ -4777,6 +5344,9 @@ def render_gateway_fragments(cfg: dict, quiet: bool = False) -> dict[str, str]:
     if not http_tpl:
         raise FileNotFoundError(f"gateway template missing: {NGINX_TEMPLATE_DIR}/dsh-mu-http.conf")
 
+    with contextlib.suppress(Exception):
+        for _p in sync_site_nginx_files(load_state(), quiet=quiet):
+            warn(f"站点：{_p}")
     if port_has_default_server(listen, cfg):
         listen_default, note = "", " (another config already owns default_server; matching by server_name)"
     else:
@@ -4785,7 +5355,8 @@ def render_gateway_fragments(cfg: dict, quiet: bool = False) -> dict[str, str]:
     rendered = (server_tpl
                 .replace("@LISTEN_DIRECTIVES@", listen_block)
                 .replace("@SERVER_NAMES@", " ".join(names))
-                .replace("@EXT_LOCATIONS@", render_ext_locations())
+                .replace("@EXT_LOCATIONS@",
+                         render_ext_locations() + render_site_locations(load_state()))
                 # Cache-buster for the panel UI: /mu-static has a 10 min cache, and
                 # a new release must not keep serving the old panel.js. Derive it
                 # from the files themselves so any edit changes the URL.
@@ -6550,6 +7121,10 @@ def instance_home(name: str) -> str:
     return f"{instances_dir(name)}/home"
 
 
+def instance_workspace(name: str) -> str:
+    return f"{instances_dir(name)}/workspace"
+
+
 def instance_profiles(name: str) -> list[str]:
     base = f"{instance_home(name)}/.dsh/profiles"
     try:
@@ -6694,7 +7269,11 @@ def render_ext_conf(manifest: dict) -> str:
         'DSH_PERMISSION_MODE="danger-full-access"',
         f'EXTRA_MOUNTS="{manifest["_dir"]}:/opt/ext:ro,{EXT_DATA}/{name}:/var/lib/ext:rw,'
         f'{ext_api_socket_dir(name)}:/run/dsh-mu-ext/api:rw,'
-        f'{ext_admin_socket_dir(name)}:/run/dsh-mu-ext/admin:rw"',
+        f'{ext_admin_socket_dir(name)}:/run/dsh-mu-ext/admin:rw'
+        + (",{0}:/run/dsh-mu/sites/{1}:rw".format(
+            f"{SITES_RUN}/{site_slug((manifest.get('site') or {}).get('name') or name)}",
+            site_slug((manifest.get('site') or {}).get('name') or name))
+           if (manifest.get("site") or {}).get("kind", "socket") == "socket" else "") + '"',
         'RO_PATHS=""',
         "",
     ]
@@ -6763,12 +7342,93 @@ def socket_probe(path: str) -> str:
         return "refused" if isinstance(exc, ConnectionRefusedError) else str(exc)[:40]
 
 
+def _admin_sock(name: str, manifest: dict) -> str:
+    """扩展 admin socket 的实际路径（manifest 写绝对路径时直接用它）"""
+    declared = str(((manifest.get("admin") or {}).get("socket")) or "").strip()
+    if declared.startswith("/"):
+        return declared
+    return ext_socket_path(name, "admin")
+
+
 def ext_status(name: str) -> str:
+    """系统级扩展（service.kind=system）看它自己的 openrc 单元"""
+    with contextlib.suppress(Exception):
+        conf = json.loads(read_text(f"{EXT_CONF}/{name}.json") or "{}")
+        svc = conf.get("service") or {}
+        if str(svc.get("kind") or "jail") == "system" and svc.get("unit"):
+            res = run(["/sbin/rc-service", str(svc["unit"]), "status"],
+                      check=False, capture=True)
+            text = ((res.stdout or "") + (res.stderr or "")).lower()
+            return "running" if "started" in text or "running" in text else "stopped"
     if not os.path.exists(ext_service(name)):
         return "absent"
     res = run(["/sbin/rc-service", f"dsh-mu-ext-{name}", "status"], check=False, capture=True)
     text = ((res.stdout or "") + (res.stderr or "")).lower()
     return "running" if "started" in text or "running" in text else "stopped"
+
+
+def install_ext_plugin_dir(manifest: dict, st: dict) -> list[str]:
+    """把扩展自带的 plugin/ 目录装进每个实例 profile（系统级扩展用）
+
+    不依赖插件市场的安装策略：扩展随包提供的客户端插件本就应该"装上即生效"，
+    与平台自带插件同等待遇（bundles + node_modules）。
+    """
+    src = f"{manifest.get('_dir') or ''}/plugin"
+    if not os.path.isdir(src):
+        return []
+    meta = {}
+    with contextlib.suppress(ValueError):
+        meta = json.loads(read_text(f"{src}/package.json") or "{}")
+    pkg = str(meta.get("name") or "")
+    if not pkg:
+        return []
+    installed = []
+    for name in sorted(st.get("instances") or {}):
+        prof_dir = f"{instance_home(name)}/.dsh/profiles/{instance_profile(name)}"
+        pkg_path = f"{prof_dir}/package.json"
+        doc = {}
+        with contextlib.suppress(ValueError):
+            doc = json.loads(read_text(pkg_path) or "{}")
+        if not doc:
+            continue
+        bundles = list(((doc.get("dsh") or {}).get("profile") or {}).get("bundles") or [])
+        dst = f"{prof_dir}/node_modules/{pkg}"
+        current = {}
+        with contextlib.suppress(ValueError):
+            current = json.loads(read_text(f"{dst}/package.json") or "{}")
+        # 同时镜像到平台的"随包插件"目录：jail 里它的路径是 /opt/dsh-mu-plugins/<pkg>，
+        # 只放 instance profile 是不够的（package.json 的 dependency 要能解析到）✗
+        mirror = f"{BUNDLED_PLUGINS_DIR}/{os.path.basename(pkg.split('/')[-1])}"
+        if str(current.get("version")) != str(meta.get("version")) or not os.path.isdir(dst):
+            with contextlib.suppress(OSError):
+                shutil.rmtree(dst)
+            os.makedirs(dst, exist_ok=True)
+            for root, _dirs, files in os.walk(src):
+                rel = os.path.relpath(root, src)
+                target = dst if rel == "." else f"{dst}/{rel}"
+                os.makedirs(target, exist_ok=True)
+                for fname in files:
+                    shutil.copyfile(f"{root}/{fname}", f"{target}/{fname}")
+                    os.chmod(f"{target}/{fname}", 0o644)
+            with contextlib.suppress(OSError):
+                shutil.rmtree(mirror)
+            os.makedirs(mirror, exist_ok=True)
+            for root, _dirs, files in os.walk(src):
+                rel = os.path.relpath(root, src)
+                target = mirror if rel == "." else f"{mirror}/{rel}"
+                os.makedirs(target, exist_ok=True)
+                for fname in files:
+                    shutil.copyfile(f"{root}/{fname}", f"{target}/{fname}")
+                    os.chmod(f"{target}/{fname}", 0o644)
+            installed.append(f"{pkg} {meta.get('version')} → {name}")
+        if pkg not in bundles:
+            bundles.append(pkg)
+            doc["dsh"] = dict(doc.get("dsh") or {}, profile=dict((doc.get("dsh") or {}).get("profile") or {}, bundles=bundles))
+            deps = dict(doc.get("dependencies") or {})
+            deps[pkg] = f"file:/opt/dsh-mu-plugins/{os.path.basename(pkg.split('/')[-1])}"
+            doc["dependencies"] = deps
+            atomic_write(pkg_path, json.dumps(doc, ensure_ascii=False, indent=2) + "\n", mode=0o644)
+    return installed
 
 
 def ext_import_bundles(manifest: dict) -> list[str]:
@@ -6830,6 +7490,23 @@ def ext_reload(quiet: bool = False) -> dict:
         ext_ensure_socket_dirs(name)
         for sub in ("home", "work"):
             os.makedirs(f"{data}/{sub}", exist_ok=True)
+        service_kind = str((manifest.get("service") or {}).get("kind") or "jail")
+        if service_kind == "system":
+            # 系统级扩展：包自己装 openrc 单元，平台不建 jail/rootfs，也不起停。
+            # 但它随包的客户端插件仍要导入并推送到实例 ✓
+            atomic_write(f"{EXT_CONF}/{name}.json",
+                         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", mode=0o644)
+            imported = ext_import_bundles(manifest)
+            for line in imported:
+                info(f"extension {name}: imported plugin {line}")
+            st_push = load_state()
+            try:
+                for line in install_ext_plugin_dir(manifest, st_push):
+                    info(f"extension {name}: installed plugin {line}")
+            except Exception as exc:  # noqa: BLE001
+                warn(f"extension {name}: plugin install failed: {exc}")
+            report["installed"].append(name)
+            continue
         rootfs = f"{data}/rootfs"
         if not os.path.isdir(rootfs):
             report["skipped"][name] = "rootfs not built (see the extension's build script)"
@@ -7845,14 +8522,34 @@ PROVIDERS_CACHE = f"{VAR}/providers.json"
 # Providers whose endpoint carries an account/project/region segment. We keep a template
 # and let the administrator fill the parameters; the import lands disabled until they do,
 # so a half-filled provider can never be selected by a plan.
+# key 模式能直接用的 provider：模板里的槽位都「可留空」（留空则调用时给中文提示）
 PROVIDER_URL_TEMPLATES = {
-    "amazon-bedrock": ("https://bedrock-runtime.{region}.amazonaws.com", ["region"]),
-    "azure": ("https://{resource}.openai.azure.com/openai/v1", ["resource"]),
+    # cloudflare 的 URL 里必须有 account_id（openai-completions 协议 ✓ 平台可代理）
     "cloudflare-ai-gateway": ("https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}",
                               ["account_id", "gateway_id"]),
     "cloudflare-workers-ai":
         ("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1", ["account_id"]),
-    "google-vertex": ("https://{location}-aiplatform.googleapis.com", ["location"]),
+}
+# 协议不被平台代理的 provider（google-vertex / bedrock / azure / google / mistral /
+# openai-codex / radius）：不提供填参框，导入时直接拒绝并说明原因 ✓
+# 每个 provider 的"声明式"可选字段：填好之后仍然要能改 ✗
+# （之前按 base_url 里残留的 {占位} 计算，填过之后就消失了 → 界面里看不到 account_id）
+PROVIDER_OPTIONAL_FIELDS = {
+    "cloudflare-workers-ai": ["account_id"],
+    "cloudflare-ai-gateway": ["account_id", "gateway_id"],
+    "azure": ["resource"],
+    "amazon-bedrock": ["region"],
+    "google-vertex": ["location"],
+}
+
+PROVIDER_UNSUPPORTED = {
+    "google-vertex": "google-vertex",
+    "amazon-bedrock": "bedrock-converse-stream",
+    "azure": "azure-openai-responses",
+    "google": "google-generative-ai",
+    "mistral": "mistral-conversations",
+    "openai-codex": "openai-codex-responses",
+    "radius": "pi-messages",
 }
 
 # Providers the harness directory lists without a default endpoint (they expect the
@@ -8013,41 +8710,579 @@ def unresolved_slots(template: str) -> list[str]:
     return sorted(set(re.findall(r"\{([a-z_]+)\}", str(template or ""))))
 
 
-def dsh_catalog(force: bool = False) -> dict:
-    """Provider metadata + model catalog of the installed harness (cached)."""
-    if not force:
-        with contextlib.suppress(ValueError):
-            cached = json.loads(read_text(DSH_CATALOG_CACHE) or "null")
-            # Guard the shape: an older cache (provider -> bare model list) must not be
-            # mistaken for the current one (provider -> {baseURL, models}).
-            if (isinstance(cached, dict) and cached
-                    and all(isinstance(v, dict) and "models" in v for v in cached.values())):
-                return cached
-    rootfs = runtime_rootfs()
-    if not rootfs:
-        return {}
-    dsh_dir = f"{rootfs}/usr/local/lib/node_modules/@deepseek-ai/dsh"
-    script = f"{dsh_dir}/dump-catalog.mjs"
+PROVIDER_CATALOG_PLATFORM = f"{LIB}/provider-catalog/catalog.json"
+PROVIDER_CATALOG_ACTIVE = f"{VAR}/catalog.json"
+CATALOG_SCHEMA = "dsh-mu.provider-catalog/v1"
+
+
+def _catalog_from_data_dir(data_dir: str, source: str, pi_ai_version: str = "") -> dict:
+    """从 pi-ai 的 providers/data/*.json 生成目录（纯 JSON，不需要 node/chroot ✓）"""
+    providers: dict[str, dict] = {}
     with contextlib.suppress(OSError):
-        atomic_write(script, DSH_CATALOG_SCRIPT, mode=0o644)
-    res = run(["chroot", rootfs, "/bin/sh", "-c",
-               "cd /usr/local/lib/node_modules/@deepseek-ai/dsh && "
-               "/usr/bin/node dump-catalog.mjs"], check=False, capture=True)
-    with contextlib.suppress(OSError):
-        os.unlink(script)
-    text = (res.stdout or "").strip()
-    with contextlib.suppress(ValueError):
-        doc = json.loads(text.splitlines()[-1] if text else "{}")
-        if isinstance(doc, dict) and doc:
-            with contextlib.suppress(OSError):
-                os.makedirs(VAR, exist_ok=True)
-                atomic_write(DSH_CATALOG_CACHE, json.dumps(doc) + "\n", mode=0o644)
-            return doc
+        for entry in sorted(os.listdir(data_dir)):
+            if not entry.endswith(".json") or entry in ("all.json", "index.json"):
+                continue
+            with contextlib.suppress(ValueError, OSError):
+                doc = json.loads(read_text(os.path.join(data_dir, entry)) or "{}")
+                if not isinstance(doc, dict):
+                    continue
+                models, base = [], ""
+                for api, group in doc.items():
+                    if not isinstance(group, dict):
+                        continue
+                    for mid, m in group.items():
+                        if not isinstance(m, dict):
+                            continue
+                        row = {"id": mid, "name": m.get("name") or mid, "api": api}
+                        if m.get("baseUrl"):
+                            row["baseUrl"] = m["baseUrl"]
+                            base = base or m["baseUrl"]
+                        for src, dst in (("contextWindow", "contextWindow"),
+                                         ("maxTokens", "maxTokens"),
+                                         ("input", "inputModalities")):
+                            if m.get(src) is not None:
+                                row[dst] = m[src]
+                        models.append(row)
+                if models:
+                    providers[entry[:-5]] = {"baseURL": base, "models": models}
+    return {"schema": CATALOG_SCHEMA, "source": source, "pi_ai_version": pi_ai_version,
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "providers": providers}
+
+
+def catalog_meta() -> dict:
+    """当前生效目录的来源信息（source / pi_ai_version / generated_at / providers）"""
+    for path in (PROVIDER_CATALOG_ACTIVE, PROVIDER_CATALOG_PLATFORM):
+        with contextlib.suppress(ValueError, OSError):
+            doc = json.loads(read_text(path) or "{}")
+            if isinstance(doc, dict) and doc.get("providers"):
+                return {"path": path, "source": doc.get("source") or "unknown",
+                        "pi_ai_version": doc.get("pi_ai_version") or "",
+                        "generated_at": doc.get("generated_at") or "",
+                        "providers": len(doc["providers"]),
+                        "models": sum(len(v.get("models") or [])
+                                      for v in doc["providers"].values())}
     return {}
 
 
+def catalog_refresh(from_runtime: str = "", from_dir: str = "") -> dict:
+    """把目录更新到指定来源，写入 /var/lib/dsh-mu/catalog.json（平台唯一权威目录）"""
+    data_dir, source, version = "", "", ""
+    if from_dir:
+        data_dir, source = from_dir, f"dir:{from_dir}"
+    else:
+        rid = from_runtime or dsh_runtime_dir(load_config()) or ""
+        if rid:
+            cand = [f"{VAR}/runtimes/{rid}/node_modules/@earendil-works/pi-ai/dist/providers/data",
+                    f"{rid}/node_modules/@earendil-works/pi-ai/dist/providers/data",
+                    f"{rid}/usr/local/lib/node_modules/@deepseek-ai/dsh/node_modules/"
+                    f"@earendil-works/pi-ai/dist/providers/data"]
+            for path in cand:
+                if os.path.isdir(path):
+                    data_dir = path
+                    break
+            source = f"runtime:{os.path.basename(rid.rstrip('/'))}"
+            version = os.path.basename(str(rid).rstrip("/"))
+        else:
+            data_dir = (f"{LIB}/../node_modules/@earendil-works/pi-ai/dist/providers/data")
+            source = "platform-snapshot"
+    if not data_dir or not os.path.isdir(data_dir):
+        die(f"catalog source not found (from_runtime={from_runtime!r} from_dir={from_dir!r})")
+    doc = _catalog_from_data_dir(data_dir, source, version)
+    if not doc["providers"]:
+        die(f"no provider data under {data_dir}")
+    atomic_write(PROVIDER_CATALOG_ACTIVE,
+                 json.dumps(doc, ensure_ascii=False, sort_keys=True, indent=1) + "\n",
+                 mode=0o644)
+    return {"source": source, "providers": len(doc["providers"]),
+            "models": sum(len(v["models"]) for v in doc["providers"].values()),
+            "path": PROVIDER_CATALOG_ACTIVE}
+
+
+def cmd_runtime_mount_test(args):
+    """报告本机的运行时挂载策略；给了镜像就真的挂一次并读文件"""
+    strategy, why = runtime_mount_strategy()
+    print(f"策略: {strategy}（{why}）")
+    print(f"  loop-control: {'有' if os.path.exists('/dev/loop-control') else '无'}")
+    print(f"  /dev/fuse:    {'有' if os.path.exists('/dev/fuse') else '无'}")
+    print(f"  squashfuse:   {squashfuse_bin() or '无'}")
+    if not args.image:
+        return 0
+    img = os.path.abspath(args.image)
+    if not os.path.exists(img):
+        die(f"no such image: {img}")
+    target = f"/tmp/dsh-mu-runtime-probe"
+    os.makedirs(target, exist_ok=True)
+    ok = False
+    if strategy == "loop":
+        ok = run(["mount", "-t", "squashfs", "-o", "loop,ro", img, target],
+                 check=False, capture=True).returncode == 0
+    if not ok and fuse_available():
+        ok = fuse_mount_image(img, target)
+    if not ok:
+        die(f"挂载失败（策略 {strategy}）")
+    n = 0
+    with contextlib.suppress(OSError):
+        for _root, _dirs, files in os.walk(target):
+            n += len(files)
+    print(f"挂载成功: {img} → {target}（{n} 个文件）")
+    entries = sorted(os.listdir(target))[:5]
+    print(f"  顶层: {', '.join(entries)}")
+    if strategy != "loop":
+        fuse_unmount(target)
+    else:
+        run(["umount", target], check=False, capture=True)
+    return 0
+
+
+# ---------------------------------------------------------------- site tokens (docs/27 §6)
+SITE_TOKEN_PREFIX = "dsk_"
+
+
+def site_token_hash(raw: str, db) -> str:
+    salt = install_salt(db)
+    return hashlib.sha256((salt + "|token|" + raw).encode()).hexdigest()
+
+
+def site_token_create(site: str, subject: str = "", tenant: str = "", scope: str = "rw",
+                      label: str = "", days: int = 30) -> tuple[str, str]:
+    """签发一个令牌。返回 (id, 明文)；明文只在这里出现一次。"""
+    db = state_db_connect()
+    try:
+        raw = SITE_TOKEN_PREFIX + secrets.token_urlsafe(32)
+        tid = "st_" + secrets.token_hex(6)
+        db.execute(
+            "INSERT INTO site_tokens(id, site, subject, tenant, scope, hash, label,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (tid, site, subject or ("svc:" + site), tenant, scope, site_token_hash(raw, db),
+             label, int(time.time())))
+        db.commit()
+        with contextlib.suppress(Exception):
+            db.execute("INSERT INTO events(at, kind, target, detail) VALUES (?,?,?,?)",
+                       (int(time.time()), "site.token.created", site,
+                        f"{subject or '-'} scope={scope} label={label}"))
+            db.commit()
+        return tid, raw
+    finally:
+        db.close()
+
+
+def site_token_list(site: str = "") -> list[dict]:
+    db = state_db_connect()
+    try:
+        q = ("SELECT id, site, subject, tenant, scope, label, created_at,"
+             " last_used_at, last_used_ip, revoked_at FROM site_tokens")
+        args: tuple = ()
+        if site:
+            q += " WHERE site=?"
+            args = (site,)
+        q += " ORDER BY site, created_at"
+        return [dict(r) for r in db.execute(q, args)]
+    finally:
+        db.close()
+
+
+def site_token_revoke(tid: str = "", subject: str = "", site: str = "") -> int:
+    db = state_db_connect()
+    try:
+        now = int(time.time())
+        if tid:
+            cur = db.execute("UPDATE site_tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
+                             (now, tid))
+        else:
+            cur = db.execute("UPDATE site_tokens SET revoked_at=? WHERE subject=? AND site=?"
+                             " AND revoked_at IS NULL", (now, subject, site))
+        db.commit()
+        with contextlib.suppress(Exception):
+            db.execute("INSERT INTO events(at, kind, target, detail) VALUES (?,?,?,?)",
+                       (now, "site.token.revoked", site or tid, subject or tid))
+            db.commit()
+        return cur.rowcount
+    finally:
+        db.close()
+
+
+def site_token_verify(site: str, raw: str, ip: str = "") -> dict | None:
+    """网关调用：令牌 → (subject, tenant, scope)。顺带更新 last_used（>60s 才写）。"""
+    if not raw or not site:
+        return None
+    db = state_db_connect()
+    try:
+        row = db.execute("SELECT * FROM site_tokens WHERE hash=? AND site=? AND revoked_at IS NULL",
+                         (site_token_hash(raw, db), site)).fetchone()
+        if not row:
+            return None
+        now = int(time.time())
+        if now - int(row["last_used_at"] or 0) > 60:
+            db.execute("UPDATE site_tokens SET last_used_at=?, last_used_ip=? WHERE id=?",
+                       (now, ip, row["id"]))
+            db.commit()
+        return {"id": row["id"], "subject": row["subject"] or "",
+                "tenant": row["tenant"] or "", "scope": row["scope"] or "rw"}
+    finally:
+        db.close()
+
+
+def site_of_extension(ext_name: str) -> dict | None:
+    """某个扩展拥有的站点（admin 的扩展列表里展示用）"""
+    st = load_state()
+    for name, row in (st.get("sites") or {}).items():
+        if str(row.get("extension") or "") == ext_name:
+            return {"name": name, "kind": row.get("kind") or "socket",
+                    "entry": (row.get("entry") or {}).get("path")
+                             or (row.get("entry") or {}).get("host") or "",
+                    "enabled": bool(row.get("enabled")),
+                    "approved": bool(row.get("approved", True))}
+    return None
+
+
+def cmd_site(args) -> int:
+    """站点（site）：外挂 HTTP 服务的接入点。规范见 docs/27"""
+    ensure_root()
+    action = getattr(args, "action", "list") or "list"
+    st = load_state()
+    if action == "sync":
+        report = site_sync(st, quiet=False)
+        save_state(st)
+        sync_all(load_state())
+        info(f"sites: added={report['added']} updated={report['updated']} "
+             f"removed={report['removed']}")
+        return 0
+
+    sites = st.get("sites") or {}
+    if action == "list":
+        if not sites:
+            info("没有注册任何站点（扩展 manifest 里写 site 段后执行 dsh-muctl site sync）")
+            return 0
+        print(f"{'SITE':12} {'EXT':18} {'ENTRY':16} {'KIND':8} {'AUTH':10} "
+              f"{'ENABLED':8} UPSTREAM")
+        for name, row in sorted(sites.items()):
+            entry = ((row.get("entry") or {}).get("path")
+                     or (row.get("entry") or {}).get("host") or "-")
+            sock = str(row.get("upstream") or "") or site_socket_path(name)
+            if (row.get("kind") or "socket") == "dav":
+                state = "builtin"
+            else:
+                state = "socket" if os.path.exists(sock) else "no-socket"
+            print(f"{name:12} {str(row.get('extension') or '-'):18} {entry:16} "
+                  f"{str(row.get('kind') or 'socket'):8} "
+                  f"{str((row.get('auth') or {}).get('mode') or '-'):10} "
+                  f"{'yes' if row.get('enabled') else 'no':8} {state}"
+                  + ("" if row.get("approved", True) else "  ⚠ 待批准"))
+        return 0
+
+    name = site_slug(getattr(args, "name", "") or "")
+    row = sites.get(name)
+    if action == "approve" and row:
+        row["approved"] = True
+        row["approved_at"] = int(time.time())
+        save_state(st)
+        sync_all(load_state())
+        info(f"站点 {name} 已批准（扩展的配置与 Lua 将运行在网关进程内）")
+        return 0
+    if action == "status":
+        if not row:
+            die(f"没有这个站点：{name or '(空)'}；先 dsh-muctl site list")
+        entry = row.get("entry") or {}
+        sock = str(row.get("upstream") or "") or site_socket_path(name)
+        print(f"站点      : {name}")
+        print(f"扩展      : {row.get('extension') or '-'}")
+        print(f"形态      : {row.get('kind') or 'socket'}")
+        print(f"入口      : {entry.get('path') or entry.get('host') or '-'}"
+              f"（分配者 {row.get('assigned_by') or 'platform'}，偏好 {row.get('preference') or '-'}）")
+        print(f"启用      : {'是' if row.get('enabled') else '否'}"
+              + ("" if row.get("approved", True) else "（待批准：dsh-muctl site approve）"))
+        print(f"上游      : {sock}（{'socket 存在' if os.path.exists(sock) else 'socket 缺失'}）")
+        print(f"鉴权      : {json.dumps(row.get('auth') or {}, ensure_ascii=False)}")
+        print(f"挂载      : {json.dumps(row.get('mounts') or [], ensure_ascii=False)}")
+        print(f"出网      : {json.dumps(row.get('egress') or [], ensure_ascii=False)}")
+        return 0
+
+    if not row:
+        die(f"没有这个站点：{name or '(空)'}；入口由扩展 manifest 声明后再 site sync")
+
+    if action == "set":
+        path = getattr(args, "path", None)
+        host = getattr(args, "host", None)
+        if path:
+            path = path if path.endswith("/") else path + "/"
+            reason = site_entry_valid(path)
+            if reason:
+                die(f"入口 {path} 不合法：{reason}")
+            other = site_entry_taken(st, path, ignore=name)
+            if other:
+                die(f"入口 {path} 已被站点 {other} 占用（或与其嵌套）")
+        entry = dict(row.get("entry") or {})
+        if path:
+            old = entry.get("path")
+            if old and old != path:
+                # 双前缀窗口：旧入口保留 300 秒（docs/27 §4.3）
+                st.setdefault("site_migrations", {})[name] = {
+                    "old": old, "new": path, "until": int(time.time()) + 300}
+            entry["path"] = path
+        if host:
+            entry["host"] = host
+        row["entry"] = entry
+        row["assigned_by"] = "operator"
+        save_state(st)
+        sync_all(load_state())
+        info(f"站点 {name} 入口 → {entry.get('path')}"
+             + (f"（旧入口 300 秒后失效）" if path and st.get("site_migrations", {}).get(name) else ""))
+        return 0
+
+    if action in ("enable", "disable"):
+        row["enabled"] = action == "enable"
+        save_state(st)
+        sync_all(load_state())
+        info(f"站点 {name} 已{'启用' if row['enabled'] else '停用'}"
+             + ("" if row["enabled"] else "（入口立刻返回 503，不再连接上游）"))
+        return 0
+
+    if action == "prune":
+        mig = (st.get("site_migrations") or {}).pop(name, None)
+        if not mig:
+            info(f"站点 {name} 没有待清理的旧入口")
+            return 0
+        save_state(st)
+        sync_all(load_state())
+        info(f"已移除站点 {name} 的旧入口 {mig.get('old')}")
+        return 0
+
+    if action == "token":
+        sub = getattr(args, "token_action", "") or "list"
+        if sub == "create":
+            tenant = getattr(args, "tenant", "") or ""
+            subject = getattr(args, "subject", "") or ("svc:" + name)
+            scope = "ro" if getattr(args, "readonly", False) else "rw"
+            days = int(getattr(args, "days", 30) or 30)
+            tid, raw = site_token_create(name, subject=subject, tenant=tenant,
+                                         scope=scope, label=getattr(args, "label", "") or "",
+                                         days=days)
+            print(f"令牌已创建（只显示这一次）：")
+            print(f"  id      : {tid}")
+            print(f"  站点    : {name}    租户: {tenant or '-'}    粒度: {scope}")
+            print(f"  用户名  : {subject}")
+            print(f"  密码/令牌: {raw}")
+            print(f"  有效期  : {days} 天")
+            print(f"  地址    : {((row.get('entry') or {}).get('path')) or ''}")
+            return 0
+        if sub == "list":
+            rows = site_token_list(name)
+            if not rows:
+                info(f"站点 {name} 没有令牌")
+                return 0
+            print(f"{'ID':16} {'SUBJECT':22} {'SCOPE':6} {'LAST USED':12} {'状态'}")
+            for r in rows:
+                used = time.strftime("%m-%d %H:%M", time.localtime(r["last_used_at"])) if r["last_used_at"] else "-"
+                print(f"{r['id']:16} {r['subject']:22} {r['scope']:6} {used:12} "
+                      f"{'已吊销' if r['revoked_at'] else '有效'}")
+            return 0
+        if sub in ("revoke", "rotate"):
+            tid = getattr(args, "token_id", "") or ""
+            subject = getattr(args, "subject", "") or ""
+            if not tid and not subject:
+                die("需要 --id 或 --subject")
+            if sub == "revoke":
+                n = site_token_revoke(tid=tid, subject=subject, site=name)
+                info(f"已吊销 {n} 个令牌")
+                return 0
+            n = site_token_revoke(tid=tid, subject=subject, site=name)
+            ntid, raw = site_token_create(name, subject=subject or "svc:" + name,
+                                          tenant=getattr(args, "tenant", "") or "",
+                                          scope="ro" if getattr(args, "readonly", False) else "rw",
+                                          label="rotated")
+            info(f"已吊销 {n} 个，新令牌（只显示这一次）：")
+            print(f"  用户名  : {subject or 'svc:' + name}")
+            print(f"  密码/令牌: {raw}")
+            return 0
+        warn(f"未知 token 操作：{sub}（可用 create / list / revoke / rotate）")
+        return 1
+
+    warn(f"`site {action}` 还没实现（docs/27）；可用：list / status / sync / set / enable / disable / prune / token")
+    return 1
+def cmd_catalog(args):
+    ensure_root()
+    if args.action == "show":
+        meta = catalog_meta()
+        if not meta:
+            die("no provider catalog found (run: dsh-muctl sync)")
+        print(json.dumps(meta, indent=2, ensure_ascii=False))
+        return 0
+    res = catalog_refresh(from_runtime=args.from_runtime or "", from_dir=args.from_dir or "")
+    info(f"catalog updated: {res['source']} → {res['providers']} providers / "
+         f"{res['models']} models（{res['path']}）")
+    return 0
+
+
+def dsh_catalog(force: bool = False) -> dict:
+    """平台权威 provider 目录（唯一来源，不再 chroot 跑 node ✗）
+
+    来源优先级：
+      ① /var/lib/dsh-mu/catalog.json         —— 平台当前生效目录（可由运行时刷新覆盖）
+      ② /usr/local/lib/dsh-mu/provider-catalog/catalog.json —— 随 dsh-mu 发布的快照
+      ③ 旧缓存 /var/lib/dsh-mu/dsh-catalog.json —— 仅兼容，读到会告警建议升级
+    返回形状：{provider: {baseURL, models: [...]}}（调用方只关心这个）
+    """
+    for path in (PROVIDER_CATALOG_ACTIVE, PROVIDER_CATALOG_PLATFORM):
+        with contextlib.suppress(ValueError, OSError):
+            doc = json.loads(read_text(path) or "{}")
+            if isinstance(doc, dict) and isinstance(doc.get("providers"), dict) and doc["providers"]:
+                return doc["providers"]
+    # 兼容：老版本留下的全局缓存（没有 metadata）。读到就提示，别悄悄用 ✗
+    with contextlib.suppress(ValueError, OSError):
+        cached = json.loads(read_text(DSH_CATALOG_CACHE) or "null")
+        if (isinstance(cached, dict) and cached
+                and all(isinstance(v, dict) and "models" in v for v in cached.values())):
+            warn(f"正在使用旧版目录缓存 {DSH_CATALOG_CACHE}（没有来源信息）；"
+                 f"建议执行 dsh-muctl sync 更新为平台目录")
+            return cached
+    return {}
 def provider_dir() -> str:
     return f"{VAR}/providers"
+
+
+DEFAULT_MAX_OUTPUT = 32768
+
+
+def sane_limits(context_window, max_tokens) -> tuple[int, int]:
+    """把 contextWindow / maxTokens 修成"能真正发请求"的组合 ✓
+
+    DSH 会在模型切换时检查：maxTokens（完成预算）必须给消息留出空间，
+    否则报 MODEL_SWITCH_COMPACTION_FAILED（实测 cloudflare 的
+    deepseek-v4-flash 给了 contextWindow=maxTokens=1048576 → 一个 token 都不剩 ✗）
+    """
+    try:
+        ctx = int(context_window or 0)
+    except (TypeError, ValueError):
+        ctx = 0
+    try:
+        mx = int(max_tokens or 0)
+    except (TypeError, ValueError):
+        mx = 0
+    if mx <= 0:
+        mx = DEFAULT_MAX_OUTPUT
+    if ctx <= 0:
+        ctx = max(mx + 32768, 131072)
+    # 至少给消息留 1/4 窗口；否则把 maxTokens 压低
+    if mx >= ctx:
+        mx = max(1024, min(DEFAULT_MAX_OUTPUT, ctx // 4))
+    return ctx, mx
+
+
+def provider_protocol_support(models: list[dict]) -> tuple[bool, list[str]]:
+    """这个 provider 的模型有没有我们发得出的协议（纯函数，可单测 ✓）"""
+    apis = sorted({str(m.get("api") or "") for m in models if m.get("api")})
+    usable = [a for a in apis if a in LLM_PATCH_APIS]
+    return bool(usable), apis
+
+
+def migrate_provider_limits() -> list[str]:
+    """把已有 provider 包里 "maxTokens >= contextWindow" 的模型修好（幂等）"""
+    changed = []
+    folder = provider_dir()
+    with contextlib.suppress(OSError):
+        for entry in sorted(os.listdir(folder)):
+            if not entry.endswith(".json"):
+                continue
+            path = f"{folder}/{entry}"
+            with contextlib.suppress(ValueError, OSError):
+                pkg = json.loads(read_text(path) or "{}")
+                if not isinstance(pkg, dict) or not pkg.get("models"):
+                    continue
+                touched = False
+                for m in pkg["models"]:
+                    ctx, mx = sane_limits(m.get("contextWindow"), m.get("maxTokens"))
+                    if m.get("contextWindow") != ctx or m.get("maxTokens") != mx:
+                        m["contextWindow"], m["maxTokens"] = ctx, mx
+                        touched = True
+                if touched:
+                    atomic_write(path, json.dumps(pkg, indent=2, ensure_ascii=False) + "\n",
+                                 mode=0o644)
+                    changed.append(pkg.get("id") or entry)
+    return changed
+
+
+def migrate_provider_packages() -> list[str]:
+    """把历史上的 "缺参数 → disabled" 包改成 "可选参数、不禁用" ✓（幂等）"""
+    changed = []
+    folder = provider_dir()
+    with contextlib.suppress(OSError):
+        for entry in sorted(os.listdir(folder)):
+            if not entry.endswith(".json"):
+                continue
+            path = f"{folder}/{entry}"
+            with contextlib.suppress(ValueError, OSError):
+                pkg = json.loads(read_text(path) or "{}")
+                if not isinstance(pkg, dict) or not pkg.get("id"):
+                    continue
+                missing = [s for s in (pkg.get("needs_params") or [])
+                           if s not in (pkg.get("params") or {})]
+                missing += [s for s in unresolved_slots(pkg.get("base_url") or "")
+                            if s not in missing]
+                touched = False
+                if pkg.get("needs_params"):
+                    pkg.pop("needs_params", None)
+                    touched = True
+                if missing and pkg.get("optional_params") != missing:
+                    pkg["optional_params"] = missing
+                    touched = True
+                if pkg.get("disabled") and missing:
+                    pkg["disabled"] = False
+                    touched = True
+                if touched:
+                    atomic_write(path, json.dumps(pkg, indent=2, ensure_ascii=False) + "\n",
+                                 mode=0o644)
+                    changed.append(pkg["id"])
+    return changed
+
+
+def migrate_provider_declared() -> list[str]:
+    """给历史 provider 包补 declared_params（界面要能改已填过的字段）"""
+    changed = []
+    folder = provider_dir()
+    with contextlib.suppress(OSError):
+        for entry in sorted(os.listdir(folder)):
+            if not entry.endswith(".json"):
+                continue
+            path = f"{folder}/{entry}"
+            with contextlib.suppress(ValueError, OSError):
+                pkg = json.loads(read_text(path) or "{}")
+                pid = pkg.get("id") or entry[:-5]
+                declared = PROVIDER_OPTIONAL_FIELDS.get(pid)
+                if not declared or pkg.get("declared_params") == declared:
+                    continue
+                pkg["declared_params"] = list(declared)
+                atomic_write(path, json.dumps(pkg, indent=2, ensure_ascii=False) + "\n",
+                             mode=0o644)
+                changed.append(pid)
+    return changed
+
+
+def provider_set_params(pid: str, params: dict, base_url: str = "") -> dict:
+    """把"高级（可选）"里的值补进 provider 包（槽位替换或整体覆盖 base_url）"""
+    path = f"{provider_dir()}/{pid}.json"
+    if not os.path.exists(path):
+        die(f"provider not found: {pid}")
+    pkg = json.loads(read_text(path) or "{}")
+    if base_url:
+        pkg["base_url"] = base_url
+        for m in pkg.get("models") or []:
+            m.pop("base_url", None)
+    if params:
+        current = dict(pkg.get("params") or {})
+        current.update({k: str(v) for k, v in params.items()})
+        pkg["params"] = current
+        template = str(pkg.get("base_url") or "")
+        resolved = resolve_base_url(template, current)
+        if not unresolved_slots(resolved):
+            pkg["base_url"] = resolved
+    left = [s for s in unresolved_slots(pkg.get("base_url") or "")]
+    if left:
+        pkg["optional_params"] = left
+    else:
+        pkg.pop("optional_params", None)
+    pkg["disabled"] = False
+    atomic_write(path, json.dumps(pkg, indent=2, ensure_ascii=False) + "\n", mode=0o644)
+    return {"id": pid, "base_url": pkg.get("base_url"), "missing": left}
 
 
 def provider_import_from_catalog(pid: str, params: dict | None = None) -> tuple[bool, dict | str]:
@@ -8070,6 +9305,12 @@ def provider_import_from_catalog(pid: str, params: dict | None = None) -> tuple[
     models = row.get("models") or []
     if not models:
         return False, f"{pid} has no model catalog"
+    supported, apis = provider_protocol_support(models)
+    if not supported:
+        return False, (f"平台当前不支持 {pid}：它使用 "
+                       f"{'、'.join(apis) or '未知协议'} 协议，而平台只代理 "
+                       f"{'/'.join(LLM_PATCH_APIS)}。这类 provider 需要在实例内直接配置"
+                       f"（原版 DSH 里可以用，是因为它复用 provider 自带适配器）")
     params = {str(k): str(v) for k, v in (params or {}).items() if str(v).strip()}
     if pid == "github-copilot":
         # Copilot authenticates with a short-lived token minted from a GitHub credential,
@@ -8090,9 +9331,11 @@ def provider_import_from_catalog(pid: str, params: dict | None = None) -> tuple[
         "auth": {"type": "bearer"},
         "api": api,
         "origin": "dsh",
-        "disabled": True if (needs or unresolved_slots(base_url)) else False,
+        # 缺槽位**不禁用**：套餐可以保存，真正调用时由 relay 给出中文提示 ✓
+        "disabled": False,
         "models": [{"id": m["id"], "name": m.get("name") or m["id"], "api": m.get("api") or api,
-                    "contextWindow": m.get("contextWindow"), "maxTokens": m.get("maxTokens")}
+                    "contextWindow": sane_limits(m.get("contextWindow"), m.get("maxTokens"))[0],
+                    "maxTokens": sane_limits(m.get("contextWindow"), m.get("maxTokens"))[1]}
                    for m in models if m.get("id")],
     }
     # anthropic-messages adapters append `/v1/messages` themselves; a harness catalog
@@ -8130,8 +9373,13 @@ def provider_import_from_catalog(pid: str, params: dict | None = None) -> tuple[
         pkg["base_url"] = resolve_base_url(base_url, params)
         if not unresolved_slots(pkg["base_url"]):
             pkg["disabled"] = False
+    declared = PROVIDER_OPTIONAL_FIELDS.get(pid) or list(needs or [])
+    if declared:
+        pkg["declared_params"] = declared
     if missing:
-        pkg["needs_params"] = missing
+        # 语义变了：不是"必须填才能启用"，而是"调用前需要补，可留空保存" ✓
+        pkg["optional_params"] = missing
+        pkg.pop("needs_params", None)
     if pid == "github-copilot":
         # No apiKeyEnv: the credential is the short-lived token the relay mints from the
         # plan's GitHub credential (plan-level `.gh`), so the package only records that.
@@ -8493,6 +9741,80 @@ def runtime_ready(rid: str) -> bool:
     return os.path.exists(f"{runtime_dir(rid)}/node_modules/@deepseek-ai/dsh/package.json")
 
 
+SQUASHFUSE_DIR = f"{LIB}/vendor/squashfuse"
+
+
+def squashfuse_bin() -> str:
+    """随包携带的 squashfuse（非特权容器里挂 squashfs 的唯一不依赖 loop 的办法）"""
+    for cand in (f"{SQUASHFUSE_DIR}/squashfuse", shutil.which("squashfuse") or ""):
+        if cand and os.path.exists(cand):
+            return cand
+    return ""
+
+
+def fuse_available() -> bool:
+    return os.path.exists("/dev/fuse") and bool(squashfuse_bin())
+
+
+def loop_available() -> bool:
+    """能不能真正 mount（需要 loop 设备 + 特权）"""
+    if not os.path.exists("/dev/loop-control"):
+        return False
+    try:
+        with open("/proc/filesystems", encoding="utf-8") as fh:
+            return "squashfs" in fh.read()
+    except OSError:
+        return False
+
+
+def runtime_mount_strategy() -> tuple[str, str]:
+    """本机该怎么把 squashfs 镜像变成可用目录：loop / fuse / extract"""
+    if loop_available():
+        return "loop", "/dev/loop-control 与 squashfs 都可用"
+    if fuse_available():
+        return "fuse", "没有 loop，但 /dev/fuse + 自带 squashfuse 可用"
+    return "extract", "既没有 loop 也没有 fuse，只能解压成目录"
+
+
+def fuse_mount_image(image: str, target: str) -> bool:
+    """用 squashfuse 把镜像挂到 target（后台进程，不需要 loop、不需要特权 mount）"""
+    exe = squashfuse_bin()
+    if not exe:
+        return False
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = f"{SQUASHFUSE_DIR}/lib" + (
+        ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    env.setdefault("PATH", "/sbin:/usr/sbin:/bin:/usr/bin")
+    res = run([exe, "-o", "ro", image, target], check=False, capture=True, env=env)
+    if res.returncode != 0:
+        warn(f"squashfuse failed: {((res.stderr or res.stdout) or '')[-200:]}")
+        return False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        with contextlib.suppress(OSError):
+            if os.listdir(target):
+                return True
+        time.sleep(0.2)
+    return os.path.isdir(target)
+
+
+def fuse_unmount(target: str) -> None:
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = f"{SQUASHFUSE_DIR}/lib" + (
+        ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    exe = f"{SQUASHFUSE_DIR}/fusermount3"
+    cands = [([exe, "-u", target], env) if os.path.exists(exe) else None,
+             (["fusermount3", "-u", target], None),
+             (["fusermount", "-u", target], None),
+             (["umount", target], None)]
+    for item in cands:
+        if not item:
+            continue
+        argv, envv = item
+        if run(argv, check=False, capture=True, **({"env": envv} if envv else {})).returncode == 0:
+            return
+
+
 def runtime_materialize(rid: str, quiet: bool = False) -> bool:
     """让 runtimes/<id>/ 成为可用的运行目录：镜像在就挂（或解压），否则假定已是解压目录。
 
@@ -8507,13 +9829,22 @@ def runtime_materialize(rid: str, quiet: bool = False) -> bool:
         warn(f"runtime {rid}: neither {d} nor {img} is usable")
         return False
     if not _is_mounted(d):
-        res = run(["mount", "-t", "squashfs", "-o", "loop,ro", img, d],
-                  check=False, capture=True)
-        if res.returncode == 0:
-            if not quiet:
-                info(f"mounted {os.path.basename(img)} -> {d} (zero-extract)")
-        else:
-            warn("cannot mount squashfs here (no loop devices); extracting instead")
+        strategy, why = runtime_mount_strategy()
+        done = False
+        if strategy == "loop":
+            res = run(["mount", "-t", "squashfs", "-o", "loop,ro", img, d],
+                      check=False, capture=True)
+            done = res.returncode == 0
+            if done and not quiet:
+                info(f"mounted {os.path.basename(img)} -> {d} (零解压，loop)")
+            elif not done:
+                warn(f"loop mount failed ({(res.stderr or '').strip()[:120]}); trying fuse")
+        if not done and fuse_available():
+            done = fuse_mount_image(img, d)
+            if done and not quiet:
+                info(f"mounted {os.path.basename(img)} -> {d}（squashfuse，无 loop）")
+        if not done:
+            warn(f"cannot mount squashfs here ({why}); extracting instead")
             shutil.rmtree(d, ignore_errors=True)
             os.makedirs(d, exist_ok=True)
             ex = run(["unsquashfs", "-q", "-n", "-d", d, img], check=False, capture=True)
@@ -9659,7 +10990,13 @@ def cmd_runtime(args):
         atomic_write(tmpman, json.dumps(man, indent=2, sort_keys=True) + "\n", mode=0o644)
         img = runtime_image(rid)
         info(f"packing {src} -> {img} (zstd)")
-        res = run(["mksquashfs", src, img, "-comp", "zstd", "-noappend", "-quiet"],
+        # 内存保护：mksquashfs 默认按"可见 CPU 数"开线程，每个线程都要缓冲一个块；
+        # 在容器里可见的是**宿主**核数（32/64 很常见）→ 打一个 673MB 的运行时能吃掉几 GB ✗
+        # 实测在客户机上把整个容器的内存打爆过。这里限死并发与内存比例。
+        want = int((load_config() or {}).get("pack_processors") or 2)
+        procs = str(max(1, min(want, os.cpu_count() or 1)))
+        res = run(["mksquashfs", src, img, "-comp", "zstd", "-noappend", "-quiet",
+                   "-processors", procs, "-mem", "25%"],
                   check=False, capture=True)
         if res.returncode != 0:
             warn(f"mksquashfs failed: {(res.stderr or res.stdout or '')[-300:]}")
@@ -10876,11 +12213,33 @@ def cmd_gateway(args):
         return cmd_gateway_install(args)
     if args.action == "reload":
         sync_all(st)
-        res = run(["/usr/sbin/nginx", "-t"], check=False, capture=True)
-        if res.returncode != 0:
-            die(f"nginx config invalid:\n{res.stderr}")
-        run(["/sbin/rc-service", "openresty", "reload"], check=False)
-        info("gateway configuration reloaded")
+        # jail 模式下 nginx 在 rootfs 里，宿主机没有 /usr/sbin/nginx ✗
+        rootfs = ""
+        if str(st["config"].get("gateway_mode") or "jail") == "jail":
+            rootfs = str(gateway_paths().get("rootfs") or "")
+        nginx = f"{rootfs}/usr/sbin/nginx" if rootfs else "/usr/sbin/nginx"
+        if not os.path.exists(nginx):
+            die(f"nginx not found: {nginx}（gateway_mode={st['config'].get('gateway_mode')}）")
+        check = run([nginx, "-t"], check=False, capture=True) if not rootfs \
+            else run(["chroot", rootfs, "/usr/sbin/nginx", "-t"], check=False, capture=True)
+        if check.returncode != 0:
+            die(f"nginx config invalid:\n{check.stderr}")
+        # jail 里的 nginx master 跑在宿主机命名空间里（配置在 /etc/dsh-mu-gateway/nginx.conf），
+        # rootfs 内的 nginx.pid 是空的 ✗ → 直接给 master 发 SIGHUP 才是可靠的 reload ✓
+        master = ""
+        with contextlib.suppress(Exception):
+            out = run(["ps", "-eo", "pid,args"], check=False, capture=True).stdout or ""
+            for line in out.splitlines():
+                if "nginx: master process" in line:
+                    master = line.split()[0]
+                    break
+        if master:
+            run(["kill", "-HUP", master], check=False)
+        elif rootfs:
+            run(["chroot", rootfs, "/usr/sbin/nginx", "-s", "reload"], check=False)
+        else:
+            run(["/sbin/rc-service", "openresty", "reload"], check=False)
+        info(f"gateway configuration reloaded (master {master or 'via rc-service'})")
     elif args.action == "status":
         res = run(["/sbin/rc-service", "openresty", "status"], check=False, capture=True)
         print(((res.stdout or "") + (res.stderr or "")).strip())
@@ -11187,6 +12546,18 @@ def watchdog_scan(heal: bool = True) -> dict:
         if not heal:
             bad.append(svc)
             continue
+        if not watchdog_may_start(svc):
+            # 上一分钟内已经试过、还是失败：先放过，避免 openrc 依赖重算把 CPU 打满 ✗
+            bad.append(svc)
+            continue
+        if svc.startswith("dsh-mu-ext-"):
+            # 扩展的负载是 jail 里的孙进程：openrc 说 stopped 时它可能还活着，
+            # 直接 start 会再起一份，旧的永不退出（实测堆了 197 个）✗
+            _ext = svc[len("dsh-mu-ext-"):]
+            with contextlib.suppress(Exception):
+                _n = ext_reap_cgroup(_ext)
+                if _n:
+                    warn(f"watchdog: {_ext}: 清掉 {_n} 个残留进程后再启动")
         info(f"watchdog: {svc} is not running — starting it")
         with contextlib.suppress(Exception):
             run(["/sbin/rc-service", svc, "zap"], check=False, capture=True)
@@ -11301,42 +12672,64 @@ def watchdog_scan(heal: bool = True) -> dict:
     return {"down": bad, "fixed": fixed, "failed": failed, "misses": misses}
 
 
-def watch_cgroup_events(timeout: float) -> int:
-    """等任意实例的 cgroup.events 变化（内核 poll，毫秒级 ✓），最多 timeout 秒。
+def _cgroup_populated() -> dict[str, str]:
+    """{实例名: populated 值} —— 只读 cgroup.events 的第一行，代价极低"""
+    out = {}
+    base = "/sys/fs/cgroup/dsh-mu"
+    with contextlib.suppress(OSError):
+        for name in os.listdir(base):
+            path = f"{base}/{name}/cgroup.events"
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    for line in fh:
+                        if line.startswith("populated"):
+                            out[name] = line.split()[-1]
+                            break
+            except OSError:
+                continue
+    return out
 
-    以前 watchdog 是"每 60 秒扫一遍"✗ 进程死了最坏要等两个周期（≈140s）才恢复。
-    现在：先挂起在 cgroup.events 上，populated 一变就立刻醒 → 立即扫描 ✓
+
+def watch_cgroup_events(timeout: float) -> int:
+    """等任意实例的 cgroup.events 变化，最多 timeout 秒。
+
+    ⚠ 不要用 select.poll(POLLPRI) 监听 cgroup.events：这个文件在很多内核上
+      **永远是"可读"状态**（POLLPRI 立刻返回），于是 poll 循环变成纯自旋 ——
+      实测 .61 上 watchdog 因此常驻 50% CPU，把整台机器拖垮 ✗
+    改为：0.5 秒一次快照比较（10 个文件读一遍，成本可忽略）。
     """
-    fds = []
-    try:
-        base = "/sys/fs/cgroup/dsh-mu"
-        with contextlib.suppress(OSError):
-            for name in os.listdir(base):
-                path = f"{base}/{name}/cgroup.events"
-                try:
-                    fds.append(os.open(path, os.O_RDONLY))
-                except OSError:
-                    continue
-        if not fds:
-            time.sleep(timeout)
-            return 0
-        poller = select.poll()
-        for fd in fds:
-            poller.register(fd, select.POLLPRI | select.POLLERR)
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            remaining = max(0.05, deadline - time.time())
-            events = poller.poll(remaining * 1000)
-            if events:
-                return len(events)
-        return 0
-    finally:
-        for fd in fds:
-            with contextlib.suppress(OSError):
-                os.close(fd)
+    before = _cgroup_populated()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.5)
+        now = _cgroup_populated()
+        if now != before:
+            changed = sum(1 for k in set(before) | set(now)
+                          if before.get(k) != now.get(k))
+            return max(1, changed)
+    return 0
+
+
+WATCHDOG_STARTED_AT: dict[str, float] = {}
+
+
+def watchdog_may_start(unit: str, min_interval: float = 120.0) -> bool:
+    """同一个 unit 两次"启动尝试"至少间隔 120 秒
+
+    网关配置错误时 `rc-service start` 会每个 tick 都失败并重试，
+    连带 openrc 的依赖缓存刷新 → CPU 被打满 ✗（实测 .61 watchdog 占 15%）
+    """
+    now = time.time()
+    last = WATCHDOG_STARTED_AT.get(unit, 0.0)
+    if now - last < min_interval:
+        return False
+    WATCHDOG_STARTED_AT[unit] = now
+    return True
 
 
 def cmd_watchdog(args):
+    with contextlib.suppress(Exception):
+        reap_duplicate_supervisors("dsh-mu-watchdog")
     ensure_root()
     interval = int(getattr(args, "interval", WATCHDOG_INTERVAL) or WATCHDOG_INTERVAL)
     if getattr(args, "once", False):
@@ -11363,9 +12756,22 @@ def cmd_watchdog(args):
 def cmd_sync(args):
     ensure_root()
     st = load_state()
+    for _pid in migrate_provider_packages():
+        info(f"provider {_pid}: 缺参数不再禁用，改为可选（调用时会提示）")
     sync_all(st)
+    # relay.json / config.json / jail 副本都由 render_gateway 写：
+    # 之前 sync 只重渲染视图，改了套餐/换了 key 之后 relay.json 仍是旧的 ✗
+    # （实测：新建 cloudflare 套餐后 relay.json 里根本没有这个 route）
+    # relay.json 必须在这里写：render_gateway 在 jail 模式下会先去装宿主机 nginx 片段，
+    # 宿主机没有 nginx.conf 时会 die，relay.json 就永远停在旧版本 ✗（实测踩到）
+    relay_note = ""
+    with contextlib.suppress(Exception):
+        path = write_relay_document(st)
+        relay_note = f"；relay.json 已更新（{path}）"
+        with contextlib.suppress(Exception):
+            sync_gateway_etc()
     reload_gateway_if_stale()
-    info("gateway views and instance configs re-rendered")
+    info("gateway views and instance configs re-rendered" + relay_note)
 
 
 # ------------------------------------------------------------------- log files
@@ -12681,6 +14087,13 @@ def validate_provider_package(doc) -> tuple[dict, list[str]]:
         normalised["params"] = params
     if needs:
         normalised["needs_params"] = needs
+    # 这两个字段必须保留：界面要能再次编辑已填过的可选参数（如 account_id）✗
+    declared = [str(x) for x in (doc.get("declared_params") or []) if str(x).strip()]
+    optional = [str(x) for x in (doc.get("optional_params") or []) if str(x).strip()]
+    if declared:
+        normalised["declared_params"] = declared
+    if optional:
+        normalised["optional_params"] = optional
     if discover:
         normalised["discover"] = discover
     if usage:
@@ -13199,18 +14612,35 @@ def relay_document(st: dict) -> dict:
     return {"version": 1, "placeholder": RELAY_PLACEHOLDER, "tokens": tokens}
 
 
-def write_relay_document(st: dict) -> str:
-    path = f"{GW_DIR}/relay.json"
-    group = nginx_group() if os.geteuid() == 0 else None
-    doc = relay_document(st)
-    atomic_write(path, json.dumps(doc, sort_keys=True) + "\n", mode=0o640, group=group)
-    # 双写：relay.json 仍是**唯一生效来源**（网关只读它），库只是镜像 + 归集维度。
-    # 这里任何失败都只 WARN，绝不能让"写凭据"因为库的问题失败。
+RELAY_FILE_RETIRED = True
+
+
+def sync_credentials(st: dict) -> None:
+    """把凭据同步进库（**唯一权威**）。网关通过 RESP 8098 查它 ✓
+
+    relay.json 已退役：文件 + 库双源会产生"文件旧了但没人知道"这类问题
+    （实测：新建套餐后网关读旧文件 → 实例报 API 密钥无效 ✗）
+    现在只有一条链路：state → state.db → 网关查询。
+    """
     try:
         sync_tokens_to_db(st)
-    except Exception as exc:  # noqa: BLE001 - never break credential writes
-        warn(f"state db mirror skipped: {exc}")
-    return path
+    except Exception as exc:  # noqa: BLE001 - 绝不因为库的问题让运维动作失败
+        warn(f"credential db sync failed: {exc}")
+    # 清掉历史遗留文件（如果还在）。网关已经不读它了，留着只会误导排查 ✗
+    stale = f"{GW_DIR}/relay.json"
+    if os.path.exists(stale):
+        with contextlib.suppress(OSError):
+            os.unlink(stale)
+            info(f"已删除历史文件 {stale}（凭据现在只存库）")
+
+
+def write_relay_document(st: dict) -> str:
+    """历史接口：只做库同步；不再写文件。
+
+    `dsh-muctl relay export` 才写文件（灾难恢复/离线排障用）。
+    """
+    sync_credentials(st)
+    return ""
 
 
 # ---------------------------------------------------------------- state DB
@@ -13530,8 +14960,29 @@ def reap_aborted_usage(older_than: int = 600, db=None) -> int:
             db.close()
 
 
+def resp_ping(port: int = 8098, timeout: float = 2.0) -> bool:
+    """RESP 凭据服务是否可达（网关现在只从它取凭据 → 挂了模型全断 ✗）"""
+    import socket as _socket
+    try:
+        with _socket.create_connection(("127.0.0.1", int(port)), timeout=timeout) as sock:
+            sock.sendall(b"*1\r\n$4\r\nPING\r\n")
+            return b"PONG" in sock.recv(64)
+    except OSError:
+        return False
+
+
 def cmd_relay(args) -> int:
     st = load_state()
+    if args.action == "ping":
+        print("PONG" if resp_ping() else "NO RESP (127.0.0.1:8098 不可达)")
+        return 0 if resp_ping() else 1
+    if args.action == "export":
+        # 灾难恢复/离线排障用：把库里的凭据导成一份文件（网关默认不读它）
+        doc = relay_document(st)
+        path = getattr(args, "out", None) or f"{GW_DIR}/relay.json.export"
+        atomic_write(path, json.dumps(doc, sort_keys=True) + "\n", mode=0o600)
+        info(f"exported {len(doc.get('tokens') or {})} token(s) → {path}")
+        return 0
     if args.action == "import":
         counts = sync_tokens_to_db(st)
         info(f"imported: {counts}")
@@ -14320,6 +15771,81 @@ BUNDLED_PLUGINS_DIR = f"{LIB}/plugins"
 BUNDLED_PLUGINS_JAIL = "/opt/dsh-mu-plugins"
 
 
+def prune_bundled_plugins(st: dict, name: str) -> list[str]:
+    """把"平台已经不再随包发布"的客户端插件从实例 profile 里清掉。
+
+    卸载扩展时最容易留下的尾巴：扩展目录删了，但实例 profile 的
+    bundles/dependencies/node_modules 里还挂着它的客户端插件 ✗
+    （页面照旧加载 → 报错、或者残留一个已失效的入口）
+    """
+    changed: list[str] = []
+    shipped = set()
+    with contextlib.suppress(OSError):
+        for entry in os.listdir(BUNDLED_PLUGINS_DIR):
+            src = f"{BUNDLED_PLUGINS_DIR}/{entry}"
+            if not os.path.isdir(src):
+                continue
+            with contextlib.suppress(ValueError):
+                meta = json.loads(read_text(f"{src}/package.json") or "{}")
+            if meta.get("name"):
+                shipped.add(str(meta["name"]))
+    # 只清"平台曾经随包发布过"的插件名；扩展提供的插件（如 @dsh-mu/dsh-ssh）
+    # 不归这里管，按前缀一刀切会把它们误删 ✗（实测踩过）
+    recorded = set()
+    with contextlib.suppress(Exception):
+        recorded = set((st.get("config") or {}).get("bundled_plugins_recorded") or [])
+    if not recorded:
+        return changed
+    ext_provided = set()
+    with contextlib.suppress(Exception):
+        for row in (st.get(PLUGIN_ASSET_KEY) or {}).values():
+            if str(row.get("source")) == "apk" and row.get("name"):
+                ext_provided.add(str(row["name"]))
+    candidates = (recorded - shipped) - ext_provided
+    home = instance_home(name)
+    profile = instance_profile(name)
+    prof_dir = f"{home}/.dsh/profiles/{profile}"
+    pkg_path = f"{prof_dir}/package.json"
+    doc = {}
+    with contextlib.suppress(ValueError):
+        doc = json.loads(read_text(pkg_path) or "{}")
+    if not doc:
+        return changed
+    profile_cfg = (doc.get("dsh") or {}).get("profile") or {}
+    bundles = list(profile_cfg.get("bundles") or [])
+    deps = dict(doc.get("dependencies") or {})
+    keep = []
+    for bundle in bundles:
+        if bundle in candidates:
+            changed.append(f"{bundle}: 已从 bundles 移除（平台不再发布）")
+            with contextlib.suppress(OSError):
+                shutil.rmtree(f"{prof_dir}/node_modules/{bundle}")
+            continue
+        keep.append(bundle)
+    for dep in list(deps):
+        if dep in candidates:
+            deps.pop(dep, None)
+            changed.append(f"{dep}: 已从 dependencies 移除")
+    with contextlib.suppress(Exception):
+        shipped_now = set()
+        for entry in os.listdir(BUNDLED_PLUGINS_DIR):
+            src = f"{BUNDLED_PLUGINS_DIR}/{entry}"
+            with contextlib.suppress(ValueError):
+                meta = json.loads(read_text(f"{src}/package.json") or "{}")
+                if meta.get("name"):
+                    shipped_now.add(str(meta["name"]))
+        if shipped_now and shipped_now != recorded:
+            st.setdefault("config", {})["bundled_plugins_recorded"] = sorted(shipped_now)
+            save_state(st)
+    if not changed:
+        return changed
+    profile_cfg["bundles"] = keep
+    doc["dsh"] = dict(doc.get("dsh") or {}, profile=profile_cfg)
+    doc["dependencies"] = deps
+    atomic_write(pkg_path, json.dumps(doc, ensure_ascii=False, indent=2) + "\n", mode=0o644)
+    return changed
+
+
 def ensure_bundled_plugins(st: dict, name: str) -> list[str]:
     """Install the client plugins this apk ships into one instance's profile.
 
@@ -14330,7 +15856,8 @@ def ensure_bundled_plugins(st: dict, name: str) -> list[str]:
     """
     changed: list[str] = []
     if not os.path.isdir(BUNDLED_PLUGINS_DIR):
-        return changed
+        return prune_bundled_plugins(st, name)
+    changed.extend(prune_bundled_plugins(st, name))
     home = instance_home(name)
     profile = instance_profile(name)
     prof_dir = f"{home}/.dsh/profiles/{profile}"
@@ -14354,6 +15881,7 @@ def ensure_bundled_plugins(st: dict, name: str) -> list[str]:
     inst = st["instances"].get(name) or {}
     uid = int(inst.get("uid", 0))
 
+    recorded = set((st.get("config") or {}).get("bundled_plugins_recorded") or [])
     for plugin in sorted(os.listdir(BUNDLED_PLUGINS_DIR)):
         src = f"{BUNDLED_PLUGINS_DIR}/{plugin}"
         if not os.path.isdir(src):
@@ -15794,6 +17322,15 @@ def cmd_selftest_unit(args):
     check("有 key 的 provider → set", plan_key_state("mu-deepseek", True, {"kilo"}) == "set")
     check("没 key 且非免费 → missing", plan_key_state("mu-deepseek", False, {"kilo"}) == "missing")
 
+    print("── 模型限额（contextWindow / maxTokens）")
+    ctx, mx = sane_limits(1048576, 1048576)
+    check("maxTokens 等于窗口时会被压低", mx < ctx)
+    check("压低后仍 >= 1024", mx >= 1024)
+    ctx2, mx2 = sane_limits(1310720, 1048576)
+    check("窗口足够大时保留原 maxTokens", (ctx2, mx2) == (1310720, 1048576))
+    ctx3, mx3 = sane_limits(None, None)
+    check("缺省值仍然自洽", mx3 < ctx3)
+
     print("── 平台服务判活")
     dead = service_cell("dsh-mu-nosuch-unit", 1)
     check("不存在的服务判为 dead", dead["state"] == "dead")
@@ -16201,6 +17738,14 @@ DOCTOR_HUMAN: dict[str, tuple[str, str, str]] = {
     "instance supervision": ("实例守护（崩溃后会自动拉起）", "suggestion",
                              "dsh-muctl instance restart <实例名>"),
     "admin code": ("后台是否在跑旧代码", "blocking", "dsh-muctl sync"),
+    "relay credentials": ("凭据服务（RESP 8098）", "blocking", "dsh-muctl sync"),
+    "relay freshness": ("网关凭据表是否最新", "blocking", "dsh-muctl sync"),
+    "provider catalog": ("模型目录来源与新鲜度", "suggestion", "dsh-muctl catalog refresh"),
+    "state lock": ("状态锁争用", "suggestion", "dsh-muctl doctor"),
+    "runtime mount": ("运行时挂载方式", "suggestion", "dsh-muctl runtime-mount-test"),
+    "sites": ("站点（外挂 HTTP 服务）", "suggestion", "dsh-muctl site list"),
+    "jail tmp": ("jail 临时脚本残留", "suggestion", "rm -f /tmp/dsh-mu-jail.*"),
+    "ext processes": ("扩展进程数", "blocking", "dsh-muctl ext restart <name>"),
     "supervisors": ("重复的守护进程", "info", "dsh-muctl instance reap-supervisors"),
     "cell view": ("状态记录不一致（服务其实正常）", "info",
                   "可忽略；想清零就 dsh-muctl instance restart <实例名>"),
@@ -16634,11 +18179,11 @@ def doctor_checks(st: dict) -> list[dict]:
             add(f"ext {name}", DOCTOR_FAIL,
                 f"{manifest.get('version')} installed but the appliance is {state_txt}",
                 f"dsh-muctl ext reload   # recreates the jail conf and restarts it")
-        elif str(((manifest.get("admin") or {}).get("socket") or "")).strip() and \
-                socket_probe(ext_socket_path(name, "admin")) not in ("ok", "n/a"):
+        elif _admin_sock(name, manifest) and \
+                socket_probe(_admin_sock(name, manifest)) not in ("ok", "n/a"):
             add(f"ext {name}", DOCTOR_FAIL,
-                f"admin socket {ext_socket_path(name, 'admin')} is "
-                f"{socket_probe(ext_socket_path(name, 'admin'))} -- /ext/{name}/ cannot work",
+                f"admin socket {_admin_sock(name, manifest)} is "
+                f"{socket_probe(_admin_sock(name, manifest))} -- /ext/{name}/ cannot work",
                 f"dsh-muctl ext restart {name}   (and check ext logs {name})")
         elif str(((manifest.get("service") or {}).get("socket") or "")).strip() \
                 and not os.path.exists(ext_socket_path(name, "api")):
@@ -16744,47 +18289,38 @@ def doctor_checks(st: dict) -> list[dict]:
 
     if relay_enabled(cfg):
         port = int(cfg.get("relay_listen", 8099) or 8099)
-        doc_ok = os.path.exists(f"{GW_DIR}/relay.json")
         sock = socket.socket()
         sock.settimeout(1.5)
         alive = sock.connect_ex(("127.0.0.1", port)) == 0
         sock.close()
-        if doc_ok and alive:
+        creds_ok = resp_ping()
+        if alive and creds_ok:
             add("model relay", DOCTOR_PASS,
-                f"127.0.0.1:{port} (keys are injected in the gateway; "
-                f"instances hold `{RELAY_PLACEHOLDER}`)")
+                f"127.0.0.1:{port} 在听；凭据来自库（RESP 8098），"
+                f"实例里只有 `{RELAY_PLACEHOLDER}`")
         else:
             add("model relay", DOCTOR_WARN,
-                f"relay.json={doc_ok} listening={alive} port={port}",
-                "dsh-muctl sync && dsh-muctl gateway restart   "
-                "# or set RELAY_ENABLED=false to go direct")
+                f"relay 端口={alive} 凭据服务={creds_ok}（port {port}）",
+                "dsh-muctl sync  # 会拉起后台并补齐库里的凭据")
 
     if relay_enabled(cfg):
-        # The patch, the state and the jail's relay.json must agree on the token;
-        # a mismatch shows up as a blanket 403 ("API 密钥无效") in every conversation.
-        doc_path = f"{GW_DIR}/relay.json"
+        # 凭据现在只在库里（relay.json 已退役）→ 这里只需要确认"实例 patch 里的 token
+        # 与 state 里记录的一致"；库里的那份由 relay credentials 那条检查负责 ✓
         mismatched = []
-        try:
-            doc = json.loads(read_text(doc_path) or "{}")
-            by_instance = {str(v.get("instance")): k for k, v in (doc.get("tokens") or {}).items()}
-            for inst_name, inst in (st.get("instances") or {}).items():
-                want = str(inst.get("relay_token") or "")
-                if not want:
-                    continue
-                patch = f"{INSTANCES_DIR}/{inst_name}/home/.dsh-mu-provider.yml"
-                text = read_text(patch) or ""
-                in_patch = re.findall(r"/mu-llm/([0-9a-f]{32})/", text)
-                if in_patch and set(in_patch) != {want}:
-                    mismatched.append(f"{inst_name}: patch")
-                if by_instance.get(inst_name) != want:
-                    mismatched.append(f"{inst_name}: relay.json")
-        except (OSError, ValueError):
-            mismatched.append("relay.json unreadable")
+        for inst_name, inst in (st.get("instances") or {}).items():
+            want = str(inst.get("relay_token") or "")
+            if not want:
+                continue
+            patch = f"{INSTANCES_DIR}/{inst_name}/home/.dsh-mu-provider.yml"
+            text = read_text(patch) or ""
+            in_patch = re.findall(r"/mu-llm/([0-9a-f]{32})/", text)
+            if in_patch and set(in_patch) != {want}:
+                mismatched.append(f"{inst_name}: patch≠state")
         if mismatched:
             add("relay tokens", DOCTOR_FAIL, ", ".join(sorted(set(mismatched))),
-                "dsh-muctl plan sync   # re-renders the patch and relay.json from state")
+                "dsh-muctl plan sync   # 用 state 里的 token 重渲染 patch")
         else:
-            add("relay tokens", DOCTOR_PASS, "patch / state / relay.json agree")
+            add("relay tokens", DOCTOR_PASS, "patch 与 state 里的实例 token 一致")
 
     current_dsh = installed_dsh_version()
     want = str(cfg.get("dsh_version") or "latest")
@@ -17350,6 +18886,144 @@ def doctor_checks(st: dict) -> list[dict]:
         else:
             add("nginx temp dirs", DOCTOR_PASS, f"{NGINX_TEMP_ROOT} inside the gateway jail")
 
+    # 扩展 cgroup 里的进程数（>5 基本可以确定是重复启动留下的孤儿）
+    fat_ext = []
+    for ext_name in sorted(ext_registered()):
+        _conf = {}
+        with contextlib.suppress(Exception):
+            _conf = json.loads(read_text(f"{EXT_CONF}/{ext_name}.json") or "{}")
+        if str(((_conf.get("service") or {}).get("kind")) or "jail") == "system":
+            continue        # 系统级扩展的进程不在 dsh-mu-ext/* cgroup 里
+        cg = f"{EXT_CGROUP_PARENT}/{ext_name}/cgroup.procs"
+        with contextlib.suppress(OSError):
+            pids = [x for x in (read_text(cg) or "").split() if x.isdigit()]
+            if len(pids) > 5:
+                fat_ext.append(f"{ext_name}={len(pids)}")
+    if fat_ext:
+        add("ext processes", DOCTOR_WARN,
+            "扩展进程数异常（可能是重复启动留下的孤儿）：" + ", ".join(fat_ext),
+            "dsh-muctl ext restart <name>   # 会先 cgroup.kill 再起一个")
+
+    # jail 临时脚本泄漏（老版本被 kill -9 时 trap 不执行 → /tmp 里堆文件）
+    stale_jail = glob.glob("/tmp/dsh-mu-jail.*")
+    if len(stale_jail) > 50:
+        add("jail tmp", DOCTOR_WARN,
+            f"/tmp 下有 {len(stale_jail)} 个遗留的 dsh-mu-jail.* 临时脚本"
+            f"（新版本会自己清理，历史遗留可直接删）",
+            "rm -f /tmp/dsh-mu-jail.*   # 进程都没在跑时才安全")
+
+    # 站点（docs/27）：入口合法、启用、上游 socket 是否在
+    sites = st.get("sites") or {}
+    if sites:
+        bad = []
+        for name, row in sorted(sites.items()):
+            path = str(((row.get("entry") or {}).get("path")) or "")
+            reason = site_entry_valid(path) if path else "没有入口"
+            if reason:
+                bad.append(f"{name}: 入口非法（{reason}）")
+            elif not row.get("enabled"):
+                bad.append(f"{name}: 已停用")
+            elif (row.get("kind") or "") == "nginx":
+                if not row.get("approved"):
+                    bad.append(f"{name}: nginx 型站点待批准（dsh-muctl site approve {name}）")
+            elif (row.get("kind") or "socket") not in ("dav",) and not os.path.exists(site_socket_path(name)):
+                bad.append(f"{name}: 上游 socket 缺失")
+        with contextlib.suppress(Exception):
+            toks = [r for r in site_token_list() if not r["revoked_at"]]
+            if toks:
+                idle = [r for r in toks if r["last_used_at"]
+                        and time.time() - r["last_used_at"] > 30 * 86400]
+                if idle:
+                    bad.append(f"{len(idle)} 个令牌超过 30 天未使用")
+        add("sites", DOCTOR_WARN if bad else DOCTOR_PASS,
+            f"{len(sites)} 个站点" + ("；" + "；".join(bad) if bad else "，入口与上游均正常"),
+            "dsh-muctl site list  # 看入口/上游/启停" if bad else "")
+
+    # 运行时挂载方式（非特权容器只能靠 fuse；这条让客户机一眼看到）
+    strat, strat_why = runtime_mount_strategy()
+    label = {"loop": "loop 直挂（零解压）", "fuse": "squashfuse（无 loop，走 /dev/fuse）",
+             "extract": "解压成目录（无 loop 也无 fuse）"}.get(strat, strat)
+    add("runtime mount", DOCTOR_PASS if strat != "extract" else DOCTOR_WARN,
+        f"{label} — {strat_why}",
+        "" if strat != "extract" else
+        "给容器开 /dev/fuse（PVE：选项→功能→FUSE；或 privileged），否则每次升级运行时都要解压")
+
+    # state 锁争用（save_state 改为无锁后，只有"读-改-写"才会争；这里看最近一次记录）
+    with contextlib.suppress(ValueError, OSError):
+        stats = json.loads(read_text(LOCK_STATS) or "{}")
+        wait_s = float(stats.get("wait_s") or 0)
+        hold_s = float(stats.get("hold_s") or 0)
+        when = str(stats.get("at_iso") or "")
+        age_h = 0.0
+        with contextlib.suppress(ValueError, TypeError):
+            age_h = (time.time() - float(stats.get("at") or 0)) / 3600
+        recent = age_h < 1.0
+        if (wait_s >= 5.0 or hold_s >= 10.0) and recent:
+            add("state lock", DOCTOR_WARN,
+                f"最近一次状态锁：等待 {wait_s:.1f}s / 持有 {hold_s:.1f}s（{when}）"
+                + (f"，持锁者 {stats.get('holder')}" if stats.get("holder") else "")
+                + " —— 有长操作在读-改-写里",
+                "dsh-muctl instance restart-stale --status  # 看是否批量操作在跑")
+        else:
+            add("state lock", DOCTOR_PASS,
+                f"最近一次状态锁：等待 {wait_s:.1f}s / 持有 {hold_s:.1f}s" if when
+                else "没有 >2s 的锁争用记录")
+
+    # provider 目录来源（今天踩到：用了 11-02 的旧缓存却没人知道 ✗）
+    cmeta = catalog_meta()
+    if not cmeta:
+        add("provider catalog", DOCTOR_FAIL, "没有可用的 provider 目录（模型接入会缺清单）",
+            "dsh-muctl sync")
+    else:
+        gen = str(cmeta.get("generated_at") or "")
+        age_days = 0
+        with contextlib.suppress(ValueError):
+            gen_epoch = time.mktime(time.strptime(gen[:19], "%Y-%m-%dT%H:%M:%S"))
+            age_days = int((time.time() - gen_epoch) / 86400)
+        stale = age_days > 90
+        add("provider catalog", DOCTOR_WARN if stale else DOCTOR_PASS,
+            f"{cmeta['providers']} 个 provider / {cmeta['models']} 个模型，"
+            f"来源 {cmeta['source']}"
+            + (f"，生成于 {gen[:10]}（已 {age_days} 天）" if gen else ""),
+            "dsh-muctl catalog refresh --from-runtime <最新运行时>" if stale else "")
+
+    # 凭据服务（RESP 8098）—— 现在是网关取凭据的**唯一**来源
+    if not resp_ping():
+        add("relay credentials", DOCTOR_FAIL,
+            "凭据服务 127.0.0.1:8098 不可达 —— 网关无法解析套餐凭据，模型请求会 503",
+            "dsh-muctl sync  # 会尝试拉起后台；仍失败看 /var/log/dsh-mu/admin.err.log")
+    else:
+        n_tokens = 0
+        with contextlib.suppress(Exception):
+            db = state_db_connect()
+            try:
+                n_tokens = db.execute("SELECT COUNT(*) c FROM tokens").fetchone()["c"]
+            finally:
+                db.close()
+        want = len([1 for i in (st.get("instances") or {}).values() if i.get("relay_token")])
+        add("relay credentials", DOCTOR_PASS if n_tokens >= want else DOCTOR_WARN,
+            f"凭据服务可达；库里 {n_tokens} 个 token（应有 {want} 个）"
+            + ("" if n_tokens >= want else " —— 执行 sync 补齐"),
+            "dsh-muctl sync" if n_tokens < want else "")
+
+    # relay 新鲜度：relay.json 里必须已经包含最新的套餐（换 key/建套餐后忘了 sync 会漏 ✗）
+    # relay.json 已退役：网关只查库，所以这条检查改成"确认历史文件不存在"✓
+    relay_path = f"{ETC}/gateway/relay.json"
+    newest_plan = 0.0
+    with contextlib.suppress(OSError):
+        for entry in os.listdir(PLANS_DIR):
+            if entry.endswith((".json", ".key")):
+                newest_plan = max(newest_plan, os.path.getmtime(f"{PLANS_DIR}/{entry}"))
+    relay_mtime = 0.0
+    with contextlib.suppress(OSError):
+        relay_mtime = os.path.getmtime(relay_path)
+    # relay.json 已退役（凭据只在库里）。这里改成"确认历史文件不存在"，
+    # 它若还在，说明有人手工放回了旧文件 → 会误导排查 ✗
+    add("relay freshness", DOCTOR_WARN if relay_mtime else DOCTOR_PASS,
+        (f"发现历史文件 {relay_path}（网关已不读它，建议删除）")
+        if relay_mtime else "凭据只存库（历史 relay.json 已清理）",
+        "rm -f /etc/dsh-mu/gateway/relay.json" if relay_mtime else "")
+
     # ③ 后台是否在跑旧代码（今天两次踩到：旧 python 占着 8787，新接口 404 ✗）
     a_port = admin_port()
     a_stale = admin_code_stale(a_port)
@@ -17878,6 +19552,33 @@ def build_parser() -> argparse.ArgumentParser:
                     help="after a successful upgrade, restart the instances whose files changed")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_upgrade)
+    sp = sub.add_parser("runtime-mount-test", help="诊断：本机把 squashfs 变成目录的方式")
+    sp.add_argument("image", nargs="?", help="一个 .squashfs；不给则只报告策略")
+    sp.set_defaults(func=cmd_runtime_mount_test)
+    sp = sub.add_parser("site", help="sites: external HTTP services behind the gateway (docs/27)")
+    sp.add_argument("action", nargs="?", default="list",
+                    choices=["list", "status", "sync", "set", "enable", "disable",
+                             "approve", "token", "prune"])
+    sp.add_argument("name", nargs="?", default="")
+    sp.add_argument("--path", help="entry path prefix (e.g. /files/)")
+    sp.add_argument("--host", help="entry host (e.g. files.corp.example)")
+    sp.add_argument("token_action", nargs="?", default="",
+                    choices=["", "create", "list", "revoke", "rotate"],
+                    help="with `site <name> token`: create/list/revoke/rotate")
+    sp.add_argument("--subject", help="令牌绑定的身份（user:alice / ext:a@corp / svc:backup）")
+    sp.add_argument("--tenant", help="令牌绑定的租户（实例名）")
+    sp.add_argument("--label", help="令牌备注（例如 windows-laptop）")
+    sp.add_argument("--readonly", action="store_true", help="只读令牌（scope=ro）")
+    sp.add_argument("--days", type=int, default=30, help="有效期（天）")
+    sp.add_argument("--id", dest="token_id", help="令牌 id（revoke/rotate）")
+    sp.set_defaults(func=cmd_site)
+    sp = sub.add_parser("catalog", help="provider catalog (platform snapshot; optional runtime refresh)")
+    csub = sp.add_subparsers(dest="action", required=True)
+    csub.add_parser("show", help="show the active catalog source/version").set_defaults(func=cmd_catalog)
+    c_ref = csub.add_parser("refresh", help="refresh from the newest runtime or a data dir")
+    c_ref.add_argument("--from-runtime", help="runtime id under /var/lib/dsh-mu/runtimes")
+    c_ref.add_argument("--from-dir", help="a pi-ai providers/data directory")
+    c_ref.set_defaults(func=cmd_catalog)
     sp = sub.add_parser("cell", help="cgroup-authoritative instance state (P2-1 phase 1, read-only)")
     csub = sp.add_subparsers(dest="cell_action", required=True)
     c_list = csub.add_parser("list", help="all instances")
@@ -17905,12 +19606,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_sync_state)
     sp = sub.add_parser("relay", help="state DB mirror of relay credentials (read-only for now)")
     sp.add_argument("action", nargs="?", default="status",
-                    choices=["status", "tokens", "routes", "credential", "import", "usage"])
+                    choices=["status", "tokens", "routes", "credential", "import", "usage",
+                             "export", "ping"])
     sp.add_argument("provider", nargs="?", default="", help="provider id (for `credential`)")
     sp.add_argument("--view", default="recent",
                     choices=["recent", "today", "users", "models", "series"],
                     help="usage 视图（配合 action=usage）")
     sp.add_argument("--days", type=int, default=7, help="usage 视图的时间窗口（天）")
+    sp.add_argument("--out", help="with `export`: output path")
     sp.set_defaults(func=cmd_relay)
     sp = sub.add_parser("instance-repair",
                         help="restore an instance's built-in profile bundles "

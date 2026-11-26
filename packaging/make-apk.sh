@@ -102,6 +102,8 @@ build_unsigned() {
 
 	install_file 0755 "$SRC/cli/dsh-muctl"           /usr/local/sbin/dsh-muctl
 	install_file 0755 "$SRC/jail/dsh-mu-jail"        /usr/local/sbin/dsh-mu-jail
+	install_file 0755 "$SRC/jail/dsh-mu-gateway-run" /usr/local/lib/dsh-mu/gateway-run.sh
+	install_file 0755 "$SRC/jail/smbd-run.sh"        /usr/local/lib/dsh-mu/smbd-run.sh
 	install_file 0644 "$SRC/jail/dsh-mu-probe.js"    /usr/local/lib/dsh-mu/probe/dsh-mu-probe.js
 	install_file 0755 "$SRC/jail/dsh-mu-cgroup-init" /usr/local/sbin/dsh-mu-cgroup-init
 	install_file 0755 "$SRC/admin/dsh-mud"           /usr/local/sbin/dsh-mud
@@ -113,6 +115,21 @@ build_unsigned() {
 	for f in "$SRC"/gateway/dsh-mu-*.conf; do
 		install_file 0644 "$f" "/usr/local/lib/dsh-mu/nginx/$(basename "$f")"
 	done
+	# 随包的 squashfuse（非特权容器里挂 squashfs 的唯一办法，约 1.7 MB）
+	if [ -x "$SRC/vendor/squashfuse/squashfuse" ]; then
+		install_file 0755 "$SRC/vendor/squashfuse/squashfuse" \
+			/usr/local/lib/dsh-mu/vendor/squashfuse/squashfuse
+		[ -x "$SRC/vendor/squashfuse/fusermount3" ] && install_file 0755 \
+			"$SRC/vendor/squashfuse/fusermount3" \
+			/usr/local/lib/dsh-mu/vendor/squashfuse/fusermount3
+		for lib in "$SRC"/vendor/squashfuse/lib/*; do
+			[ -f "$lib" ] && install_file 0644 "$lib" \
+				"/usr/local/lib/dsh-mu/vendor/squashfuse/lib/$(basename "$lib")"
+		done
+	fi
+	# 平台自带的 provider 目录快照（唯一权威来源；运行时只作为可选更新源）
+	install_file 0644 "$SRC/provider-catalog/catalog.json" \
+		/usr/local/lib/dsh-mu/provider-catalog/catalog.json
 	install_file 0644 "$SRC/admin/index.html" /usr/local/lib/dsh-mu/admin/index.html
 	# cockpit 的样式与字体（页面确认过的外观；后端按扩展名白名单静态服务）
 	for f in "$SRC"/admin/*.css; do

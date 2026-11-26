@@ -1,0 +1,19 @@
+#!/bin/sh
+# 网关启动包装器（在 jail 内执行）
+#
+# 为什么需要它：nginx-kind 站点的 server{} 监听
+#   /run/dsh-mu/sites/<site>/nginx.sock
+# 如果上一次 nginx 异常退出，socket 文件会留下，新进程 bind 报 EADDRINUSE，
+# 而 supervise-daemon 每 5 秒重试一次 → 无限崩溃循环，整站 000 ✗
+# 这里在 exec nginx 之前把残留 socket 清掉（我们就是唯一的绑定者）。
+set -e
+for sock in /run/dsh-mu/sites/*/*.sock; do
+    [ -S "$sock" ] || continue
+    rm -f "$sock" 2>/dev/null || true
+done
+# 临时目录必须可写且属主为 root（jail 里没有 CAP_CHOWN，nginx 的 chown 会 EPERM）
+for d in /var/tmp/nginx /var/tmp/nginx/*; do
+    [ -d "$d" ] || continue
+    chmod 1777 "$d" 2>/dev/null || true
+done
+exec /usr/sbin/nginx "$@"

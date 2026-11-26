@@ -210,6 +210,16 @@ if action == "plan-add" or action == "plan-rename" or action == "plan-delete"
 	return json(200, result)
 end
 
+if action == "webdav-token" then
+	-- 客户端插件：给"自己"签一张短期 WebDAV 令牌（只能访问自己的实例）
+	local result, err, status = mu.internal_post("/me/webdav-token", name,
+		{ site = payload.site or "files" })
+	if not result then
+		return json(status or 502, { error = err or "token request failed" })
+	end
+	return json(200, result)
+end
+
 if action == "password" then
 	if mu.is_system_admin(name) then
 		return json(400, {

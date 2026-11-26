@@ -160,3 +160,19 @@ CREATE TABLE IF NOT EXISTS prices (
   effective_from INTEGER NOT NULL DEFAULT 0,
   note         TEXT
 );
+
+-- 站点的委托凭证（docs/27 §6）：令牌只绑定 subject/tenant/scope，不依赖 users 表
+CREATE TABLE IF NOT EXISTS site_tokens (
+  id           TEXT PRIMARY KEY,
+  site         TEXT NOT NULL,
+  subject      TEXT NOT NULL,
+  tenant       TEXT NOT NULL DEFAULT '',
+  scope        TEXT NOT NULL DEFAULT 'rw',
+  hash         TEXT NOT NULL UNIQUE,
+  label        TEXT NOT NULL DEFAULT '',
+  created_at   INTEGER NOT NULL,
+  last_used_at INTEGER NOT NULL DEFAULT 0,
+  last_used_ip TEXT NOT NULL DEFAULT '',
+  revoked_at   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_site_tokens_site ON site_tokens(site, subject);

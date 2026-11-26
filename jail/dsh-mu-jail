@@ -96,7 +96,21 @@ setup_cgroup() {
 }
 
 # --------------------------------------------------------------- inner script
-INNER="${TMPDIR:-/tmp}/dsh-mu-jail.$$"
+# 临时脚本放 /run（tmpfs，重启自动清空），而不是 /tmp。
+# 历史问题：进程被 cgroup.kill / kill -9 杀掉时 trap 不会执行 → /tmp 里留下
+#   /tmp/dsh-mu-jail.<pid>，实测累积到 8 万个文件（吃 inode/dentry 内存 ✗）。
+# 这里同时做一次"遗留清理"：把 /tmp 下旧命名、且对应 pid 已死的文件删掉。
+JAIL_TMP="${TMPDIR:-/tmp}"
+for stale in "$JAIL_TMP"/dsh-mu-jail.*; do
+	[ -e "$stale" ] || continue
+	pid=${stale##*.}
+	case "$pid" in
+	'' | *[!0-9]*) rm -f "$stale" 2>/dev/null || true; continue ;;
+	esac
+	[ -d "/proc/$pid" ] || rm -f "$stale" 2>/dev/null || true
+done
+mkdir -p /run/dsh-mu/jail 2>/dev/null || true
+INNER="/run/dsh-mu/jail/${NAME}.$$"
 trap 'rm -f "$INNER"' EXIT INT TERM
 
 cat > "$INNER" <<'INNER_EOF'

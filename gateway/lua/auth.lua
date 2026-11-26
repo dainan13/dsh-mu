@@ -218,11 +218,16 @@ local function try_start(inst_name, port, reason, actor)
 	local key = "ensure:" .. inst_name
 	if not d:get(key) then
 		d:set(key, 1, 10)
-		local result, err = mu.internal_post("/instances/" .. inst_name .. "/ensure", actor)
+		local result, err, status = mu.internal_post("/instances/" .. inst_name .. "/ensure", actor)
 		if not result then
-			ngx.log(ngx.WARN, "dshmu: auto-start of ", inst_name, " failed: ", tostring(err))
-			-- The start request itself failed (bad config, missing rootfs, ...). Retrying on
-			-- a timer will not fix that, so show the failure instead of an endless spinner.
+			ngx.log(ngx.WARN, "dshmu: auto-start of ", inst_name, " returned: ", tostring(err),
+				" (status ", tostring(status), ")")
+			-- 502/503/504 说明"请求没走通"（后端忙、正在重启、实例还在冷启动），
+			-- 这**不是**启动失败 ✗ → 继续给等待页，让浏览器 3 秒后再试 ✓
+			-- 只有真正的 4xx（配置错、实例不存在）才显示失败页。
+			if status == 502 or status == 503 or status == 504 or status == nil then
+				return wait_page(inst_name, port, "启动请求已发出（后端忙或正在启动），稍后自动重试")
+			end
 			return fail_page(inst_name, port, tostring(err))
 		end
 		ngx.log(ngx.NOTICE, "dshmu: auto-start requested for ", inst_name,

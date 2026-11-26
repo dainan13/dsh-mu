@@ -54,6 +54,18 @@ _os.environ.setdefault("DSH_MU_NO_SELF_RESTART", "1")
 RESP_PORT = int(os.environ.get("DSH_MU_RESP_PORT") or 8098)
 
 
+_RELAY_DOC = {"at": 0.0, "doc": None}
+
+
+def _relay_doc_cached(ttl: float = 5.0) -> dict:
+    """relay_document(state) 的 5 秒缓存（RESP 高频查询，重算一次要读 state+plans）"""
+    now = time.time()
+    if _RELAY_DOC["doc"] is None or now - _RELAY_DOC["at"] > ttl:
+        _RELAY_DOC["doc"] = mu.relay_document(mu.load_state())
+        _RELAY_DOC["at"] = now
+    return _RELAY_DOC["doc"]
+
+
 def _resp_bulk(payload: bytes) -> bytes:
     return b"$" + str(len(payload)).encode() + b"\r\n" + payload + b"\r\n"
 
@@ -129,17 +141,15 @@ def _handle_resp_command(args):
                         break
                 if not hit:
                     return b"$-1\r\n"
-                routes = [{"route": x["route"], "provider": x["provider"]}
-                          for x in db.execute("SELECT route, provider FROM routes WHERE token=?",
-                                              (hit["id"],))]
-                keys = {x["provider"]: x["key_cipher"] for x in
-                        db.execute("SELECT provider, key_cipher FROM credentials")}
-                ver = db.execute("SELECT v FROM kv WHERE k='credential_version'").fetchone()
-                return _resp_bulk(json.dumps({
-                    "id": hit["id"], "user": hit["user"], "instance": hit["instance"],
-                    "plan": hit["plan"], "version": ver["v"] if ver else "1",
-                    "routes": [{**rt, "key": keys.get(rt["provider"], "")} for rt in routes],
-                }).encode())
+                # ★ 网关要的是"能不能转发"的完整信息（upstream / auth / protocols / key），
+                #   不是分析用的 route+provider 两列 ✗ 之前 db 模式缺这些字段，
+                #   所以它一直没真正可用（只是被 relay.json 兜着）。
+                #   现在直接返回与 relay_document 完全相同的形状 ✓ 单一来源 ✓
+                doc = _relay_doc_cached()
+                entry = (doc.get("tokens") or {}).get(token)
+                if not entry:
+                    return b"$-1\r\n"
+                return _resp_bulk(json.dumps(entry).encode())
             provider = key.split(":", 1)[-1]
             row = db.execute("SELECT key_cipher FROM credentials WHERE provider=?",
                              (provider,)).fetchone()
@@ -698,8 +708,10 @@ def do_instance_action(action: str, name: str, body: dict) -> tuple[int, dict]:
 
 ROUTES: list[tuple[str, re.Pattern, str]] = [
     ("GET", re.compile(r"^/api/health$"), "health"),
+    ("POST", re.compile(r"^/api/site/verify$"), "site_verify"),
     ("GET", re.compile(r"^/api/me$"), "me"),
     ("POST", re.compile(r"^/api/me/password$"), "me_password"),
+    ("POST", re.compile(r"^/api/me/webdav-token$"), "me_webdav_token"),
     ("GET", re.compile(r"^/api/overview$"), "overview"),
     ("GET", re.compile(r"^/api/users$"), "users"),
     ("GET", re.compile(r"^/api/instances$"), "instances"),
@@ -819,6 +831,10 @@ MUTATING = {"auth_verify", "instance_ensure", "provider_save", "provider_delete"
 
 
 
+def msorted(names) -> list:
+    return sorted({str(n) for n in names if str(n).strip()})
+
+
 def keyless_providers() -> set:
     """本来就不需要 key 的 provider（配置 keyless_providers，默认 kilo）"""
     with contextlib.suppress(Exception):
@@ -836,6 +852,15 @@ def apply_plan_change(mu, st, plan=None):
     """
     mu.save_state(st)
     mu.sync_all(st)
+    # 套餐/key 变了必须重写网关凭据表，否则 relay.json 还是旧的 ✗
+    # （实测：新建 cloudflare 套餐后 relay.json 里没有这个 route → 实例报 API 密钥无效）
+    # 直接写凭据表（render_gateway 依赖宿主机 nginx，jail 模式下会中断 ✗）
+    with contextlib.suppress(Exception):
+        mu.write_relay_document(st)
+    with contextlib.suppress(Exception):
+        mu.sync_gateway_etc()
+    with contextlib.suppress(Exception):
+        mu.reload_gateway_if_stale()
     # 注意：这里**不**动网关。模型清单靠 patch + 实例 F5 生效（已验证）。
     # 换 key 需要网关注入新的上游凭据，而网关把 relay.json 读进内存不会重读 ——
     # 临时手段是在 plan_key 分支里重启网关（见 docs/20-设计备忘-模型与key改为查询式.md）。
@@ -999,6 +1024,9 @@ class Handler(BaseHTTPRequestHandler):
             body = body.replace(b"__PAGE_BUILD__", VERSION.encode())
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        # 控制台页面每次升级都变：禁止缓存，避免"升级了但看到旧页面"这类误判
+        # （实测踩过两次：按钮文案/新面板没出现，其实是浏览器用了缓存）
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
@@ -1316,6 +1344,44 @@ class Handler(BaseHTTPRequestHandler):
     def _run(self, name: str, match: re.Match, body: dict, query: dict,
              actor: str = "", ip: str = "") -> tuple[int, dict]:
         groups = match.groups()
+        if name == "me_webdav_token":
+            # 客户端插件用：给"当前用户自己的实例"签一张短期 WebDAV 令牌，
+            # 让它能一键把工作区映射到系统资源管理器（docs/27 §6）
+            actor_u = str(actor or "")
+            st_t = mu.load_state()
+            inst_name = str((st_t.get("users") or {}).get(actor_u, {}).get("instance") or actor_u)
+            site_name = str(body.get("site") or "files")
+            row_site = (st_t.get("sites") or {}).get(site_name)
+            if not row_site:
+                return 404, {"error": f"no such site: {site_name}"}
+            if not row_site.get("enabled") or not row_site.get("approved", True):
+                return 403, {"error": "site not enabled/approved"}
+            if inst_name not in (st_t.get("instances") or {}):
+                return 403, {"error": f"user has no instance: {inst_name}"}
+            days = 1
+            tid, secret = mu.site_token_create(
+                site_name, subject=f"user:{actor_u}", tenant=inst_name,
+                scope="rw", label="webdav-launch", days=days)
+            entry = str(((row_site.get("entry") or {}).get("path")) or "")
+            host = str(self.headers.get("X-Forwarded-Host")
+                       or self.headers.get("Host")
+                       or (mu.load_config().get("gateway_host") or "dsh-mu"))
+            scheme = str(self.headers.get("X-Forwarded-Proto") or "http")
+            return 200, {"site": site_name, "instance": inst_name, "id": tid,
+                         # Basic 的用户名不能含冒号 → 客户端用占位名，密码=令牌
+                         "username": "dsh", "subject": f"user:{actor_u}",
+                         "secret": secret,
+                         "url": f"{scheme}://{host}{entry}",
+                         "workspace": f"{scheme}://{host}{entry}workspace/",
+                         "expires_days": days}
+        if name == "site_verify":
+            # 网关调用：把 Authorization 里的令牌换成身份（docs/27 §6）
+            site = str(body.get("site") or "")
+            token = str(body.get("token") or "")
+            res = mu.site_token_verify(site, token, ip=ip)
+            if not res:
+                return 401, {"error": "invalid token"}
+            return 200, res
         if name == "provider_spec":
             return 200, {"spec": mu.PROVIDER_SPEC_TEXT}
         if name == "package_list":
@@ -1324,7 +1390,16 @@ class Handler(BaseHTTPRequestHandler):
                 rows.append({"id": pid, "label": pkg.get("label") or pid,
                              "origin": pkg.get("origin") or "custom",
                              "disabled": bool(pkg.get("disabled")),
-                             "needs_params": pkg.get("needs_params") or [],
+                             "optional_params": msorted(set(
+                                 (pkg.get("declared_params") or [])
+                                 + mu.unresolved_slots(pkg.get("base_url") or "")
+                                 + (pkg.get("optional_params") or []))),
+                             "optional_params": msorted(set(
+                                 (pkg.get("declared_params") or [])
+                                 + mu.unresolved_slots(pkg.get("base_url") or "")
+                                 + (pkg.get("optional_params") or []))),
+                             "supported": mu.provider_protocol_support(pkg.get("models") or [])[0],
+                             "protocols": mu.provider_protocol_support(pkg.get("models") or [])[1],
                              "params": pkg.get("params") or {},
                              "base_url": pkg.get("base_url"),
                              "models": len(pkg.get("models") or []),
@@ -1432,7 +1507,16 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return 400, {"error": str(exc), "id": groups[0]}
             return 200, {"package": {"id": pkg["id"], "disabled": bool(pkg.get("disabled")),
-                                     "needs_params": pkg.get("needs_params") or [],
+                                     "optional_params": msorted(set(
+                                 (pkg.get("declared_params") or [])
+                                 + mu.unresolved_slots(pkg.get("base_url") or "")
+                                 + (pkg.get("optional_params") or []))),
+                             "optional_params": msorted(set(
+                                 (pkg.get("declared_params") or [])
+                                 + mu.unresolved_slots(pkg.get("base_url") or "")
+                                 + (pkg.get("optional_params") or []))),
+                             "supported": mu.provider_protocol_support(pkg.get("models") or [])[0],
+                             "protocols": mu.provider_protocol_support(pkg.get("models") or [])[1],
                                      "base_url": pkg.get("base_url")}}
         if name == "me_restart":
             actor_user = str(actor or "").strip()
@@ -1711,9 +1795,12 @@ class Handler(BaseHTTPRequestHandler):
                         "admin_ui": (manifest.get("admin") or {}).get("ui") or None,
                         "nav": (manifest.get("admin") or {}).get("nav") or None,
                         "pages": (manifest.get("admin") or {}).get("pages") or [],
+                        "user_api": bool((manifest.get("admin") or {}).get("user_api")),
                         "egress": (manifest.get("net") or {}).get("egress") or [],
                         "state": mu.ext_status(ext_name),
                         "registered": ext_name in registered,
+                        "site": mu.site_of_extension(ext_name),
+                        "service_kind": str(((manifest.get("service") or {}).get("kind")) or "jail"),
                     })
                 return 200, {"extensions": rows}
             action = str(body.get("action") or "").strip()
@@ -1722,6 +1809,20 @@ class Handler(BaseHTTPRequestHandler):
                 mu.sync_all(mu.load_state())
                 return 200, {"ok": True, **{k: report[k] for k in ("installed", "retired")},
                              "skipped": report["skipped"]}
+            if action in ("site_approve", "site_enable", "site_disable"):
+                site_name = str(body.get("site") or body.get("name") or "").strip()
+                st_s = mu.load_state()
+                row_s = (st_s.get("sites") or {}).get(site_name)
+                if not row_s:
+                    return 404, {"error": f"no such site: {site_name}"}
+                if action == "site_approve":
+                    row_s["approved"] = True
+                    row_s["approved_at"] = int(__import__("time").time())
+                else:
+                    row_s["enabled"] = action == "site_enable"
+                mu.save_state(st_s)
+                mu.sync_all(mu.load_state())
+                return 200, {"ok": True, "site": site_name, **row_s}
             ext_name = str(body.get("name") or "").strip()
             if action not in ("start", "stop", "restart") or not ext_name:
                 return 400, {"error": "action must be start|stop|restart|reload (with name)"}
@@ -1918,22 +2019,33 @@ class Handler(BaseHTTPRequestHandler):
                 return 404, {"error": "no such plan", "id": pid}
             if name == "plan_key":
                 key = str(body.get("key") or "").strip()
-                if not key:
-                    return 400, {"error": "the credential must not be empty"}
+                params = {str(k): str(v) for k, v in (body.get("params") or {}).items()
+                          if str(v).strip()}
+                base_override = str(body.get("base_url") or "").strip()
+                if params or base_override:
+                    # 只补高级项（不换 key）也要能保存 ✓
+                    with contextlib.suppress(Exception):
+                        mu.provider_set_params(plan.get("provider") or "", params,
+                                               base_url=base_override)
+                if not key and not (params or base_override):
+                    return 400, {"error": "key 与高级项不能同时为空"}
                 # save_plan 只有在收到 key= 实参时才写凭据文件；之前这里把 key 塞进 plan
                 # dict 再调用 save_plan(plan)，凭据文件从未更新 —— 所以"换了 key 还能用"。
-                plan["has_key"] = True
-                mu.save_plan(plan, key=key)
+                if key:
+                    plan["has_key"] = True
+                    mu.save_plan(plan, key=key)
+                else:
+                    mu.save_plan(plan)
                 # 托管模式下 key 只在网关（relay.json）里用：必须重写并让网关重载，
                 # 否则换了 key 仍然会拿旧 key 打通 —— 与实例无关，不需要重启实例。
                 st_key = mu.load_state()
                 applied = apply_plan_change(mu, st_key, mu.load_plan(pid))
-                # 临时手段：网关把 relay.json 读进内存，reload 不够，必须 restart 才会用新 key。
-                # 代价是所有实例的模型请求中断约 1–2 秒。长期方案见 docs/20-设计备忘。
+                # 不再 restart openresty ✗
+                # relay.lua 每个请求都会重新读 relay.json（gateway/lua/relay.lua: load_document），
+                # 所以换 key 根本不需要动网关；而 restart 会清掉 lua_shared_dict 里的会话，
+                # 正在使用的用户会被踢下线并陷入"不停重连 + 接口返回登录页 HTML"✗（实测踩到）
                 with contextlib.suppress(Exception):
-                    if os.path.exists("/etc/init.d/openresty"):
-                        subprocess.run(["/sbin/rc-service", "openresty", "restart"],
-                                       check=False, capture_output=True, timeout=120)
+                    mu.reload_gateway_if_stale()
                 extra = applied if isinstance(applied, dict) else {"restarted": applied}
                 extra = dict(extra)
                 extra["restart_required"] = False
@@ -2313,8 +2425,16 @@ class Handler(BaseHTTPRequestHandler):
             if not name_:
                 return 400, {"error": "name is required"}
             key = str(body.get("key") or "").strip()
-            if not key:
-                return 400, {"error": "a credential is required"}
+            params = {str(k): str(v) for k, v in (body.get("params") or {}).items()
+                      if str(v).strip()}
+            base_override = str(body.get("base_url") or "").strip()
+            if not key and not (params or base_override):
+                return 400, {"error": "a credential is required (or fill the advanced fields)"}
+            if params or base_override:
+                # 创建套餐时就能补 account_id / base URL（不用再走"改 key"）
+                with contextlib.suppress(Exception):
+                    mu.provider_set_params(str(body.get("provider") or ""), params,
+                                           base_url=base_override)
             models = [m for m in (body.get("models") or []) if m]
             known = {m["id"] for m in pkg["models"]}
             bad = [m for m in models if m not in known]

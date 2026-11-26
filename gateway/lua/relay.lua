@@ -4,27 +4,12 @@
 --
 --   http://127.0.0.1:<relay_listen>/mu-llm/<instance-token>/<route>/<provider path>
 --
--- This handler resolves <token>/<route> in /etc/dsh-mu/gateway/relay.json (which is
--- never mounted into an instance jail), sets the auth header the provider wants and
+-- This handler resolves <token>/<route> through the credential service (RESP 8098,
+-- the sole source of truth: the relay.json file was retired), sets the auth header the
+-- provider wants and
 -- rewrites the upstream URL. Anything it cannot resolve is refused, so the relay can
 -- never be used as an open proxy.
 local cjson = require "cjson.safe"
-
-local RELAY_PATH = "/etc/dsh-mu/gateway/relay.json"
-
-local function load_document()
-	local fh = io.open(RELAY_PATH, "rb")
-	if not fh then
-		return nil, "relay.json missing"
-	end
-	local body = fh:read("*a")
-	fh:close()
-	local ok, doc = pcall(cjson.decode, body)
-	if not ok or type(doc) ~= "table" then
-		return nil, "relay.json invalid"
-	end
-	return doc
-end
 
 local function deny(status, message)
 	ngx.status = status
@@ -47,73 +32,66 @@ end
 ngx.var.relay_route = tostring(route)
 ngx.var.relay_endpoint = tostring(path)
 
--- 凭据来源：relay_source=file（默认，读 relay.json）| db（问 dsh-mud，带 30s 内存缓存）
--- db 模式下任何异常都**回退读 relay.json** ✓ 降级不中断 ✓
-local function load_config()
-	local conf = "/etc/dsh-mu/config.json"
-	local fh = io.open(conf, "rb")
-	if not fh then return {} end
-	local body = fh:read("*a")
-	fh:close()
-	local ok, parsed = pcall(cjson.decode, body)
-	if not ok or type(parsed) ~= "table" then return {} end
-	return parsed
-end
-
+-- 凭据来源：**只有库**（RESP 问 dsh-mud）。
+-- 历史包袱 relay.json 已退役：文件与库双源是今天"报 API 密钥无效"的根源 ✗
+-- 可用性：把最近一次成功结果留在 shared dict 里（不设过期），库不可达时继续用它，
+--         这样后端重启的几秒不会打断正在进行的模型请求 ✓
 local function db_lookup(token)
 	local redis = require "resty.redis"
 	local r = redis:new()
-	r:set_timeouts(120, 120, 120)
+	r:set_timeouts(300, 300, 300)
 	local ok = r:connect("127.0.0.1", 8098)
-	if not ok then return nil end
+	if not ok then return nil, "connect failed" end
 	local payload = r:get("tok:" .. token)
 	r:set_keepalive(1000, 16)
-	if not payload or type(payload) ~= "string" then return nil end
+	if not payload or type(payload) ~= "string" then return nil, "miss" end
 	local decoded_ok, doc2 = pcall(cjson.decode, payload)
-	if not decoded_ok or type(doc2) ~= "table" then return nil end
+	if not decoded_ok or type(doc2) ~= "table" then return nil, "bad json" end
 	return doc2
 end
 
+-- 后端返回的就是 relay_document 的 token 条目（routes 是 {route: {upstream, auth, key, ...}}）
 local function entry_from_db(doc2)
-	local routes = {}
-	for _, rt in ipairs(doc2.routes or {}) do
-		routes[rt.route] = { provider = rt.provider, key = rt.key, plan = doc2.plan,
-		                     instance = doc2.instance, user = doc2.user,
-		                     token_id = doc2.id }
-	end
-	return { instance = doc2.instance, user = doc2.user, plan = doc2.plan,
-	         routes = routes, source = "db" }
+	if type(doc2) ~= "table" then return nil end
+	if type(doc2.routes) ~= "table" then return nil end
+	doc2.source = "db"
+	return doc2
 end
 
-local conf = load_config()
-local doc, err
 local entry
-if (conf.relay_source or "file") == "db" then
+do
 	local cache = ngx.shared.relay_cache
-	local cached = cache and cache:get(token)
+	local cached = cache and cache:get(token .. ":fresh")
 	if cached then
 		local ok2, parsed = pcall(cjson.decode, cached)
 		if ok2 and type(parsed) == "table" then entry = entry_from_db(parsed) end
-	else
-		local d = db_lookup(token)
+	end
+	if not entry then
+		local d, why = db_lookup(token)
 		if d then
 			entry = entry_from_db(d)
 			if cache then
-				cache:set(token, cjson.encode(d), 30)
+				cache:set(token .. ":fresh", cjson.encode(d), 30)   -- 30s 内复用
+				cache:set(token .. ":last", cjson.encode(d), 3600)  -- 库挂了时的兜底
+			end
+		else
+			-- 库不可达：用最近一次成功结果（最多 1 小时），否则明确报错
+			local last = cache and cache:get(token .. ":last")
+			if last then
+				local ok3, parsed3 = pcall(cjson.decode, last)
+				if ok3 and type(parsed3) == "table" then
+					entry = entry_from_db(parsed3)
+					ngx.log(ngx.WARN, "dshmu relay: credential db unreachable (",
+						tostring(why), "); serving last known entry for this token")
+				end
+			end
+			if not entry then
+				ngx.log(ngx.ERR, "dshmu relay: credential db unreachable (", tostring(why),
+					") and no cached entry for this token")
+				return deny(503, "凭据服务不可达（dsh-mud 的 RESP 8098），请检查平台后台")
 			end
 		end
 	end
-	if not entry then
-		-- 降级：回退 relay.json（库里查不到 / dsh-mud 挂了）
-		doc, err = load_document()
-		if doc then entry = (doc.tokens or {})[token] end
-	end
-else
-	doc, err = load_document()
-	if not doc then
-		return deny(503, err or "relay unavailable")
-	end
-	entry = (doc.tokens or {})[token]
 end
 if type(entry) ~= "table" then
 	return deny(403, "unknown relay token")
@@ -330,6 +308,14 @@ local mu_route, mu_path = route, path
 local target = (entry.routes or {})[route]
 if type(target) ~= "table" then
 	return deny(403, "unknown relay route")
+end
+-- 上游地址里如果还留着 {占位符}（例如 cloudflare 的 account_id 没填），
+-- 直接给一句中文提示，而不是让上游回一个看不懂的 404/401 ✗
+local upstream_str = tostring(target.upstream or "")
+if upstream_str:find("{", 1, true) then
+	local missing = upstream_str:match("{([%w_]+)}") or "参数"
+	return deny(503, "该套餐还缺 " .. missing .. "：请在【套餐 → 改 key → 高级】里补上。"
+		.. "当前上游地址：" .. upstream_str)
 end
 local key = tostring(target.key or "")
 -- A keyless route (auth == "") is legitimate: the Kilo free gateway needs no

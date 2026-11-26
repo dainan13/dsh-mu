@@ -1406,7 +1406,8 @@ html.wiring .side-stack .flags { visibility: hidden; }
           </div>
         </div>
 
-        <div id="extAdminList" class="grid-2" hidden></div>
+        <div id="extAdminList" hidden style="display:flex;flex-direction:column;gap:14px"></div>
+
       </section>
 
       <!-- ───────────────────────── 9 平台 ───────────────────────── -->
@@ -1757,14 +1758,17 @@ const extTheme = () => document.documentElement.getAttribute('data-theme') || 'd
 function renderExtRail() {
   const box = $('#railExtensions');
   if (!box) return;
-  const list = hostExts().slice(0, 5);
+  // 系统级扩展（service_kind=system）不进左轨：它的页面由自己的站点承载，
+  // 走 #ext/<name> 会落到 /ext/<name>/ 代理上（那条代理只对 jail 扩展存在）✗
+  const railCandidates = () => hostExts();
+  const list = railCandidates().slice(0, 5);
   box.innerHTML = list.map(e => `
     <a class="rail-item" href="#ext/${e.name}" title="${e.admin.nav.label}"
        data-nav="extpage" data-ext="${e.name}">
       <svg class="i"><use href="#${EXT_ICON[e.admin.nav.icon] || 'i-layers'}"/></svg>
       <span class="label">${e.admin.nav.label}</span><span class="ext-chip">ext</span>
-    </a>`).join('') + (hostExts().length > 5
-      ? `<a class="rail-item" href="#ext" title="更多扩展"><svg class="i"><use href="#i-more"/></svg><span class="label">更多扩展（${hostExts().length - 5}）</span></a>`
+    </a>`).join('') + (railCandidates().length > 5
+      ? `<a class="rail-item" href="#ext" title="更多扩展"><svg class="i"><use href="#i-more"/></svg><span class="label">更多扩展（${railCandidates().length - 5}）</span></a>`
       : '');
 }
 
@@ -1825,18 +1829,48 @@ function renderExtShell(ext) {
 function renderExtAdmin() {
   const box = $('#extAdminList');
   if (!box) return;
-  box.innerHTML = EXTENSIONS.map(e => {
+  box.innerHTML = EXTENSIONS.map((e) => {
+    const sysExt = e.service_kind === 'system';
+    const siteOnly = !!(e.site && !(e.admin && e.admin.url) && !e.port);
     const chrome = (e.admin && e.admin.ui && e.admin.ui.chrome) || 'standalone';
     const pages = extPages(e);
     const host = chrome === 'host' && e.admin.nav;
     const statusBadge = e.status === 'running'
       ? '<span class="badge ok"><span class="dot ok live"></span>running</span>'
       : '<span class="badge warn"><span class="dot warn"></span>stopped</span>';
-    const action = host
-      ? `<button class="btn sm primary" onclick="go('ext/${e.name}')">打开配置页<svg class="i i-sm"><use href="#i-chev-r"/></svg></button>`
-      : (e.admin && e.admin.url
-        ? `<a class="btn sm secondary" href="${e.admin.url}" target="_blank" rel="noopener">打开原始页面<svg class="i i-sm"><use href="#i-external"/></svg></a>`
-        : '<span class="badge sm">无配置页</span>');
+
+    // 所有扩展同一套字段（ssh 与 smb 应当长得一样）：
+    // 形态 / 左轨入口 / 页面 / 代理路径；只有 nginx 型"站点"才多出站点那几行。
+    const rows = [];
+    rows.push(['形态', `<span class="mono">chrome: ${chrome}</span>`]);
+    rows.push(['左轨入口', host ? e.admin.nav.label : '<span class="faint">无（自带外壳）</span>']);
+    rows.push(['页面', pages.length ? pages.map((p) => p.label).join(' / ') : '<span class="faint">—</span>']);
+    rows.push(['代理路径', `<span class="mono">/ext/${e.name}/</span>`]);
+    if (sysExt) rows.push(['服务', '系统级（扩展包自带 openrc 单元）']);
+    if (e.site) {
+      rows.push(['站点', `<span class="mono">${e.site.entry || '-'}</span>`]);
+      rows.push(['站点形态', `<span class="mono">${e.site.kind}</span>`]);
+      rows.push(['站点状态', !e.site.approved ? '待批准' : (e.site.enabled ? '运行中' : '已停用')]);
+    }
+
+    let action = '<span class="badge sm">无配置页</span>';
+    if (host) {
+      action = `<button class="btn sm primary" onclick="go('ext/${e.name}')">打开配置页<svg class="i i-sm"><use href="#i-chev-r"/></svg></button>`;
+    } else if (!siteOnly && e.admin && e.admin.url) {
+      action = `<button class="btn sm primary" onclick="go('ext/${e.name}')">打开配置页<svg class="i i-sm"><use href="#i-chev-r"/></svg></button>`;
+    } else if (!siteOnly && e.admin && e.admin.url) {
+      action = `<a class="btn sm secondary" href="${e.admin.url}" target="_blank" rel="noopener">打开原始页面<svg class="i i-sm"><use href="#i-external"/></svg></a>`;
+    }
+
+    const nginxSite = e.site && !sysExt && e.site.kind === 'nginx';
+    const siteButtons = nginxSite
+      ? `<button class="btn sm ${e.site.approved ? 'secondary' : 'primary'}"
+           onclick="extSiteAction('site_approve','${e.site.name}')">批准站点</button>
+         <button class="btn sm secondary"
+           onclick="extSiteAction('${e.site.enabled ? 'site_disable' : 'site_enable'}','${e.site.name}')">
+           ${e.site.enabled ? '停用站点' : '启用站点'}</button>`
+      : '';
+
     return `
       <div class="panel">
         <div class="panel-head">
@@ -1847,17 +1881,15 @@ function renderExtAdmin() {
         </div>
         <div class="panel-body">
           <div class="kvlist">
-            <div class="r"><span class="k">形态</span><span class="v mono">chrome: ${chrome}</span></div>
-            <div class="r"><span class="k">左轨入口</span><span class="v">${host ? e.admin.nav.label : '<span class="faint">无（自带外壳）</span>'}</span></div>
-            <div class="r"><span class="k">页面</span><span class="v">${pages.length ? pages.map(p => p.label).join(' / ') : '<span class="faint">—</span>'}</span></div>
-            <div class="r"><span class="k">代理路径</span><span class="v mono">/ext/${e.name}/</span></div>
+            ${rows.map(([k, v]) => `<div class="r"><span class="k">${k}</span><span class="v">${v}</span></div>`).join('')}
           </div>
         </div>
         <div class="panel-foot">
           ${action}
+          ${siteButtons}
           ${host ? `<button class="btn sm secondary" onclick="confirmExtRestart('${e.name}')">重启</button>` : ''}
           <span class="spacer"></span>
-          <span>${pages.length ? 'manifest 生成 tab' : '老扩展不动也能用'}</span>
+          <span>${sysExt ? '系统级：SMB 账号与配置由扩展自己管理' : (pages.length ? 'manifest 生成 tab' : '老扩展不动也能用')}</span>
         </div>
       </div>`;
   }).join('');
@@ -1866,9 +1898,12 @@ function renderExtAdmin() {
 function extTarget(page, sub) {
   const rawBase = (extCur && extCur.admin && extCur.admin.url) || '';
   // 真实扩展一律走网关代理；原型里的相对 demo 文件（ext-demo.html）不请求
-  const base = (extCur && rawBase && !/\.html?($|\?)/.test(rawBase))
+  const sysExt = extCur && extCur.service_kind === 'system';
+  const base = sysExt && rawBase
     ? rawBase
-    : (extCur ? '/ext/' + extCur.name + '/' : 'ext-demo.html');
+    : (extCur && rawBase && !/\.html?($|\?)/.test(rawBase)
+      ? rawBase
+      : (extCur ? '/ext/' + extCur.name + '/' : 'ext-demo.html'));
   return base + '?page=' + encodeURIComponent(page)
     + '&sub=' + encodeURIComponent(sub || '')
     + '&host=1&kit=1&theme=' + encodeURIComponent(extTheme());
@@ -4915,27 +4950,62 @@ function wireDoctorBadge(summary) {
       });
   };
   window.openPlanQuota = function (id) { toast('info', '配额还没接线', id); };
-  window.openPlanKey = function (id) {
+  window.openPlanKey = async function (id) {
+    const row = (window.__planRows || []).find(r => r.id === id) || {};
+    // 关键：/api/plans 里的 providers 不含 optional_params，必须读 /api/packages ✗
+    let pkg = (window.__providerPkgs || {})[row.provider || ''] || {};
+    try {
+      const d = await api('packages');
+      const hit = (d.packages || []).find(p => p.id === (row.provider || ''));
+      if (hit) pkg = Object.assign({}, pkg, hit);
+    } catch (e) { /* 用缓存兜底 */ }
+    const extras = (pkg.optional_params || []).slice();
+    const urlField = `<label class="field"><span class="label">base URL（可选，留空用默认）</span>`
+      + `<input class="input mono" id="pkBase" placeholder="${esc(pkg.base_url || 'https://…')}">`
+      + `<span class="hint">一般不用改；需要自定义端点时才填。</span></label>`;
+    const extraFields = extras.length
+      ? `<div class="faint" style="font-size:12px;margin:6px 0">这个 provider 还支持下面这些（都可以留空；不填调用时会提示）：</div>`
+        + extras.map(k => {
+            const cur = (pkg.params || {})[k]
+              || (/^(account|gateway)_id$/.test(k)
+                  ? ((pkg.base_url || '').match(/\/accounts\/([0-9a-f]{32})/i) || [])[1]
+                  : '') || '';
+            return `<label class="field"><span class="label">${esc(k)}${cur ? '（当前：' + esc(String(cur).slice(0, 8)) + '…）' : ''}</span>`
+              + `<input class="input mono" id="pkEx_${esc(k)}" value="${esc(cur)}" placeholder="可留空"></label>`;
+          }).join('')
+      : '';
     openModal({
-      title: '更换 ' + id + ' 的 key',
-      sub: '只换凭据；模型清单与套餐范围不变。保存会让网关重载（约 1–2 秒，期间模型请求可能失败一次），实例不需要重启。',
+      title: (row.has_key ? '更换 ' : '填写 ') + id + ' 的凭据',
+      sub: 'key 与高级项都可以留空；保存会让网关重载约 1–2 秒，实例不需要重启。',
       size: 'sm',
-      body: '<label class="field"><span class="label">新 key</span>'
-        + '<input class="input mono" id="pkKey" placeholder="上游 API key" autocomplete="off"></label>',
+      body: '<label class="field"><span class="label">API key（可留空）</span>'
+        + '<input class="input mono" id="pkKey" placeholder="sk-…（留空则只更新高级项）" autocomplete="off"></label>'
+        + `<details style="margin-top:8px"><summary class="faint" style="cursor:pointer;font-size:12px">高级（可选）</summary>`
+        + urlField + extraFields + '</details>',
       foot: `<button class="btn ghost" onclick="closeModal()">取消</button>
              <button class="btn primary" onclick="submitPlanKey('${esc(id)}')">保存</button>`,
     });
   };
   window.submitPlanKey = function (id) {
     const key = (($('#pkKey') || {}).value || '').trim();
-    if (!key) { showModalError('key 不能为空'); return; }
+    const baseUrl = (($('#pkBase') || {}).value || '').trim();
+    const params = {};
+    document.querySelectorAll('[id^="pkEx_"]').forEach(el => {
+      const name = el.id.slice(5);
+      const v = (el.value || '').trim();
+      if (v) params[name] = v;
+    });
+    if (!key && !baseUrl && Object.keys(params).length === 0) {
+      showModalError('至少填一项（key 或高级项）'); return;
+    }
     setModalBusy(true); clearModalError();
     act2('plans/' + encodeURIComponent(id) + '/key',
       { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key }) })
+        body: JSON.stringify({ key, base_url: baseUrl, params }) })
       .then((r) => {
         setModalBusy(false); closeModal();
-        toast('ok', 'key 已更换', '末四位 ****' + ((r && r.tail) || key.slice(-4))
+        toast('ok', key ? 'key 已更换' : '高级项已保存', key ? ('末四位 ****' + ((r && r.tail) || key.slice(-4))) : '未改动 key'
+          + (((r && r.missing) || []).length ? ' · 仍缺：' + r.missing.join(',') : '')
           + ' · 网关已重启（1–2 秒），立即生效；实例不需要重启');
         refresh();
       })
@@ -4957,18 +5027,25 @@ function wireDoctorBadge(summary) {
         <td class="mono faint">${esc((p.apis || []).join(', '))}</td>
         <td class="num mono">${esc(p.models)}</td>
         <td class="mono faint">${esc(p.default_model || '—')}</td>
-        <td class="dim">${(p.needs_params || []).length ? esc(p.needs_params.join(', ')) : '—'}</td>
-        <td>${p.disabled
-          ? '<span class="badge warn"><span class="dot warn"></span>已停用</span>'
-          : '<span class="badge ok"><span class="dot ok"></span>已启用</span>'}</td>
+        <td class="dim">${(p.optional_params || p.needs_params || []).length
+          ? `<span class="badge warn sm" title="可留空保存；调用时若仍缺会给出中文提示">缺 ${esc((p.optional_params || p.needs_params).join('、'))}</span>`
+          : '—'}</td>
+        <td>${p.supported === false
+          ? '<span class="badge warn" title="平台只代理 openai-completions / openai-responses / anthropic-messages">协议不支持</span>'
+          : (p.disabled
+            ? '<span class="badge warn"><span class="dot warn"></span>已停用</span>'
+            : '<span class="badge ok"><span class="dot ok"></span>已启用</span>')}</td>
         <td class="num"><div class="row-actions">
           <button class="btn icon ghost" title="${p.disabled ? '启用' : '停用'}" onclick="confirmToggleProvider('${esc(p.id)}',${!!p.disabled})"><svg class="i i-sm"><use href="#${p.disabled ? 'i-check' : 'i-ban'}"/></svg></button>
         </div></td></tr>`).join('') : '<tr><td colspan="8" class="muted">还没有导入 provider。</td></tr>';
     }
 
-    const planBody = document.getElementById('planBody');
+    window.__providerPkgs = {};
+      (pl.providers || []).forEach(p => { window.__providerPkgs[p.id] = p; });
+      const planBody = document.getElementById('planBody');
     if (planBody) {
       const rows = (pl.plans || []);
+      window.__planRows = rows;
       planBody.innerHTML = rows.length ? rows.map((r, i) => {
         const eff = r.effective_models || [];
         const search = (pl.search_plan || {}).id === r.id;
@@ -6141,6 +6218,7 @@ function wireDoctorBadge(summary) {
         ${field('key <span class="req">*</span>', '<input class="input mono" id="npKey" placeholder="上游 API key">')}
         ${field('范围', '<select class="select" id="npScope"><option value="">团队（所有用户可见）</option><option value="self">个人（只有自己可见）</option></select>')}
         <div class="span-2" style="grid-column:1/-1">${field('模型子集（可选）', '<div id="npModels"></div>')}</div>
+        <div class="span-2" style="grid-column:1/-1" id="npExtras"></div>
       </div>`,
       foot: `<button class="btn ghost" onclick="closeModal()">取消</button>
              <button class="btn primary" onclick="submitCreatePlanReal()">创建套餐</button>`,
@@ -6150,6 +6228,26 @@ function wireDoctorBadge(summary) {
       const ids = await providerModelIds(pid);
       const box = document.getElementById('npModels');
       if (box) box.innerHTML = modelPicker('npModel', ids, []);
+      // 高级（可选）：base URL + 该 provider 的可选参数（例如 cloudflare 的 account_id）
+      let pkg = {};
+      try {
+        const d = await api('packages');
+        pkg = (d.packages || []).find(p => p.id === pid) || {};
+      } catch (e) { pkg = {}; }
+      const extras = pkg.optional_params || [];
+      const host = document.getElementById('npExtras');
+      if (host) {
+        host.innerHTML = `<details><summary class="faint" style="cursor:pointer;font-size:12px">`
+          + `高级（可选）：base URL${extras.length ? ' / ' + extras.join(' / ') : ''}</summary>`
+          + `<div class="row-wrap" style="gap:10px;margin-top:8px">`
+          + `<label class="field" style="min-width:260px"><span class="label">base URL（可留空）</span>`
+          + `<input class="input mono" id="npBase" placeholder="${esc(pkg.base_url || '')}"></label>`
+          + extras.map(k => `<label class="field" style="min-width:200px"><span class="label">${esc(k)}（可留空）</span>`
+              + `<input class="input mono" id="npEx_${esc(k)}" placeholder="可留空"></label>`).join('')
+          + `</div>`
+          + (extras.length ? `<span class="hint" style="font-size:11.5px">${esc(pid)} 需要 ${esc(extras.join('、'))} 才能真正调用；留空也能先建，调用时会用中文提示补齐。</span>` : '')
+          + `</details>`;
+      }
     };
     const sel = document.getElementById('npProvider');
     if (sel) sel.addEventListener('change', fill);
@@ -6172,6 +6270,15 @@ function wireDoctorBadge(summary) {
       const body = { provider, name, key };
       if (models.length) body.models = models;
       if (scope) body.scope = scope;
+      const baseUrl = (($('#npBase') || {}).value || '').trim();
+      if (baseUrl) body.base_url = baseUrl;
+      const params = {};
+      document.querySelectorAll('[id^="npEx_"]').forEach(el => {
+        const name2 = el.id.slice(5);
+        const v = (el.value || '').trim();
+        if (v) params[name2] = v;
+      });
+      if (Object.keys(params).length) body.params = params;
       await post('plans', body);
       setModalBusy(false); closeModal();
       toast('ok', '套餐已创建', name + '（' + provider + '）· 用户在实例页 F5 即可看到，无需重启');
@@ -6563,28 +6670,51 @@ html.wiring .side-stack .flags { visibility: hidden; }
       if (!real.has(list[i].name)) { list.splice(i, 1); changed = true; }
     }
     rows.forEach((row) => {
-      const ext = list.find(x => x.name === row.name);
-      if (!ext) return;
+      let ext = list.find(x => x.name === row.name);
+      if (!ext) {
+        // 原型表里没有的新扩展（例如只提供站点的 dav）→ 动态补一条
+        ext = {
+          name: row.name,
+          version: row.version || '-',
+          status: 'stopped',
+          summary: row.summary || '',
+          admin: { url: row.proxy_path || '', ui: row.admin_ui || null,
+                   nav: row.nav || null, pages: row.pages || [] },
+          site_only: !row.admin_url && !row.port,
+        };
+        list.push(ext);
+        changed = true;
+      }
       const st = String(row.state || '').toLowerCase();
       const status = /running|started|active/.test(st) ? 'running' : 'stopped';
       if (ext.version !== row.version) { ext.version = row.version || ext.version; changed = true; }
       if (ext.status !== status) { ext.status = status; changed = true; }
       ext.port = row.port || ext.port;
       ext.admin_url = row.admin_url || ext.admin_url;
-      // 浏览器永远走网关代理路径，不直连扩展的 admin_url
-      if (row.proxy_path) {
+      ext.service_kind = row.service_kind || 'jail';
+      // 浏览器永远走网关代理路径，不直连扩展的 admin_url。
+      // 系统级扩展没有 /ext/<name>/ 代理，它的配置页就是自己的站点入口（如 /s/smb/）。
+      if (row.service_kind === 'system') {
+        ext.admin = ext.admin || {};
+        if (row.admin_url) ext.admin.url = row.admin_url;
+      } else if (row.proxy_path) {
         ext.admin = ext.admin || {};
         ext.admin.url = row.proxy_path;
       }
       if (row.admin_ui) { ext.admin = ext.admin || {}; ext.admin.ui = row.admin_ui; }
       if (row.nav) { ext.admin = ext.admin || {}; ext.admin.nav = row.nav; }
       if (Array.isArray(row.pages) && row.pages.length) { ext.admin = ext.admin || {}; ext.admin.pages = row.pages; }
+      ext.site = row.site || null;
+      if (ext.site) {
+        ext.status = ext.site.enabled && ext.site.approved ? 'running' : 'stopped';
+      }
     });
     // 列表在数据到手前是 hidden，这里打开
     const box = document.getElementById('extAdminList');
     if (box) box.hidden = false;
     // 左轨的扩展入口是**动态**的（#railExtensions），必须跟着真实列表重建
     if (typeof renderExtRail === 'function') renderExtRail();
+    // 系统级扩展不参与左轨"扩展配置页"（它的页面是站点入口，直接开新标签）
     const railBox = document.getElementById('railExtensions');
     if (railBox) railBox.hidden = false;
     if (typeof renderExtAdmin === 'function') renderExtAdmin();
